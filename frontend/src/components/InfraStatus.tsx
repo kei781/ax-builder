@@ -69,7 +69,7 @@ export default function InfraStatus() {
 
   const services = [
     { key: 'backend', label: 'Backend', data: health.backend },
-    { key: 'database', label: 'MySQL', data: health.database },
+    { key: 'database', label: 'Database', data: health.database },
     { key: 'docker', label: 'Docker', data: health.docker },
     { key: 'hermes', label: 'Hermes', data: health.hermes },
   ];

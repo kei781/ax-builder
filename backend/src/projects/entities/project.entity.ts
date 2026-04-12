@@ -35,11 +35,7 @@ export class Project {
   @Column({ type: 'varchar', length: 255 })
   title!: string;
 
-  @Column({
-    type: 'enum',
-    enum: ['scoring', 'building', 'qa', 'awaiting_env', 'deployed', 'failed', 'stopped'],
-    default: 'scoring',
-  })
+  @Column({ type: 'varchar', length: 20, default: 'scoring' })
   status!: ProjectStatus;
 
   @Column({ type: 'int', default: 0 })

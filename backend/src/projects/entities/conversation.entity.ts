@@ -25,13 +25,10 @@ export class Conversation {
   @Column({ type: 'varchar', length: 36 })
   user_id!: string;
 
-  @Column({
-    type: 'enum',
-    enum: ['scoring', 'bug_report', 'improvement'],
-  })
+  @Column({ type: 'varchar', length: 20 })
   type!: ConversationType;
 
-  @Column({ type: 'json' })
+  @Column({ type: 'simple-json' })
   conversation_history!: Array<{ role: string; content: string }>;
 
   @Column({ type: 'int', default: 0 })

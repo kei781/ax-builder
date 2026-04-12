@@ -15,12 +15,14 @@ PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.minor}")')
 if [ "$PYTHON_VERSION" -lt 11 ]; then
   echo "⚠️  Python 3.11+ 필요 (현재 3.$PYTHON_VERSION). brew install python@3.11"
 fi
-command -v docker >/dev/null 2>&1 || { echo "❌ Docker가 필요합니다. https://docker.com"; exit 1; }
+if command -v docker >/dev/null 2>&1; then
+  echo "✅ Docker $(docker --version | head -1)"
+else
+  echo "⚠️  Docker 미설치 (빌드 파이프라인에서 프로젝트 격리 실행 시 필요)"
+fi
 
 echo "✅ Node.js $(node -v)"
 echo "✅ Python $(python3 --version)"
-echo "✅ Docker $(docker --version | head -1)"
-
 # 2. Backend dependencies
 echo ""
 echo "[2/7] 백엔드 의존성 설치..."
@@ -115,12 +117,14 @@ echo "   • GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET"
 echo "   • GEMINI_API_KEY"
 echo "   • JWT_SECRET"
 
-# 7. Projects directory
+# 7. Data + Projects directory
 echo ""
-echo "[7/7] 프로젝트 디렉토리 생성..."
+echo "[7/7] 디렉토리 생성..."
+mkdir -p data
 mkdir -p projects
 touch projects/.gitkeep
-echo "✅ projects/ 디렉토리 준비 완료"
+echo "✅ data/ 디렉토리 준비 완료 (SQLite DB 저장)"
+echo "✅ projects/ 디렉토리 준비 완료 (빌드된 프로젝트)"
 
 echo ""
 echo "========================================="
@@ -131,8 +135,7 @@ echo "다음 단계:"
 echo "  1. nano .env  (API 키 입력)"
 echo "  2. hermes setup  (Hermes 초기 설정 — 최초 1회)"
 echo "  3. claude login  (Claude Code CLI 로그인 — 최초 1회)"
-echo "  4. cd docker && docker-compose up -d  (MySQL 시작)"
-echo "  5. cd backend && npm run start:dev  (백엔드 시작)"
-echo "  6. cd frontend && npm run dev  (프론트엔드 시작)"
-echo "  7. http://localhost:5173 접속"
+echo "  4. cd backend && npm run start:dev  (백엔드 시작)"
+echo "  5. cd frontend && npm run dev  (프론트엔드 시작)"
+echo "  6. http://localhost:5173 접속"
 echo ""

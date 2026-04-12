@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import * as path from 'path';
 import { AuthModule } from './auth/auth.module.js';
 import { ProjectsModule } from './projects/projects.module.js';
 import { ScoringModule } from './scoring/scoring.module.js';
@@ -15,12 +16,11 @@ import { HealthModule } from './health/health.module.js';
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
-        type: 'mysql' as const,
-        host: config.get<string>('DB_HOST', 'localhost'),
-        port: config.get<number>('DB_PORT', 3306),
-        username: 'root',
-        password: config.get<string>('DB_ROOT_PASSWORD', ''),
-        database: config.get<string>('DB_NAME', 'ai_builder'),
+        type: 'better-sqlite3' as const,
+        database: config.get<string>(
+          'DB_PATH',
+          path.resolve(process.cwd(), '..', 'data', 'ax-builder.db'),
+        ),
         entities: [__dirname + '/**/*.entity{.ts,.js}'],
         synchronize: true, // dev only
       }),

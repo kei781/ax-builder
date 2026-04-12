@@ -8,6 +8,10 @@ dist/
 # Environment
 .env
 
+# Database
+data/*
+!data/.gitkeep
+
 # Generated projects
 projects/*
 !projects/.gitkeep

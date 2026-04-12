@@ -26,11 +26,7 @@ export class ProjectPermission {
   @Column({ type: 'varchar', length: 36 })
   user_id!: string;
 
-  @Column({
-    type: 'enum',
-    enum: ['owner', 'editor', 'viewer'],
-    default: 'viewer',
-  })
+  @Column({ type: 'varchar', length: 10, default: 'viewer' })
   role!: PermissionRole;
 
   @Column({ type: 'varchar', length: 36 })
