@@ -1,0 +1,4 @@
+# Hermes Agent 설치:
+# curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+#
+# requirements.txt는 추가 Python 의존성이 필요할 때 사용합니다.
