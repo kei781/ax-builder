@@ -78,10 +78,11 @@ export class HealthService {
 
   private async checkHermes(): Promise<ServiceHealth> {
     const start = Date.now();
-    const hermesVenvPython = `${process.env['HOME']}/.hermes/hermes-agent/venv/bin/python3`;
+    const hermesPython = process.env['HERMES_PYTHON_PATH']
+      || `${process.env['HOME']}/.hermes/hermes-agent/venv/bin/python3`;
     try {
       const { stdout } = await execAsync(
-        `${hermesVenvPython} -c "from run_agent import AIAgent; print('ok')"`,
+        `${hermesPython} -c "from run_agent import AIAgent; print('ok')"`,
         { timeout: 10000 },
       );
       const latency = Date.now() - start;
