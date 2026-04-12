@@ -38,76 +38,72 @@ ax-builder는 그 문제를 해결합니다.
 
 ---
 
-## 어떻게 작동하나요?
-
-| 단계 | 무슨 일이 일어나는지 | 사용하는 AI |
-|---|---|---|
-| **Discovery** | AI가 린 캔버스 기반으로 질문하며 아이디어를 PRD로 구조화 | Gemini 3.0 Flash |
-| **Build** | PRD를 기반으로 코드 생성 + 서버 실행 | Hermes Agent → Claude Code CLI |
-| **QA** | 가상 브라우저로 접속하여 모든 기능을 자동 검증 | Claude Code CLI (에이전트 팀) |
-| **Fix** | QA 실패 시 자동 수정 후 재검증 | Hermes Agent → Claude Code CLI |
-| **Deploy** | Docker 컨테이너에 격리 배포, URL 발급 | Docker + Nginx |
-
-모든 프로젝트는 개별 Docker 컨테이너에서 격리 실행됩니다. 한 프로젝트가 망가져도 다른 프로젝트에 영향 없습니다.
-
----
-
-## 설치
+## 빠른 시작 (3단계)
 
 ### 요구사항
 
 - Node.js 20+
-- Python 3.11+
-- Docker + Docker Compose
-- Gemini API 키 ([Google AI Studio](https://aistudio.google.com/)에서 발급)
-- Anthropic 계정 (Claude Code CLI 로그인용)
+- Python 3.11+ (`brew install python@3.11`)
+- Docker (빌드한 프로젝트 격리 실행용, 선택)
+- [Gemini API 키](https://aistudio.google.com/) (무료 발급 가능)
+- [Google OAuth 클라이언트](https://console.cloud.google.com) (로그인용)
+- Anthropic 계정 (`claude login`용)
 
-### 1단계: 프로젝트 받기
+### 1단계: .env 설정
 
 ```bash
-git clone https://github.com/sangwoon/ax-builder.git
+git clone https://github.com/kei781/ax-builder.git
 cd ax-builder
+cp .env.example .env
+nano .env
 ```
 
-### 2단계: 자동 설치
+아래 값을 입력하세요:
+
+| 변수 | 어디서 발급하나요 |
+|---|---|
+| `GOOGLE_CLIENT_ID` | [Google Cloud Console](https://console.cloud.google.com) → API 및 서비스 → 사용자 인증 정보 → OAuth 2.0 클라이언트 ID |
+| `GOOGLE_CLIENT_SECRET` | 위와 동일 (승인된 리디렉션 URI: `http://localhost:4000/api/auth/google/callback`) |
+| `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) → API 키 발급 |
+| `JWT_SECRET` | 아무 랜덤 문자열 (예: `openssl rand -hex 32`) |
+| `ALLOWED_EMAIL_DOMAIN` | 로그인 허용할 이메일 도메인 (예: `cv-3.com`) |
+
+### 2단계: 설치
 
 ```bash
 chmod +x setup.sh
 ./setup.sh
 ```
 
-setup.sh가 아래를 자동으로 처리합니다:
+setup.sh가 자동으로 처리하는 것:
 - Node.js 의존성 설치 (frontend + backend)
-- Claude Code CLI 설치
-- Hermes Agent 설치 (Python)
-- Docker 이미지 다운로드
-- `.env` 파일 생성
+- Hermes Agent 설치 + Python 경로 자동 감지 → `.env`에 기록
+- `.env` 파일 생성 (없을 경우)
+- `data/`, `projects/` 디렉토리 생성
 
-### 3단계: 수동 설정 (1회)
-
-```bash
-# 1. API 키 입력
-nano .env
-# GEMINI_API_KEY, JWT_SECRET, DB_ROOT_PASSWORD 입력
-
-# 2. Claude Code 로그인
-claude login
-```
-
-### 4단계: 실행
+### 3단계: 실행
 
 ```bash
-# Docker 서비스 시작 (MySQL, Nginx)
-docker-compose up -d
-
-# 백엔드 시작
+# 터미널 1: 백엔드
 cd backend && npm run start:dev
 
-# 프론트엔드 시작 (별도 터미널)
+# 터미널 2: 프론트엔드
 cd frontend && npm run dev
 ```
 
-http://localhost:5173 에서 접속 가능합니다.
+http://localhost:5173 에서 접속. 끝.
+
+> DB 서버를 따로 띄울 필요 없습니다. SQLite를 사용하며 `data/ax-builder.db` 파일로 자동 생성됩니다.
+
+### 최초 1회 추가 설정
+
+```bash
+# Hermes Agent 초기 설정 (모델 선택 등)
+hermes setup
+
+# Claude Code CLI 로그인
+claude login
+```
 
 ---
 
@@ -133,7 +129,20 @@ http://localhost:5173 에서 접속 가능합니다.
 
 - 만든 사람(owner)만 수정/삭제 가능
 - 다른 사람에게 editor(수정 가능) 또는 viewer(보기만 가능) 권한 부여 가능
-- 팀 단위 일괄 공유는 의도적으로 지원하지 않음 (한 사람의 문제를 해결하는 인스턴트 제품 철학)
+
+---
+
+## 어떻게 작동하나요?
+
+| 단계 | 무슨 일이 일어나는지 | 사용하는 AI |
+|---|---|---|
+| **Discovery** | AI가 린 캔버스 기반으로 질문하며 아이디어를 PRD로 구조화 | Gemini 3 Flash |
+| **Build** | PRD를 기반으로 코드 생성 + 서버 실행 | Hermes Agent → Claude Code CLI |
+| **QA** | 브라우저로 접속하여 모든 기능을 자동 검증 | Claude Code CLI |
+| **Fix** | QA 실패 시 자동 수정 후 재검증 (최대 3회) | Hermes Agent → Claude Code CLI |
+| **Deploy** | Docker 컨테이너에 격리 배포, URL 발급 | Docker |
+
+> Hermes Agent는 오케스트레이터 역할만 하고, 실제 코딩은 모두 Claude Code CLI가 수행합니다.
 
 ---
 
@@ -159,12 +168,11 @@ AI는 대화를 통해 아이디어를 1000점 만점으로 평가합니다.
 |---|---|
 | Frontend | React + TypeScript + Tailwind CSS |
 | Backend | NestJS + TypeScript |
-| Database | MySQL (플랫폼) + SQLite (프로젝트별) |
-| Discovery Agent | Gemini 3.0 Flash |
+| Database | SQLite (better-sqlite3) |
+| Discovery Agent | Gemini 3 Flash |
 | Build/QA 오케스트레이터 | Hermes Agent |
 | Build/QA 실행 | Claude Code CLI |
 | 컨테이너 격리 | Docker (포트 3000~3999) |
-| 리버스 프록시 | Nginx |
 
 ---
 
@@ -176,6 +184,7 @@ ax-builder/
 ├── backend/           # NestJS API 서버
 ├── bridge/            # Hermes Agent ↔ Claude Code CLI 브릿지
 │   └── hermes_pipeline.py
+├── data/              # SQLite DB (ax-builder.db, 자동 생성)
 ├── projects/          # 빌드된 프로젝트들 (자동 생성)
 ├── docker/            # Docker Compose + Nginx 설정
 ├── setup.sh           # 자동 설치 스크립트
@@ -187,14 +196,17 @@ ax-builder/
 
 ## 환경 변수
 
-| 변수 | 설명 | 예시 |
+| 변수 | 설명 | 필수 |
 |---|---|---|
-| `GEMINI_API_KEY` | Google Gemini API 키 | `AIza...` |
-| `DB_ROOT_PASSWORD` | MySQL 루트 비밀번호 | `your_password` |
-| `JWT_SECRET` | JWT 인증 시크릿 | `your_secret` |
-| `OPENROUTER_API_KEY` | Hermes Agent용 (선택) | `sk-or-...` |
-
-Claude Code CLI는 `claude login`으로 인증하며, 환경 변수 불필요.
+| `GOOGLE_CLIENT_ID` | Google OAuth 클라이언트 ID | ✅ |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth 시크릿 | ✅ |
+| `GEMINI_API_KEY` | Gemini API 키 | ✅ |
+| `JWT_SECRET` | JWT 인증 시크릿 | ✅ |
+| `ALLOWED_EMAIL_DOMAIN` | 허용 이메일 도메인 | ✅ |
+| `HERMES_PYTHON_PATH` | Hermes Agent Python 경로 (setup.sh가 자동 설정) | 자동 |
+| `OPENROUTER_API_KEY` | Hermes Agent용 LLM API 키 | 선택 |
+| `GEMINI_MODEL` | Gemini 모델명 (기본: gemini-3-flash-preview) | 선택 |
+| `DB_PATH` | SQLite DB 경로 (기본: data/ax-builder.db) | 선택 |
 
 ---
 
@@ -206,14 +218,11 @@ Claude Code CLI는 `claude login`으로 인증하며, 환경 변수 불필요.
 **Q: 만든 앱은 어디서 접속하나요?**
 프로젝트 대시보드에 접속 URL이 표시됩니다. `http://localhost:3000~3999` 범위의 포트가 자동 할당됩니다.
 
-**Q: 동시에 몇 개까지 만들 수 있나요?**
-포트 범위(3000~3999) 내에서 최대 1000개까지 동시 운영 가능합니다.
+**Q: DB 서버를 따로 설치해야 하나요?**
+아닙니다. SQLite를 사용하며 `data/ax-builder.db` 파일로 자동 생성됩니다. 별도 DB 서버가 필요 없습니다.
 
 **Q: 앱 데이터는 어디에 저장되나요?**
 각 프로젝트 폴더 안에 SQLite 파일로 저장됩니다. 프로젝트 삭제 시 데이터도 함께 삭제됩니다.
-
-**Q: 다른 사람이 내 앱을 수정할 수 있나요?**
-본인이 명시적으로 editor 권한을 부여한 사람만 수정 가능합니다.
 
 **Q: QA에서 계속 실패하면?**
 AI가 자동으로 최대 3회 수정을 시도합니다. 그래도 해결 안 되면 실패 리포트와 함께 PRD 수정을 안내합니다.
