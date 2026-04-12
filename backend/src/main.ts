@@ -12,7 +12,7 @@ async function bootstrap() {
   });
   app.useGlobalPipes(new ValidationPipe({ transform: true }));
 
-  const port = process.env['BACKEND_PORT'] || 4000;
+  const port = process.env['BACKEND_PORT'] || 3123;
   await app.listen(port);
   console.log(`ax-builder backend running on port ${port}`);
 }

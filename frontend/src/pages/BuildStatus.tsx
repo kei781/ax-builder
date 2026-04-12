@@ -1,7 +1,8 @@
-import { useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useState, useEffect, useRef } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
 import BuildLog from '../components/BuildLog';
 import { useWebSocket } from '../hooks/useWebSocket';
+import client from '../api/client';
 
 const steps = [
   { key: 'setup', label: '환경 준비' },
@@ -10,13 +11,65 @@ const steps = [
   { key: 'deploy', label: '배포' },
 ];
 
+type ProjectStatus = 'building' | 'qa' | 'deployed' | 'failed' | string;
+
 export default function BuildStatus() {
   const { id } = useParams<{ id: string }>();
-  const { connected, progress } = useWebSocket(id);
-  const [logs] = useState<string[]>([]);
+  const navigate = useNavigate();
+  const { connected, progress, lastEvent } = useWebSocket(id);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [projectStatus, setProjectStatus] = useState<ProjectStatus>('building');
+  const [port, setPort] = useState<number | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const startTime = useRef(Date.now());
 
-  const currentStep = progress?.phase || 'setup';
-  const currentStepIdx = steps.findIndex((s) => s.key === currentStep);
+  // 경과 시간 카운터
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTime.current) / 1000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // API 폴링 — WebSocket 안 될 때 대비
+  useEffect(() => {
+    if (!id) return;
+    const poll = async () => {
+      try {
+        const res = await client.get(`/projects/${id}/build/status`);
+        setProjectStatus(res.data.status);
+        if (res.data.port) setPort(res.data.port);
+      } catch { /* ignore */ }
+    };
+    poll();
+    const interval = setInterval(poll, 5000);
+    return () => clearInterval(interval);
+  }, [id]);
+
+  // WebSocket 이벤트 반영
+  useEffect(() => {
+    if (lastEvent === 'build_complete') {
+      setProjectStatus('deployed');
+    } else if (lastEvent === 'build_failed') {
+      setProjectStatus('failed');
+    }
+  }, [lastEvent]);
+
+  // progress 로그 추가
+  useEffect(() => {
+    if (progress?.current_task) {
+      setLogs((prev) => [...prev, progress.current_task]);
+    }
+  }, [progress]);
+
+  const currentPhase = progress?.phase || (
+    projectStatus === 'deployed' ? 'deploy' :
+    projectStatus === 'qa' ? 'qa' :
+    projectStatus === 'failed' ? 'deploy' : 'setup'
+  );
+  const currentStepIdx = steps.findIndex((s) => s.key === currentPhase);
+  const isComplete = projectStatus === 'deployed';
+  const isFailed = projectStatus === 'failed';
 
   return (
     <div className="min-h-screen bg-gray-950">
@@ -32,35 +85,80 @@ export default function BuildStatus() {
               : 'bg-gray-800 text-gray-500'
           }`}
         >
-          {connected ? '연결됨' : '연결 중...'}
+          {connected ? '실시간 연결' : 'API 폴링'}
+        </span>
+        <span className="text-gray-500 text-xs ml-auto">
+          경과: {Math.floor(elapsed / 60)}분 {elapsed % 60}초
         </span>
       </header>
 
       <main className="max-w-4xl mx-auto px-6 py-8">
+        {/* 완료/실패 배너 */}
+        {isComplete && (
+          <div className="bg-green-500/10 border border-green-500/30 rounded-xl p-4 mb-8 flex items-center justify-between">
+            <div>
+              <p className="text-green-400 font-medium">빌드 완료!</p>
+              {port && (
+                <a
+                  href={`http://localhost:${port}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-green-300 text-sm hover:underline"
+                >
+                  http://localhost:{port} 에서 접속 →
+                </a>
+              )}
+            </div>
+            <button
+              onClick={() => navigate('/')}
+              className="bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded-xl text-sm"
+            >
+              대시보드로
+            </button>
+          </div>
+        )}
+
+        {isFailed && (
+          <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-8">
+            <p className="text-red-400 font-medium">빌드 실패</p>
+            <p className="text-red-300/70 text-sm mt-1">
+              AI가 3회 재시도했으나 해결하지 못했습니다. PRD를 수정하고 다시 시도해주세요.
+            </p>
+            <button
+              onClick={() => navigate(`/projects/${id}/chat`)}
+              className="mt-3 bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded-xl text-sm"
+            >
+              PRD 수정하기
+            </button>
+          </div>
+        )}
+
         {/* Step Progress */}
         <div className="mb-8">
           {steps.map((step, idx) => {
-            const isComplete = idx < currentStepIdx;
-            const isCurrent = idx === currentStepIdx;
+            const stepComplete = isComplete ? true : idx < currentStepIdx;
+            const isCurrent = !isComplete && !isFailed && idx === currentStepIdx;
 
             return (
               <div key={step.key} className="flex items-start gap-4 mb-4">
                 <div className="flex flex-col items-center">
                   <div
                     className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${
-                      isComplete
+                      stepComplete
                         ? 'bg-green-600 text-white'
                         : isCurrent
                           ? 'bg-yellow-500 text-black animate-pulse'
-                          : 'bg-gray-800 text-gray-600'
+                          : isFailed && idx === currentStepIdx
+                            ? 'bg-red-500 text-white'
+                            : 'bg-gray-800 text-gray-600'
                     }`}
                   >
-                    {isComplete ? '✓' : idx + 1}
+                    {stepComplete ? '✓' : isFailed && idx === currentStepIdx ? '✗' : idx + 1}
                   </div>
                   {idx < steps.length - 1 && (
                     <div
                       className={`w-0.5 h-8 ${
-                        isComplete ? 'bg-green-600' : 'bg-gray-800'
+                        stepComplete ? 'bg-green-600' : 'bg-gray-800'
                       }`}
                     />
                   )}
@@ -68,11 +166,13 @@ export default function BuildStatus() {
                 <div className="pt-1">
                   <p
                     className={`font-medium ${
-                      isComplete
+                      stepComplete
                         ? 'text-green-400'
                         : isCurrent
                           ? 'text-yellow-400'
-                          : 'text-gray-600'
+                          : isFailed && idx === currentStepIdx
+                            ? 'text-red-400'
+                            : 'text-gray-600'
                     }`}
                   >
                     {step.label}
@@ -82,41 +182,21 @@ export default function BuildStatus() {
                       {progress.current_task}
                     </p>
                   )}
+                  {isCurrent && !progress?.current_task && (
+                    <p className="text-gray-500 text-sm mt-1 animate-pulse">
+                      진행 중...
+                    </p>
+                  )}
                 </div>
               </div>
             );
           })}
         </div>
 
-        {/* Stats */}
-        {progress && (
-          <div className="grid grid-cols-3 gap-4 mb-8">
-            <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-              <p className="text-gray-500 text-xs mb-1">생성된 파일</p>
-              <p className="text-white text-xl font-bold">
-                {progress.files_created}/{progress.files_total}
-              </p>
-            </div>
-            <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-              <p className="text-gray-500 text-xs mb-1">경과 시간</p>
-              <p className="text-white text-xl font-bold">
-                {Math.floor(progress.elapsed_seconds / 60)}분{' '}
-                {progress.elapsed_seconds % 60}초
-              </p>
-            </div>
-            <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-              <p className="text-gray-500 text-xs mb-1">진행률</p>
-              <p className="text-white text-xl font-bold">
-                {progress.progress_percent}%
-              </p>
-            </div>
-          </div>
-        )}
-
         {/* Logs */}
         <div>
-          <h3 className="text-gray-400 text-sm mb-3">실시간 빌드 로그</h3>
-          <BuildLog logs={logs} />
+          <h3 className="text-gray-400 text-sm mb-3">빌드 로그</h3>
+          <BuildLog logs={logs.length > 0 ? logs : ['빌드 파이프라인 실행 중... (Hermes → Claude Code CLI)']} />
         </div>
       </main>
     </div>

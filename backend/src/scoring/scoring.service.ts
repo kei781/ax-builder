@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
-import { GoogleGenAI } from '@google/genai';
+import OpenAI from 'openai';
 import { Conversation, ConversationType } from '../projects/entities/conversation.entity.js';
 import { Project } from '../projects/entities/project.entity.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -117,9 +117,8 @@ Discovery Agent입니다. 단순한 PRD 평가가 아니라, 사용자의 문제
 @Injectable()
 export class ScoringService {
   private readonly logger = new Logger(ScoringService.name);
-  private readonly ai: GoogleGenAI;
-  private readonly primaryModel: string;
-  private readonly fallbackModels: string[];
+  private readonly openai: OpenAI;
+  private readonly chatModel: string;
 
   constructor(
     @InjectRepository(Conversation)
@@ -128,10 +127,16 @@ export class ScoringService {
     private readonly projectRepo: Repository<Project>,
     private readonly configService: ConfigService,
   ) {
-    const apiKey = this.configService.get<string>('GEMINI_API_KEY', '');
-    this.ai = new GoogleGenAI({ apiKey });
-    this.primaryModel = this.configService.get<string>('GEMINI_MODEL', 'gemini-3-flash-preview');
-    this.fallbackModels = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+    // OpenRouter — OpenAI 호환 API
+    this.openai = new OpenAI({
+      baseURL: 'https://openrouter.ai/api/v1',
+      apiKey: this.configService.get<string>('OPENROUTER_API_KEY', ''),
+    });
+    // 기획 채팅: Gemma 4 31B (deep 분석, 저비용)
+    this.chatModel = this.configService.get<string>(
+      'CHAT_MODEL',
+      'google/gemma-4-31b-it',
+    );
   }
 
   async chat(
@@ -158,18 +163,48 @@ export class ScoringService {
       });
     }
 
-    // 2. Build Gemini contents from history
+    // 2. 최근 6개 메시지만 전송 (토큰 비용 절감)
     const history = conversation.conversation_history || [];
-    const contents = [
-      ...history.map((m: { role: string; content: string }) => ({
-        role: m.role === 'assistant' ? 'model' as const : 'user' as const,
-        parts: [{ text: m.content }],
-      })),
-      { role: 'user' as const, parts: [{ text: message }] },
+    const MAX_HISTORY = 6;
+    const recentHistory = history.slice(-MAX_HISTORY);
+
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      { role: 'system', content: SCORING_SYSTEM_PROMPT },
     ];
 
-    // 3. Call Gemini API with retry and fallback
-    const responseText = await this.callGeminiWithRetryAndFallback(contents);
+    // 이전 대화가 잘린 경우, 컨텍스트 요약 추가
+    if (history.length > MAX_HISTORY) {
+      messages.push({
+        role: 'user',
+        content: `[이전 대화 요약] 현재 스코어: ${conversation.current_score}/1000, 단계: ${conversation.score_tier}. 이어서 진행해주세요.`,
+      });
+    }
+
+    for (const m of recentHistory) {
+      messages.push({
+        role: m.role === 'assistant' ? 'assistant' : 'user',
+        content: m.content,
+      });
+    }
+    messages.push({ role: 'user', content: message });
+
+    // 3. Call OpenRouter API
+    let responseText: string;
+    try {
+      const response = await this.openai.chat.completions.create({
+        model: this.chatModel,
+        messages,
+        max_tokens: 4096,
+      });
+      responseText = response.choices[0]?.message?.content ?? 'AI 응답을 받지 못했습니다.';
+    } catch (error: any) {
+      this.logger.error(`OpenRouter API error (${this.chatModel}):`, error?.message);
+      if (error?.status === 429) {
+        responseText = 'API 요청 한도에 도달했습니다. 잠시 후 다시 시도해주세요.';
+      } else {
+        responseText = 'AI 연결에 문제가 발생했습니다. 잠시 후 다시 시도해주세요.';
+      }
+    }
 
     // 4. Parse JSON block from response
     const parsed = this.parseScoreJson(responseText);
@@ -206,66 +241,6 @@ export class ScoringService {
     };
   }
 
-  private parseRetryDelay(error: unknown): number {
-    try {
-      const errorObj = error as { message?: string };
-      const msg = errorObj?.message ?? String(error);
-      const match = msg.match(/retryDelay.*?(\d+)s/i) ?? msg.match(/"(\d+)s"/);
-      if (match) return parseInt(match[1], 10) * 1000;
-    } catch {
-      // ignore parse errors
-    }
-    return 5000; // default 5s
-  }
-
-  private isQuotaError(error: unknown): boolean {
-    const msg = (error as { message?: string })?.message ?? String(error);
-    return msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
-  }
-
-  private async callGeminiWithRetryAndFallback(
-    contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }>,
-  ): Promise<string> {
-    const modelsToTry = [this.primaryModel, ...this.fallbackModels];
-
-    for (const model of modelsToTry) {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const response = await this.ai.models.generateContent({
-            model,
-            config: {
-              systemInstruction: SCORING_SYSTEM_PROMPT,
-              maxOutputTokens: 4096,
-            },
-            contents,
-          });
-          return response.text ?? 'AI 응답을 받지 못했습니다.';
-        } catch (error) {
-          if (this.isQuotaError(error)) {
-            const delay = this.parseRetryDelay(error);
-            this.logger.warn(
-              `Gemini 429 quota error on model=${model}, attempt ${attempt + 1}/3. Retrying in ${delay}ms...`,
-            );
-            if (attempt < 2) {
-              await new Promise((resolve) => setTimeout(resolve, delay));
-              continue;
-            }
-            // Last attempt for this model failed, try next model
-            this.logger.warn(`All retries exhausted for model=${model}, trying fallback...`);
-            break;
-          }
-          // Non-quota error, don't retry
-          this.logger.error(`Gemini API error on model=${model}:`, error);
-          return 'AI 연결에 문제가 발생했습니다. 잠시 후 다시 시도해주세요.';
-        }
-      }
-    }
-
-    // All models exhausted
-    this.logger.error('All Gemini models exhausted due to quota limits');
-    return 'Gemini API 할당량이 초과되었습니다. 잠시 후 다시 시도해주세요.';
-  }
-
   private parseScoreJson(text: string): {
     current_phase: string;
     score: number;
@@ -292,7 +267,6 @@ export class ScoringService {
     };
 
     try {
-      // Find JSON block in ```json ... ```
       const jsonMatch = text.match(/```json\s*([\s\S]*?)```/);
       if (!jsonMatch) return defaults;
 
@@ -315,13 +289,12 @@ export class ScoringService {
         prd_preview: parsed.prd_preview || null,
       };
     } catch {
-      this.logger.warn('Failed to parse score JSON from Gemini response');
+      this.logger.warn('Failed to parse score JSON from response');
       return defaults;
     }
   }
 
   private stripJsonBlock(text: string): string {
-    // Remove the JSON block from the display text
     return text.replace(/```json[\s\S]*?```/, '').trim();
   }
 
@@ -353,7 +326,6 @@ export class ScoringService {
       };
     }
 
-    // Strip JSON blocks from assistant messages for display
     const messages = (conversation.conversation_history || []).map(
       (m: { role: string; content: string }) => ({
         role: m.role,
@@ -362,7 +334,6 @@ export class ScoringService {
       }),
     );
 
-    // Re-parse the last assistant message to get the latest breakdown
     const lastAssistant = [...(conversation.conversation_history || [])]
       .reverse()
       .find((m: { role: string; content: string }) => m.role === 'assistant');

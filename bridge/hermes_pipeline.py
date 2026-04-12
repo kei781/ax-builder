@@ -134,13 +134,15 @@ def run_pipeline(project_path: str, port: int) -> dict:
     prompt = PIPELINE_PROMPT.replace("{project_path}", project_path).replace("{port}", str(port))
 
     try:
+        # Hermes 오케스트레이터: Qwen 3.5 via OpenRouter (저비용)
+        # 코딩은 Claude Code CLI(정액제)가 수행
+        hermes_model = os.environ.get("HERMES_MODEL", "qwen/qwen3.5-35b-a3b")
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4",
+            model=hermes_model,
             quiet_mode=True,
             ephemeral_system_prompt=prompt,
             skip_memory=True,
             max_iterations=90,
-            # terminal만 허용 — Hermes는 claude CLI 호출만 가능
             enabled_toolsets=["terminal"],
         )
 
