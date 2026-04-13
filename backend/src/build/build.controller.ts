@@ -21,4 +21,10 @@ export class BuildController {
   async getBuildLogs(@Param('id') id: string) {
     return this.buildService.getBuildLogs(id);
   }
+
+  /** 프로젝트 디렉토리의 로컬 파일 조회 (PRD.md / DESIGN.md / CLAUDE.md) */
+  @Get(':id/build/docs')
+  async getBuildDocs(@Param('id') id: string) {
+    return this.buildService.getProjectDocs(id);
+  }
 }

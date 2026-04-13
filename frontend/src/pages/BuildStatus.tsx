@@ -27,6 +27,14 @@ export default function BuildStatus() {
   const [tab, setTab] = useState<Tab>('build');
   const [chatMessages, setChatMessages] = useState<Array<{ role: string; content: string }>>([]);
   const [chatLoading, setChatLoading] = useState(false);
+  const [docs, setDocs] = useState<{ prd: string | null; design: string | null; claude: string | null; project_path: string | null }>({
+    prd: null,
+    design: null,
+    claude: null,
+    project_path: null,
+  });
+  const [docsLoading, setDocsLoading] = useState(false);
+  const [showDoc, setShowDoc] = useState<null | 'prd' | 'design' | 'claude'>(null);
   const startTime = useRef(Date.now());
 
   useEffect(() => {
@@ -60,6 +68,28 @@ export default function BuildStatus() {
       setLocalLogs((prev) => [...prev, `▸ ${progress.current_task}`]);
     }
   }, [progress]);
+
+  // 로컬 프로젝트 문서 (PRD.md / DESIGN.md / CLAUDE.md) 로드
+  // 빌드 진행 중이면 10초마다 갱신, 완료/실패 후엔 1회만
+  useEffect(() => {
+    if (!id) return;
+    const load = async () => {
+      setDocsLoading(true);
+      try {
+        const res = await client.get(`/projects/${id}/build/docs`);
+        setDocs(res.data);
+      } catch {
+        /* ignore */
+      } finally {
+        setDocsLoading(false);
+      }
+    };
+    load();
+    const active = projectStatus === 'building' || projectStatus === 'qa';
+    if (!active) return;
+    const timer = setInterval(load, 10000);
+    return () => clearInterval(timer);
+  }, [id, projectStatus]);
 
   // 채팅 탭 전환 시 히스토리 로드 (최초 1회)
   useEffect(() => {
@@ -233,6 +263,44 @@ export default function BuildStatus() {
               })}
             </div>
 
+            {/* 로컬 문서 보기 (프로젝트 디렉토리의 현재 상태) */}
+            <div className="mb-6">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-gray-600 dark:text-gray-400 text-sm">프로젝트 문서 (로컬, 빌드 중 갱신됨)</h3>
+                {docsLoading && (
+                  <span className="text-xs text-gray-500">로딩...</span>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => setShowDoc('prd')}
+                  disabled={!docs.prd}
+                  className="px-3 py-2 rounded-lg text-xs font-medium border border-blue-400/50 text-blue-500 hover:bg-blue-400/10 disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  📄 PRD.md {docs.prd && <span className="text-[10px] opacity-60">({docs.prd.length}자)</span>}
+                </button>
+                <button
+                  onClick={() => setShowDoc('design')}
+                  disabled={!docs.design}
+                  className="px-3 py-2 rounded-lg text-xs font-medium border border-purple-400/50 text-purple-500 hover:bg-purple-400/10 disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  🎨 DESIGN.md {docs.design && <span className="text-[10px] opacity-60">({docs.design.length}자)</span>}
+                </button>
+                <button
+                  onClick={() => setShowDoc('claude')}
+                  disabled={!docs.claude}
+                  className="px-3 py-2 rounded-lg text-xs font-medium border border-gray-400/50 text-gray-500 hover:bg-gray-400/10 disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  ⚙ CLAUDE.md
+                </button>
+              </div>
+              {docs.project_path && (
+                <p className="text-[10px] text-gray-500 mt-2 font-mono truncate">
+                  {docs.project_path}
+                </p>
+              )}
+            </div>
+
             {/* Logs */}
             <div>
               <h3 className="text-gray-600 dark:text-gray-400 text-sm mb-3">빌드 로그</h3>
@@ -269,6 +337,34 @@ export default function BuildStatus() {
           </div>
         )}
       </main>
+
+      {/* 로컬 문서 모달 */}
+      {showDoc && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-white dark:bg-gray-900 rounded-2xl w-full max-w-3xl max-h-[85vh] flex flex-col shadow-2xl">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-800">
+              <h2 className="text-gray-900 dark:text-white font-medium">
+                {showDoc === 'prd' && '📄 PRD.md (프로젝트 디렉토리 현재 상태)'}
+                {showDoc === 'design' && '🎨 DESIGN.md (프로젝트 디렉토리 현재 상태)'}
+                {showDoc === 'claude' && '⚙ CLAUDE.md (빌드 에이전트 규칙)'}
+              </h2>
+              <button
+                onClick={() => setShowDoc(null)}
+                className="text-gray-400 hover:text-gray-900 dark:hover:text-white text-xl leading-none"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="overflow-y-auto px-6 py-4">
+              <pre className="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-wrap font-sans leading-relaxed">
+                {showDoc === 'prd' && (docs.prd || '(비어있음)')}
+                {showDoc === 'design' && (docs.design || '(비어있음)')}
+                {showDoc === 'claude' && (docs.claude || '(비어있음)')}
+              </pre>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
