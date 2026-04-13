@@ -30,10 +30,10 @@ export default function Login() {
   const error = searchParams.get('error');
 
   return (
-    <div className="min-h-screen bg-gray-950 flex items-center justify-center">
-      <div className="bg-gray-900 rounded-2xl p-10 max-w-md w-full mx-4 text-center">
-        <h1 className="text-3xl font-bold text-white mb-2">ax-builder</h1>
-        <p className="text-gray-400 mb-8">
+    <div className="min-h-screen bg-gray-50 dark:bg-gray-950 flex items-center justify-center">
+      <div className="bg-white dark:bg-gray-900 rounded-2xl p-10 max-w-md w-full mx-4 text-center shadow-lg dark:shadow-none">
+        <h1 className="text-3xl font-bold text-gray-900 dark:text-white mb-2">ax-builder</h1>
+        <p className="text-gray-600 dark:text-gray-400 mb-8">
           아이디어를 말하면 AI가 제품을 만들어줍니다
         </p>
 
@@ -49,7 +49,7 @@ export default function Login() {
 
         <button
           onClick={login}
-          className="w-full bg-white text-gray-900 font-medium py-3 px-6 rounded-xl hover:bg-gray-100 transition-colors flex items-center justify-center gap-3"
+          className="w-full bg-white text-gray-900 font-medium py-3 px-6 rounded-xl hover:bg-gray-100 transition-colors flex items-center justify-center gap-3 border border-gray-200 dark:border-transparent"
         >
           <svg className="w-5 h-5" viewBox="0 0 24 24">
             <path

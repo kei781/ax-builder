@@ -8,6 +8,7 @@ import { Repository } from 'typeorm';
 import { Project } from './entities/project.entity.js';
 import { ProjectPermission } from './entities/project-permission.entity.js';
 import { ProjectEnvVar } from './entities/project-env-var.entity.js';
+import { Conversation } from './entities/conversation.entity.js';
 import { User } from '../auth/entities/user.entity.js';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -20,9 +21,83 @@ export class ProjectsService {
     private readonly permissionRepo: Repository<ProjectPermission>,
     @InjectRepository(ProjectEnvVar)
     private readonly envVarRepo: Repository<ProjectEnvVar>,
+    @InjectRepository(Conversation)
+    private readonly conversationRepo: Repository<Conversation>,
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
   ) {}
+
+  private extractMissingItems(history: Array<{ role: string; content: string }>): string[] {
+    const lastAssistant = [...(history || [])]
+      .reverse()
+      .find((m) => m.role === 'assistant');
+    if (!lastAssistant) return [];
+    const match = lastAssistant.content.match(/```json\s*([\s\S]*?)```/);
+    if (!match) return [];
+    try {
+      const parsed = JSON.parse(match[1]);
+      return Array.isArray(parsed.missing_items) ? parsed.missing_items : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 같은 이메일 도메인의 다른 사용자가 만든 프로젝트 — 권한 없음 (viewer 자동)
+   */
+  async findTeamProjects(userId: string) {
+    const me = await this.userRepo.findOne({ where: { id: userId } });
+    if (!me) return [];
+    const domain = me.email.split('@')[1];
+    if (!domain) return [];
+
+    // 같은 도메인의 모든 유저
+    const teammates = await this.userRepo
+      .createQueryBuilder('u')
+      .where('u.email LIKE :pat', { pat: `%@${domain}` })
+      .andWhere('u.id != :me', { me: userId })
+      .getMany();
+    const teammateIds = teammates.map((u) => u.id);
+    if (teammateIds.length === 0) return [];
+
+    // 내가 이미 권한 있는 프로젝트는 제외
+    const myPerms = await this.permissionRepo.find({ where: { user_id: userId } });
+    const myProjectIds = new Set(myPerms.map((p) => p.project_id));
+
+    const allProjects = await this.projectRepo
+      .createQueryBuilder('p')
+      .leftJoinAndSelect('p.user', 'u')
+      .where('p.user_id IN (:...ids)', { ids: teammateIds })
+      .orderBy('p.created_at', 'DESC')
+      .getMany();
+
+    const teamProjects = allProjects.filter((p) => !myProjectIds.has(p.id));
+    if (teamProjects.length === 0) return [];
+
+    // missing_items
+    const conversations = await this.conversationRepo.find({
+      where: teamProjects.map((p) => ({
+        project_id: p.id,
+        type: 'scoring' as const,
+      })),
+    });
+    const missingMap = new Map<string, string[]>();
+    for (const c of conversations) {
+      missingMap.set(c.project_id, this.extractMissingItems(c.conversation_history));
+    }
+
+    return teamProjects.map((p) => ({
+      id: p.id,
+      title: p.title,
+      status: p.status,
+      score: p.score,
+      port: p.port,
+      ownerName: p.user?.name || 'Unknown',
+      myRole: 'viewer' as const,
+      missing_items: missingMap.get(p.id) || [],
+      created_at: p.created_at,
+    }));
+  }
 
   async findAllForUser(userId: string) {
     const permissions = await this.permissionRepo.find({
@@ -30,18 +105,34 @@ export class ProjectsService {
       relations: ['project', 'project.user'],
     });
 
-    return permissions
-      .filter((p) => p.project)
-      .map((p) => ({
-        id: p.project.id,
-        title: p.project.title,
-        status: p.project.status,
-        score: p.project.score,
-        port: p.project.port,
-        ownerName: p.project.user?.name || 'Unknown',
-        myRole: p.role,
-        created_at: p.project.created_at,
-      }));
+    const validPerms = permissions.filter((p) => p.project);
+    const projectIds = validPerms.map((p) => p.project.id);
+
+    // 각 프로젝트의 scoring 대화에서 missing_items 뽑기
+    const conversations = projectIds.length
+      ? await this.conversationRepo.find({
+          where: projectIds.map((id) => ({
+            project_id: id,
+            type: 'scoring' as const,
+          })),
+        })
+      : [];
+    const missingMap = new Map<string, string[]>();
+    for (const c of conversations) {
+      missingMap.set(c.project_id, this.extractMissingItems(c.conversation_history));
+    }
+
+    return validPerms.map((p) => ({
+      id: p.project.id,
+      title: p.project.title,
+      status: p.project.status,
+      score: p.project.score,
+      port: p.project.port,
+      ownerName: p.project.user?.name || 'Unknown',
+      myRole: p.role,
+      missing_items: missingMap.get(p.project.id) || [],
+      created_at: p.project.created_at,
+    }));
   }
 
   async create(userId: string, title: string): Promise<Project> {

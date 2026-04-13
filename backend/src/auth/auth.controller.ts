@@ -7,15 +7,14 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
+import { ConfigService } from '@nestjs/config';
 import type { Response } from 'express';
 import { AuthService } from './auth.service.js';
 import { JwtAuthGuard } from './guards/jwt-auth.guard.js';
 import { User } from './entities/user.entity.js';
 
-// Google callback guard — 실패해도 예외 대신 req.user = false 전달
 class GoogleCallbackGuard extends AuthGuard('google') {
   handleRequest(err: any, user: any, info: any) {
-    // 에러나 user=false여도 예외 안 던지고 그대로 넘김
     if (err || !user) {
       return { _authFailed: true, reason: info?.message || 'auth_failed' };
     }
@@ -25,13 +24,21 @@ class GoogleCallbackGuard extends AuthGuard('google') {
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  private readonly frontendUrl: string;
+
+  constructor(
+    private readonly authService: AuthService,
+    private readonly configService: ConfigService,
+  ) {
+    this.frontendUrl = this.configService.get<string>(
+      'FRONTEND_URL',
+      'http://localhost:3123',
+    );
+  }
 
   @Get('google')
   @UseGuards(AuthGuard('google'))
-  googleAuth() {
-    // Initiates Google OAuth flow
-  }
+  googleAuth() {}
 
   @Get('google/callback')
   @UseGuards(GoogleCallbackGuard)
@@ -42,15 +49,14 @@ export class AuthController {
     const response = res as unknown as Response;
     const user = req['user'];
 
-    // 인증 실패 시 프론트엔드 로그인 페이지로 리다이렉트 (에러 코드 포함)
     if (!user || user._authFailed) {
       const reason = user?.reason || 'auth_failed';
-      response.redirect(`http://localhost:5173/login?error=${reason}`);
+      response.redirect(`${this.frontendUrl}/login?error=${reason}`);
       return;
     }
 
     const token = this.authService.generateJwt(user as User);
-    response.redirect(`http://localhost:5173/login?token=${token}`);
+    response.redirect(`${this.frontendUrl}/login?token=${token}`);
   }
 
   @Get('me')

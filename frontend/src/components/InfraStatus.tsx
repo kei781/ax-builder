@@ -57,7 +57,7 @@ export default function InfraStatus() {
 
   if (error || !health) {
     return (
-      <div className="flex items-center gap-3 px-4 py-1.5 bg-gray-900/50 border-b border-gray-800 text-xs">
+      <div className="flex items-center gap-3 px-4 py-1.5 bg-gray-100 dark:bg-gray-900/50 border-b border-gray-200 dark:border-gray-800 text-xs">
         <span className="text-gray-500">인프라 상태</span>
         <span className="flex items-center gap-1.5 text-gray-500">
           <Dot status="down" />
@@ -75,12 +75,12 @@ export default function InfraStatus() {
   ];
 
   return (
-    <div className="flex items-center gap-4 px-4 py-1.5 bg-gray-900/50 border-b border-gray-800 text-xs">
+    <div className="flex items-center gap-4 px-4 py-1.5 bg-gray-100 dark:bg-gray-900/50 border-b border-gray-200 dark:border-gray-800 text-xs">
       <span className="text-gray-500">인프라</span>
       {services.map((s) => (
         <span
           key={s.key}
-          className="flex items-center gap-1.5 text-gray-400"
+          className="flex items-center gap-1.5 text-gray-600 dark:text-gray-400"
           title={`${s.data.message}${s.data.latency_ms ? ` (${s.data.latency_ms}ms)` : ''}`}
         >
           <Dot status={s.data.status} />

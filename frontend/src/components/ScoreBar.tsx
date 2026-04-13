@@ -16,13 +16,13 @@ export default function ScoreBar({ label, score, maxScore }: ScoreBarProps) {
 
   return (
     <div className="mb-2">
-      <div className="flex justify-between text-xs text-gray-400 mb-1">
+      <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
         <span>{label}</span>
         <span>
           {score}/{maxScore}
         </span>
       </div>
-      <div className="w-full bg-gray-800 rounded-full h-2">
+      <div className="w-full bg-gray-200 dark:bg-gray-800 rounded-full h-2">
         <div
           className={`${getColor()} h-2 rounded-full transition-all duration-500`}
           style={{ width: `${percentage}%` }}

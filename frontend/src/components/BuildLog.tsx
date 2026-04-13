@@ -12,7 +12,7 @@ export default function BuildLog({ logs }: BuildLogProps) {
   }, [logs]);
 
   return (
-    <div className="bg-gray-950 border border-gray-800 rounded-lg p-4 h-64 overflow-y-auto font-mono text-xs text-gray-400">
+    <div className="bg-gray-950 border border-gray-300 dark:border-gray-800 rounded-lg p-4 h-64 overflow-y-auto font-mono text-xs text-gray-400">
       {logs.length === 0 ? (
         <p className="text-gray-600">로그 대기 중...</p>
       ) : (

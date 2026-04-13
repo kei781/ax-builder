@@ -7,12 +7,12 @@ async function bootstrap() {
 
   app.setGlobalPrefix('api');
   app.enableCors({
-    origin: 'http://localhost:5173',
+    origin: ['http://localhost:3123', 'https://hackathon.acaxiaa.store'],
     credentials: true,
   });
   app.useGlobalPipes(new ValidationPipe({ transform: true }));
 
-  const port = process.env['BACKEND_PORT'] || 3123;
+  const port = process.env['BACKEND_PORT'] || 4000;
   await app.listen(port);
   console.log(`ax-builder backend running on port ${port}`);
 }

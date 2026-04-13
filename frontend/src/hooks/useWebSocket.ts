@@ -14,6 +14,7 @@ interface WebSocketState {
   connected: boolean;
   lastEvent: string | null;
   progress: BuildProgress | null;
+  logs: string[];
 }
 
 export function useWebSocket(projectId: string | undefined): WebSocketState {
@@ -21,6 +22,7 @@ export function useWebSocket(projectId: string | undefined): WebSocketState {
     connected: false,
     lastEvent: null,
     progress: null,
+    logs: [],
   });
   const socketRef = useRef<Socket | null>(null);
 
@@ -51,6 +53,14 @@ export function useWebSocket(projectId: string | undefined): WebSocketState {
 
     socket.on('build_failed', () => {
       setState((prev) => ({ ...prev, lastEvent: 'build_failed' }));
+    });
+
+    socket.on('build_log', (data: { projectId: string; line: string }) => {
+      if (data.projectId !== projectId) return;
+      setState((prev) => ({
+        ...prev,
+        logs: [...prev.logs.slice(-500), data.line], // 최근 500줄만 유지
+      }));
     });
 
     return () => {

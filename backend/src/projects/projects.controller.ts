@@ -28,6 +28,12 @@ export class ProjectsController {
     return this.projectsService.findAllForUser(user.id);
   }
 
+  @Get('team')
+  async findTeam(@Req() req: Record<string, any>) {
+    const user = req['user'] as JwtUser;
+    return this.projectsService.findTeamProjects(user.id);
+  }
+
   @Post()
   async create(
     @Req() req: Record<string, any>,
