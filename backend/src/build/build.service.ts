@@ -58,10 +58,17 @@ export class BuildService {
     await fs.mkdir(projectPath, { recursive: true });
     await fs.mkdir(path.join(projectPath, 'data'), { recursive: true });
 
-    // 2. Save PRD
-    const prdPath = path.join(projectPath, 'prd.md');
+    // 2. Save PRD.md + DESIGN.md (에이전트팀 입력)
+    const prdPath = path.join(projectPath, 'PRD.md');
     if (project.prd_content) {
       await fs.writeFile(prdPath, project.prd_content, 'utf-8');
+    }
+    if (project.design_content) {
+      await fs.writeFile(
+        path.join(projectPath, 'DESIGN.md'),
+        project.design_content,
+        'utf-8',
+      );
     }
 
     // 3. Allocate port
@@ -204,13 +211,15 @@ export class BuildService {
       let stderr = '';
 
       proc.stdout.on('data', (data: Buffer) => {
-        stdout += data.toString();
+        const text = data.toString();
+        stdout += text;
       });
 
       proc.stderr.on('data', (data: Buffer) => {
         const lines = data.toString().split('\n').filter(Boolean);
         for (const line of lines) {
           stderr += line + '\n';
+          // JSON progress 이벤트인지 체크
           try {
             const parsed = JSON.parse(line);
             if (parsed.type === 'progress') {
@@ -219,11 +228,14 @@ export class BuildService {
                 current_task: parsed.current_task,
                 progress_percent: parsed.progress_percent,
               });
+              continue;
             }
           } catch {
-            // Non-JSON stderr line — just log it
-            this.logger.debug(`[hermes] ${line}`);
+            // JSON 아니면 일반 로그로 전송
           }
+          // 모든 Hermes/Claude 로그를 프론트 로그 창으로 전송
+          this.wsGateway.emitLog(projectId, line);
+          this.logger.debug(`[hermes] ${line}`);
         }
       });
 
