@@ -46,7 +46,7 @@ cat conversation.md | head -100
 두 Claude CLI 프로세스를 **백그라운드로 동시 실행**:
 
 ```bash
-# PRD 에이전트 (백그라운드)
+# PRD 에이전트 (백그라운드) — --no-session-persistence로 완전 stateless
 claude -p "현재 디렉토리의 conversation.md를 정독하세요. current_prd.md가 있으면 참고해서 개선하세요.
 
 고품질 Product Requirements Document를 PRD.md 파일로 Write 툴을 통해 생성하세요.
@@ -66,6 +66,8 @@ claude -p "현재 디렉토리의 conversation.md를 정독하세요. current_pr
 - 완료 후 'PRD_DONE' 한 줄만 출력" \\
   --permission-mode bypassPermissions \\
   --allowedTools "Read Write Edit Bash" \\
+  --no-session-persistence \\
+  --bare \\
   > /tmp/prd_agent.log 2>&1 &
 PRD_PID=$!
 
@@ -92,6 +94,8 @@ AI 에이전트가 바로 UI 구현에 쓸 수 있는 디자인 시스템 문서
 - 완료 후 'DESIGN_DONE' 한 줄만 출력" \\
   --permission-mode bypassPermissions \\
   --allowedTools "Read Write Edit Bash" \\
+  --no-session-persistence \\
+  --bare \\
   > /tmp/design_agent.log 2>&1 &
 DESIGN_PID=$!
 
