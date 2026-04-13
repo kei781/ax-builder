@@ -36,6 +36,8 @@ export interface ScoreResult {
   design_outdated: boolean;
   /** 이번 응답으로 처음 900점에 도달했는지 */
   crossed_900: boolean;
+  /** 마지막 Claude CLI 생성 시도 에러 (있으면 UI 알림) */
+  prd_gen_error: string | null;
 }
 
 function getScoreTier(score: number) {
@@ -270,6 +272,7 @@ export class ScoringService {
       prd_outdated: !!existingPrd && turnCount > lastGenTurn,
       design_outdated: !!existingDesign && turnCount > lastGenTurn,
       crossed_900: crossed900,
+      prd_gen_error: this.prdGenerator.getStatus(projectId).lastError,
     };
   }
 
@@ -404,6 +407,7 @@ export class ScoringService {
         last_prd_gen_turn: 0,
         prd_outdated: false,
         design_outdated: false,
+        prd_gen_error: this.prdGenerator.getStatus(projectId).lastError,
       };
     }
 
@@ -450,6 +454,7 @@ export class ScoringService {
       design_outdated:
         !!designContent &&
         Math.floor((conversation.conversation_history || []).length / 2) > (conversation.last_prd_gen_turn || 0),
+      prd_gen_error: this.prdGenerator.getStatus(projectId).lastError,
     };
   }
 

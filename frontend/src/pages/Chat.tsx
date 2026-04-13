@@ -42,6 +42,7 @@ export default function Chat() {
   const [showPrototype, setShowPrototype] = useState(false);
   const [generatingPrototype, setGeneratingPrototype] = useState(false);
   const [prdGenerating, setPrdGenerating] = useState(false);
+  const [prdGenError, setPrdGenError] = useState<string | null>(null);
   const [prdOutdated, setPrdOutdated] = useState(false);
   const [designOutdated, setDesignOutdated] = useState(false);
   const [show900Modal, setShow900Modal] = useState(false);
@@ -117,6 +118,7 @@ export default function Chat() {
         if (data.prd_content) setPrdContent(data.prd_content);
         if (data.design_content) setDesignContent(data.design_content);
         if (data.prd_generating) setPrdGenerating(true);
+        if (data.prd_gen_error) setPrdGenError(data.prd_gen_error);
         setPrdOutdated(!!data.prd_outdated);
         setDesignOutdated(!!data.design_outdated);
         // 프로토타입 존재 여부 확인
@@ -143,9 +145,19 @@ export default function Chat() {
       try {
         const res = await client.get(`/projects/${id}/chat/history?type=${chatType}`);
         const data = res.data;
+        // 새 내용이 들어왔는지 감지 (길이 변화로 판단)
         if (data.prd_content) setPrdContent(data.prd_content);
         if (data.design_content) setDesignContent(data.design_content);
-        if (!data.prd_generating) setPrdGenerating(false);
+        setPrdOutdated(!!data.prd_outdated);
+        setDesignOutdated(!!data.design_outdated);
+        if (data.prd_gen_error) setPrdGenError(data.prd_gen_error);
+        if (!data.prd_generating) {
+          setPrdGenerating(false);
+          // 에러 없이 끝났는데 prd/design이 여전히 비어있으면 사용자에게 알림
+          if (!data.prd_gen_error && !data.prd_content && !data.design_content) {
+            setPrdGenError('PRD/DESIGN이 생성되지 않았습니다. 백엔드 로그를 확인해주세요.');
+          }
+        }
       } catch { /* ignore */ }
     }, 5000);
     return () => clearInterval(timer);
@@ -202,6 +214,7 @@ export default function Chat() {
 
   const handleRegeneratePrd = async () => {
     if (prdGenerating) return;
+    setPrdGenError(null);
     try {
       const res = await client.post(`/projects/${id}/regenerate-prd`);
       if (res.data.started) {
@@ -451,6 +464,20 @@ export default function Chat() {
                 </li>
               ))}
             </ul>
+          </div>
+        )}
+
+        {/* PRD 생성 에러 배너 */}
+        {prdGenError && (
+          <div className="mb-3 p-3 rounded-lg bg-red-500/10 border border-red-500/40 text-red-400 text-xs leading-relaxed">
+            <div className="font-semibold mb-1">⚠️ PRD/DESIGN 생성 실패</div>
+            <div className="opacity-80 break-words">{prdGenError}</div>
+            <button
+              onClick={() => setPrdGenError(null)}
+              className="mt-2 text-[10px] text-red-300 hover:text-red-200 underline"
+            >
+              닫기
+            </button>
           </div>
         )}
 

@@ -11,11 +11,20 @@ import { Project } from '../projects/entities/project.entity.js';
  * Claude Code CLI를 spawn해서 고품질 PRD/DESIGN 마크다운을 생성한다.
  * Gemini 대화 요약 + 기존 PRD를 입력으로 넘긴다.
  */
+export interface PrdGenStatus {
+  running: boolean;
+  /** 마지막 생성 실패 시 에러 메시지 (UI 노출용) */
+  lastError: string | null;
+  /** 마지막 성공 시각 */
+  lastSuccessAt: Date | null;
+}
+
 @Injectable()
 export class PrdGeneratorService {
   private readonly logger = new Logger(PrdGeneratorService.name);
   /** 동일 projectId에 대한 중복 생성 방지 */
   private readonly running = new Set<string>();
+  private readonly status = new Map<string, PrdGenStatus>();
 
   constructor(
     @InjectRepository(Project)
@@ -24,6 +33,25 @@ export class PrdGeneratorService {
 
   isRunning(projectId: string): boolean {
     return this.running.has(projectId);
+  }
+
+  getStatus(projectId: string): PrdGenStatus {
+    return (
+      this.status.get(projectId) || {
+        running: this.running.has(projectId),
+        lastError: null,
+        lastSuccessAt: null,
+      }
+    );
+  }
+
+  private setStatus(projectId: string, patch: Partial<PrdGenStatus>) {
+    const prev = this.status.get(projectId) || {
+      running: false,
+      lastError: null,
+      lastSuccessAt: null,
+    };
+    this.status.set(projectId, { ...prev, ...patch });
   }
 
   /**
@@ -40,9 +68,11 @@ export class PrdGeneratorService {
       return;
     }
     this.running.add(projectId);
+    this.setStatus(projectId, { running: true, lastError: null });
 
     try {
       const { prd, design } = await this.runClaudeCli(
+        projectId,
         conversation,
         currentPrd,
         currentDesign,
@@ -53,17 +83,29 @@ export class PrdGeneratorService {
           ...(design ? { design_content: design } : {}),
         });
         this.logger.log(
-          `PRD/DESIGN generated for ${projectId}: prd=${prd?.length || 0}ch, design=${design?.length || 0}ch`,
+          `[${projectId}] PRD/DESIGN saved: prd=${prd?.length || 0}ch, design=${design?.length || 0}ch`,
         );
+        this.setStatus(projectId, {
+          running: false,
+          lastError: null,
+          lastSuccessAt: new Date(),
+        });
+      } else {
+        const msg = 'Claude CLI 실행은 성공했지만 PRD.md/DESIGN.md를 만들지 못했습니다. 서버 로그를 확인하세요.';
+        this.logger.error(`[${projectId}] ${msg}`);
+        this.setStatus(projectId, { running: false, lastError: msg });
       }
     } catch (err: any) {
-      this.logger.error(`PRD gen failed for ${projectId}: ${err?.message}`);
+      const msg = err?.message || String(err);
+      this.logger.error(`[${projectId}] PRD gen failed: ${msg}`);
+      this.setStatus(projectId, { running: false, lastError: msg });
     } finally {
       this.running.delete(projectId);
     }
   }
 
   private async runClaudeCli(
+    projectId: string,
     conversation: Array<{ role: string; content: string }>,
     currentPrd: string | null,
     currentDesign: string | null,
@@ -86,39 +128,44 @@ export class PrdGeneratorService {
     const prompt = this.buildPrompt(!!currentPrd, !!currentDesign);
 
     const claudePath = process.env['CLAUDE_CLI_PATH'] || 'claude';
+    // --permission-mode bypassPermissions: -p (print) 모드에서 Write/Edit이
+    // 권한 요청 없이 바로 실행되게 함 (임시 디렉토리라 안전)
     const args = [
       '-p',
       prompt,
+      '--permission-mode',
+      'bypassPermissions',
       '--allowedTools',
-      'Read,Write',
+      'Read Write Edit Bash',
       '--output-format',
       'text',
     ];
 
-    this.logger.debug(`Spawning claude CLI in ${workDir}`);
+    this.logger.log(`[${projectId}] Spawning claude CLI in ${workDir} (path=${claudePath})`);
+    const startedAt = Date.now();
 
-    const output = await new Promise<string>((resolve, reject) => {
+    const { stdout, stderr, code } = await new Promise<{
+      stdout: string;
+      stderr: string;
+      code: number | null;
+    }>((resolve, reject) => {
       const proc = spawn(claudePath, args, {
         cwd: workDir,
         env: { ...process.env },
       });
 
-      let stdout = '';
-      let stderr = '';
+      let stdoutBuf = '';
+      let stderrBuf = '';
       const timeout = setTimeout(() => {
         proc.kill('SIGTERM');
         reject(new Error('claude CLI timed out after 180s'));
       }, 180_000);
 
-      proc.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
-      proc.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
-      proc.on('close', (code) => {
+      proc.stdout.on('data', (d: Buffer) => (stdoutBuf += d.toString()));
+      proc.stderr.on('data', (d: Buffer) => (stderrBuf += d.toString()));
+      proc.on('close', (c) => {
         clearTimeout(timeout);
-        if (code !== 0) {
-          reject(new Error(`claude CLI exited ${code}: ${stderr.slice(0, 500)}`));
-        } else {
-          resolve(stdout);
-        }
+        resolve({ stdout: stdoutBuf, stderr: stderrBuf, code: c });
       });
       proc.on('error', (err) => {
         clearTimeout(timeout);
@@ -126,20 +173,69 @@ export class PrdGeneratorService {
       });
     });
 
-    // Claude가 PRD.md, DESIGN.md 파일을 생성했을 것
+    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+    this.logger.log(
+      `[${projectId}] claude CLI exit=${code} in ${elapsed}s, stdout=${stdout.length}ch, stderr=${stderr.length}ch`,
+    );
+    if (stderr) {
+      this.logger.warn(`[${projectId}] claude stderr: ${stderr.slice(0, 800)}`);
+    }
+    if (stdout.length < 2000) {
+      this.logger.debug(`[${projectId}] claude stdout: ${stdout.slice(0, 2000)}`);
+    }
+
+    if (code !== 0) {
+      // 정리 전에 에러 발생
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+      throw new Error(
+        `claude CLI exited ${code}. stderr: ${stderr.slice(0, 300) || '(empty)'}`,
+      );
+    }
+
+    // 생성된 파일 목록 로그
+    const files: string[] = await fs.readdir(workDir).catch(() => [] as string[]);
+    this.logger.log(`[${projectId}] workDir files: ${files.join(', ')}`);
+
+    // 대소문자 변형 모두 허용
+    const findFile = (candidates: string[]) => {
+      for (const c of candidates) {
+        if (files.includes(c)) return path.join(workDir, c);
+      }
+      return null;
+    };
+    const prdPath = findFile(['PRD.md', 'prd.md', 'Prd.md']);
+    const designPath = findFile(['DESIGN.md', 'design.md', 'Design.md']);
+
     const [prd, design] = await Promise.all([
-      fs.readFile(path.join(workDir, 'PRD.md'), 'utf-8').catch(() => null),
-      fs.readFile(path.join(workDir, 'DESIGN.md'), 'utf-8').catch(() => null),
+      prdPath ? fs.readFile(prdPath, 'utf-8').catch(() => null) : Promise.resolve(null),
+      designPath
+        ? fs.readFile(designPath, 'utf-8').catch(() => null)
+        : Promise.resolve(null),
     ]);
+
+    // 파일이 없으면 stdout에서 파싱 시도 (fallback)
+    let result: { prd: string | null; design: string | null };
+    if (!prd && !design) {
+      this.logger.warn(
+        `[${projectId}] PRD.md/DESIGN.md 파일이 생성되지 않음. stdout fallback 파싱 시도.`,
+      );
+      result = this.parseFromStdout(stdout);
+    } else {
+      result = { prd, design };
+    }
+
+    // 디버그용: stdout을 파일로 남김 (생성 실패 시 원인 확인용)
+    if (!result.prd && !result.design) {
+      const debugPath = path.join(os.tmpdir(), `axb-prd-debug-${projectId}.log`);
+      await fs
+        .writeFile(debugPath, `CODE: ${code}\n\nSTDOUT:\n${stdout}\n\nSTDERR:\n${stderr}`, 'utf-8')
+        .catch(() => {});
+      this.logger.error(`[${projectId}] 빈 결과 — 디버그 로그: ${debugPath}`);
+    }
 
     // 정리
     await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
-
-    // 파일이 없으면 stdout에서 파싱 시도 (fallback)
-    if (!prd && !design) {
-      return this.parseFromStdout(output);
-    }
-    return { prd, design };
+    return result;
   }
 
   private buildPrompt(hasCurrentPrd: boolean, hasCurrentDesign: boolean): string {
