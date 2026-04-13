@@ -40,6 +40,12 @@ export class Conversation {
   @Column({ type: 'boolean', default: false })
   score_passed!: boolean;
 
+  @Column({ type: 'int', default: 0 })
+  last_prd_gen_turn!: number;
+
+  @Column({ type: 'int', default: 0 })
+  last_prd_gen_score!: number;
+
   @CreateDateColumn()
   created_at!: Date;
 

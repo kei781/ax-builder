@@ -1,4 +1,5 @@
-import { Controller, Post, Get, Param, Body, Query, Req, UseGuards } from '@nestjs/common';
+import { Controller, Post, Get, Param, Body, Query, Req, UseGuards, Res } from '@nestjs/common';
+import type { Response } from 'express';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard.js';
 import { ScoringService } from './scoring.service.js';
 import type { ConversationType } from '../projects/entities/conversation.entity.js';
@@ -31,5 +32,33 @@ export class ScoringController {
       body.message,
       body.type,
     );
+  }
+
+  @Post(':id/regenerate-prd')
+  async regeneratePrd(
+    @Param('id') projectId: string,
+    @Req() req: Record<string, any>,
+  ) {
+    const user = req['user'] as { id: string; email: string };
+    return this.scoringService.regeneratePrd(projectId, user.id);
+  }
+
+  @Post(':id/prototype')
+  async generatePrototype(@Param('id') projectId: string) {
+    return this.scoringService.generatePrototype(projectId);
+  }
+
+  @Get(':id/prototype')
+  async getPrototype(
+    @Param('id') projectId: string,
+    @Res() res: Response,
+  ) {
+    const html = await this.scoringService.getPrototype(projectId);
+    if (!html) {
+      res.status(404).json({ message: 'Prototype not generated yet' });
+      return;
+    }
+    res.setHeader('Content-Type', 'text/html');
+    res.send(html);
   }
 }

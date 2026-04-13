@@ -56,6 +56,12 @@ export class Project {
   @Column({ type: 'text', nullable: true })
   prd_content!: string | null;
 
+  @Column({ type: 'text', nullable: true })
+  design_content!: string | null;
+
+  @Column({ type: 'text', nullable: true })
+  prototype_html!: string | null;
+
   @Column({ type: 'int', default: 0 })
   build_attempts!: number;
 

@@ -5,6 +5,7 @@ import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
 import { Conversation, ConversationType } from '../projects/entities/conversation.entity.js';
 import { Project } from '../projects/entities/project.entity.js';
+import { PrdGeneratorService } from './prd-generator.service.js';
 import { v4 as uuidv4 } from 'uuid';
 
 export interface ScoreBreakdown {
@@ -24,7 +25,17 @@ export interface ScoreResult {
   score_passed: boolean;
   breakdown: ScoreBreakdown;
   missing_items: string[];
-  prd_preview: string | null;
+  /** Claude CLI가 백그라운드에서 PRD/DESIGN 재생성 중인지 */
+  prd_generating: boolean;
+  /** 현재까지 누적된 대화 턴 수 */
+  turn_count: number;
+  /** 마지막으로 PRD를 생성한 시점의 턴 수 */
+  last_prd_gen_turn: number;
+  /** PRD가 생성된 시점 이후 새 대화가 있으면 구버전 */
+  prd_outdated: boolean;
+  design_outdated: boolean;
+  /** 이번 응답으로 처음 900점에 도달했는지 */
+  crossed_900: boolean;
 }
 
 function getScoreTier(score: number) {
@@ -81,7 +92,7 @@ Discovery Agent입니다. 단순한 PRD 평가가 아니라, 사용자의 문제
 
 ## 응답 형식
 
-항상 아래 JSON 구조를 응답 마지막에 포함하세요:
+항상 아래 JSON 구조를 응답 마지막에 포함하세요 (PRD/DESIGN 문서는 별도 시스템이 생성하니 여기선 절대 포함 금지):
 
 \`\`\`json
 {
@@ -99,8 +110,7 @@ Discovery Agent입니다. 단순한 PRD 평가가 아니라, 사용자의 문제
     "데이터를 새로고침해도 유지할지 결정 필요",
     "에러 발생 시 사용자에게 보여줄 메시지 미정"
   ],
-  "passed": false,
-  "prd_preview": null
+  "passed": false
 }
 \`\`\`
 
@@ -111,7 +121,8 @@ Discovery Agent입니다. 단순한 PRD 평가가 아니라, 사용자의 문제
 - 대화 초반에는 점수를 낮게 주되, 구체적으로 뭘 보완하면 점수가 오를지 안내
 - 비개발자도 이해할 수 있는 용어만 사용. 전문 용어 사용 시 반드시 쉬운 설명 병기
 - 한 번에 질문은 최대 2개까지
-- passed가 true가 되면, 최종 PRD를 마크다운으로 정리하여 prd_preview에 포함
+- PRD나 DESIGN 문서는 절대 직접 작성하지 말 것 (별도 시스템에서 Claude가 생성함). 당신은 대화와 스코어링에만 집중
+- 시스템이 제공하는 "[현재 PRD/DESIGN 초안]" 컨텍스트가 있으면 참고해서 중복 질문 피하고, 비어 있거나 [미정]인 부분을 물어볼 것
 - "프로세스화가 불가능하다"고 느끼는 사용자도 있으므로, 작은 단위로 쪼개서 질문`;
 
 @Injectable()
@@ -126,16 +137,17 @@ export class ScoringService {
     @InjectRepository(Project)
     private readonly projectRepo: Repository<Project>,
     private readonly configService: ConfigService,
+    private readonly prdGenerator: PrdGeneratorService,
   ) {
     // OpenRouter — OpenAI 호환 API
     this.openai = new OpenAI({
       baseURL: 'https://openrouter.ai/api/v1',
       apiKey: this.configService.get<string>('OPENROUTER_API_KEY', ''),
     });
-    // 기획 채팅: Gemma 4 31B (deep 분석, 저비용)
+    // 기획 채팅: Gemini 3 Flash Preview via OpenRouter
     this.chatModel = this.configService.get<string>(
       'CHAT_MODEL',
-      'google/gemma-4-31b-it',
+      'google/gemini-3-flash-preview',
     );
   }
 
@@ -160,8 +172,15 @@ export class ScoringService {
         current_score: 0,
         score_tier: 'too_vague',
         score_passed: false,
+        last_prd_gen_turn: 0,
+        last_prd_gen_score: 0,
       });
     }
+
+    // 프로젝트 기존 PRD/DESIGN을 컨텍스트로 주입 (Gemini가 중복 질문 안 하도록)
+    const project = await this.projectRepo.findOne({ where: { id: projectId } });
+    const existingPrd = project?.prd_content || null;
+    const existingDesign = project?.design_content || null;
 
     // 2. 최근 6개 메시지만 전송 (토큰 비용 절감)
     const history = conversation.conversation_history || [];
@@ -171,6 +190,14 @@ export class ScoringService {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       { role: 'system', content: SCORING_SYSTEM_PROMPT },
     ];
+
+    // 기존 PRD/DESIGN 초안이 있으면 시스템 컨텍스트로 주입
+    if (existingPrd || existingDesign) {
+      const ctx: string[] = ['[현재까지 정리된 초안 — 참고용, 직접 수정하지 말 것]'];
+      if (existingPrd) ctx.push(`\n### 현재 PRD 초안\n${existingPrd}`);
+      if (existingDesign) ctx.push(`\n### 현재 DESIGN 초안\n${existingDesign}`);
+      messages.push({ role: 'system', content: ctx.join('\n') });
+    }
 
     // 이전 대화가 잘린 경우, 컨텍스트 요약 추가
     if (history.length > MAX_HISTORY) {
@@ -210,23 +237,23 @@ export class ScoringService {
     const parsed = this.parseScoreJson(responseText);
 
     // 5. Update conversation history
+    const prevScore = conversation.current_score;
     history.push({ role: 'user', content: message });
     history.push({ role: 'assistant', content: responseText });
     conversation.conversation_history = history;
     conversation.current_score = parsed.score;
     conversation.score_tier = parsed.score_tier;
     conversation.score_passed = parsed.passed;
-
     await this.conversationRepo.save(conversation);
 
     // 6. Update project score
-    await this.projectRepo.update(projectId, {
-      score: parsed.score,
-      prd_content: parsed.prd_preview || undefined,
-    });
+    await this.projectRepo.update(projectId, { score: parsed.score });
 
     // 7. Build result
     const tierInfo = getScoreTier(parsed.score);
+    const turnCount = Math.floor(history.length / 2);
+    const lastGenTurn = conversation.last_prd_gen_turn || 0;
+    const crossed900 = prevScore < 900 && parsed.score >= 900;
 
     return {
       reply: this.stripJsonBlock(responseText),
@@ -237,8 +264,52 @@ export class ScoringService {
       score_passed: tierInfo.passed,
       breakdown: parsed.breakdown,
       missing_items: parsed.missing_items,
-      prd_preview: parsed.prd_preview,
+      prd_generating: this.prdGenerator.isRunning(projectId),
+      turn_count: turnCount,
+      last_prd_gen_turn: lastGenTurn,
+      prd_outdated: !!existingPrd && turnCount > lastGenTurn,
+      design_outdated: !!existingDesign && turnCount > lastGenTurn,
+      crossed_900: crossed900,
     };
+  }
+
+  /**
+   * 수동 PRD/DESIGN 재생성 트리거.
+   * 900점 이상일 때만 허용.
+   */
+  async regeneratePrd(projectId: string, userId: string): Promise<{ started: boolean; message: string }> {
+    const project = await this.projectRepo.findOne({ where: { id: projectId } });
+    if (!project) throw new Error('Project not found');
+    if (project.score < 900) {
+      return { started: false, message: '900점 이상일 때만 재생성할 수 있습니다.' };
+    }
+    if (this.prdGenerator.isRunning(projectId)) {
+      return { started: false, message: '이미 생성 중입니다.' };
+    }
+
+    // owner의 scoring conversation 사용
+    const conversation = await this.conversationRepo.findOne({
+      where: { project_id: projectId, user_id: project.user_id, type: 'scoring' },
+    });
+    if (!conversation) {
+      return { started: false, message: '대화 이력이 없습니다.' };
+    }
+
+    const history = conversation.conversation_history || [];
+    const turnCount = Math.floor(history.length / 2);
+    conversation.last_prd_gen_turn = turnCount;
+    conversation.last_prd_gen_score = project.score;
+    await this.conversationRepo.save(conversation);
+
+    void this.prdGenerator.generateInBackground(
+      projectId,
+      history,
+      project.prd_content || null,
+      project.design_content || null,
+    );
+
+    this.logger.log(`Manual PRD regen triggered for ${projectId} by ${userId} (turn ${turnCount})`);
+    return { started: true, message: 'PRD/DESIGN 생성을 시작했습니다. 30초~2분 소요됩니다.' };
   }
 
   private parseScoreJson(text: string): {
@@ -248,7 +319,6 @@ export class ScoringService {
     breakdown: ScoreBreakdown;
     missing_items: string[];
     passed: boolean;
-    prd_preview: string | null;
   } {
     const defaults = {
       current_phase: 'discovery',
@@ -263,7 +333,6 @@ export class ScoringService {
       },
       missing_items: [] as string[],
       passed: false,
-      prd_preview: null as string | null,
     };
 
     try {
@@ -286,7 +355,6 @@ export class ScoringService {
           ? parsed.missing_items
           : defaults.missing_items,
         passed: parsed.passed === true,
-        prd_preview: parsed.prd_preview || null,
       };
     } catch {
       this.logger.warn('Failed to parse score JSON from response');
@@ -303,8 +371,14 @@ export class ScoringService {
     userId: string,
     type: ConversationType,
   ) {
+    // 프로젝트 owner 기준으로 대화 조회 (viewer도 owner 대화를 볼 수 있게)
+    const project = await this.projectRepo.findOne({ where: { id: projectId } });
+    const ownerId = project?.user_id || userId;
+    const prdContent = project?.prd_content || null;
+    const designContent = project?.design_content || null;
+
     const conversation = await this.conversationRepo.findOne({
-      where: { project_id: projectId, user_id: userId, type },
+      where: { project_id: projectId, user_id: ownerId, type },
     });
 
     if (!conversation) {
@@ -323,6 +397,13 @@ export class ScoringService {
           user_experience: 0,
         },
         missing_items: [] as string[],
+        prd_content: prdContent,
+        design_content: designContent,
+        prd_generating: this.prdGenerator.isRunning(projectId),
+        turn_count: 0,
+        last_prd_gen_turn: 0,
+        prd_outdated: false,
+        design_outdated: false,
       };
     }
 
@@ -358,7 +439,63 @@ export class ScoringService {
         user_experience: 0,
       },
       missing_items: parsed?.missing_items || [],
+      prd_content: prdContent,
+      design_content: designContent,
+      prd_generating: this.prdGenerator.isRunning(projectId),
+      turn_count: Math.floor((conversation.conversation_history || []).length / 2),
+      last_prd_gen_turn: conversation.last_prd_gen_turn || 0,
+      prd_outdated:
+        !!prdContent &&
+        Math.floor((conversation.conversation_history || []).length / 2) > (conversation.last_prd_gen_turn || 0),
+      design_outdated:
+        !!designContent &&
+        Math.floor((conversation.conversation_history || []).length / 2) > (conversation.last_prd_gen_turn || 0),
     };
+  }
+
+  async generatePrototype(projectId: string): Promise<{ html: string }> {
+    const project = await this.projectRepo.findOne({ where: { id: projectId } });
+    if (!project) throw new Error('Project not found');
+
+    const prd = project.prd_content || '(PRD 없음)';
+    const design = project.design_content || '(DESIGN 없음)';
+
+    const prompt = `당신은 UI 프로토타이퍼입니다. 아래 PRD와 DESIGN.md를 기반으로 **단일 self-contained HTML 파일**을 생성하세요.
+
+## PRD
+${prd}
+
+## DESIGN.md
+${design}
+
+## 요구사항
+- 모든 CSS/JS를 HTML 파일 안에 인라인으로 포함 (외부 CDN 사용 가능)
+- PRD에 언급된 모든 주요 화면/페이지를 구현 (SPA 방식, 탭 또는 사이드바로 전환)
+- DESIGN.md의 컬러, 폰트, 컴포넌트 스타일을 충실히 반영
+- 실제 데이터는 목 데이터(mock)로 채울 것
+- 기능 동작 불필요 (버튼 클릭 시 화면 전환 정도만)
+- 모바일/데스크탑 반응형 레이아웃
+- 시각적으로 완성도 높게 (프로토타입이 아닌 디자인 목업 수준)
+
+HTML 파일만 출력하고, 설명 텍스트 없이 <!DOCTYPE html>로 시작하는 순수 HTML만 반환하세요.`;
+
+    const response = await this.openai.chat.completions.create({
+      model: this.chatModel,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 8192,
+    });
+
+    let html = response.choices[0]?.message?.content ?? '';
+    // Strip markdown code fences if present
+    html = html.replace(/^```html\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/, '').trim();
+
+    await this.projectRepo.update(projectId, { prototype_html: html });
+    return { html };
+  }
+
+  async getPrototype(projectId: string): Promise<string | null> {
+    const project = await this.projectRepo.findOne({ where: { id: projectId } });
+    return project?.prototype_html || null;
   }
 
   getScoreTier = getScoreTier;
