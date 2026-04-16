@@ -11,6 +11,7 @@ interface HealthData {
   orchestrator: ServiceHealth;
   database: ServiceHealth;
   planning_agent: ServiceHealth;
+  building_agent: ServiceHealth;
   docker: ServiceHealth;
 }
 
@@ -70,6 +71,7 @@ export default function InfraStatus() {
     { key: 'orchestrator', label: 'Orchestrator', data: health.orchestrator },
     { key: 'database', label: 'Database', data: health.database },
     { key: 'planning_agent', label: 'Planning Agent', data: health.planning_agent },
+    { key: 'building_agent', label: 'Building Agent', data: health.building_agent },
     { key: 'docker', label: 'Docker', data: health.docker },
   ];
 

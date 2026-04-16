@@ -34,7 +34,7 @@ export class BuildingRunner {
   private readonly buildingAgentPython: string;
 
   /** project_id → active subprocess (one concurrent build per project). */
-  private readonly processes = new Map<string, ChildProcess>();
+  readonly processes = new Map<string, ChildProcess>();
 
   /** project_id → phase tracking state for DB writes. */
   private readonly phaseIds = new Map<string, Map<string, string>>();

@@ -1,8 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Inject, forwardRef } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { ConfigService } from '@nestjs/config';
 import Docker from 'dockerode';
+import { BuildingRunner } from '../agents/building.runner.js';
 
 type Status = 'ok' | 'degraded' | 'down';
 
@@ -16,6 +17,7 @@ export interface HealthResult {
   orchestrator: ServiceHealth;
   database: ServiceHealth;
   planning_agent: ServiceHealth;
+  building_agent: ServiceHealth;
   docker: ServiceHealth;
 }
 
@@ -28,6 +30,8 @@ export class HealthService {
     @InjectDataSource()
     private readonly dataSource: DataSource,
     private readonly config: ConfigService,
+    @Inject(forwardRef(() => BuildingRunner))
+    private readonly buildingRunner: BuildingRunner,
   ) {
     this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
     this.planningAgentUrl = this.config.get<string>(
@@ -47,6 +51,7 @@ export class HealthService {
       orchestrator: { status: 'ok', message: '정상 작동 중' },
       database,
       planning_agent: planningAgent,
+      building_agent: this.checkBuildingAgent(),
       docker,
     };
   }
@@ -94,6 +99,15 @@ export class HealthService {
     } catch {
       return { status: 'down', message: 'Planning Agent 연결 실패' };
     }
+  }
+
+  private checkBuildingAgent(): ServiceHealth {
+    const activeCount = this.buildingRunner.processes.size;
+    if (activeCount > 0) {
+      return { status: 'ok', message: `실행 중 (${activeCount}개 빌드)` };
+    }
+    // 꺼져있는 건 정상 — on-demand 서비스라 degraded(주황)으로 표시
+    return { status: 'degraded', message: '대기 중' };
   }
 
   private async checkDocker(): Promise<ServiceHealth> {
