@@ -5,6 +5,7 @@ import ProjectCard from '../components/ProjectCard';
 import type { ProjectCardProps } from '../components/ProjectCard';
 import client from '../api/client';
 import ThemeToggle from '../components/ThemeToggle';
+import InfraStatus from '../components/InfraStatus';
 
 export default function Dashboard() {
   const { user, logout } = useAuth();
@@ -66,6 +67,8 @@ export default function Dashboard() {
           </button>
         </div>
       </header>
+
+      <InfraStatus />
 
       <main className="max-w-6xl mx-auto px-6 py-8">
         <div className="flex items-center justify-between mb-8">
