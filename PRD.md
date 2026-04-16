@@ -3,6 +3,10 @@
 > **비개발자가 아이디어를 제품으로 만들 수 있는 AI 네이티브 플랫폼**
 > Discovery Agent(Gemini)가 기획의 빈틈을 채우고, Hermes Agent가 Claude Code CLI를 활용하여 코드를 생성·검증·배포한다.
 
+> **시스템 구조·책임 분리·상태 머신·계약(contract)은 [ARCHITECTURE.md](./ARCHITECTURE.md)를 참조.**
+> 이 문서(PRD.md)는 **무엇을 만드는가(제품 사양)**, `ARCHITECTURE.md`는 **어떻게 만드는가(시스템 구조)**.
+> 두 문서가 충돌할 경우 `ARCHITECTURE.md`가 시스템 구조에 대한 SSoT다.
+
 ---
 
 ## 1. 배경 및 문제 정의

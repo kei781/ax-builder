@@ -1,0 +1,5 @@
+[project]
+name = "ax-building-agent"
+version = "0.1.0"
+description = "Building Agent for ax-builder — reads PRD/DESIGN, generates PHASES.md, dispatches to Claude Code CLI per phase."
+requires-python = ">=3.11"

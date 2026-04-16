@@ -1,0 +1,8 @@
+[project]
+name = "ax-planning-agent"
+version = "0.1.0"
+description = "Planning Agent for ax-builder — converses with users to produce PRD.md and DESIGN.md."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

@@ -2,55 +2,35 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import ProjectCard from '../components/ProjectCard';
+import type { ProjectCardProps } from '../components/ProjectCard';
 import client from '../api/client';
-import InfraStatus from '../components/InfraStatus';
 import ThemeToggle from '../components/ThemeToggle';
-
-interface ProjectData {
-  id: string;
-  title: string;
-  status:
-    | 'scoring'
-    | 'building'
-    | 'qa'
-    | 'awaiting_env'
-    | 'deployed'
-    | 'failed'
-    | 'stopped';
-  score: number;
-  port: number | null;
-  ownerName: string;
-  myRole: 'owner' | 'editor' | 'viewer';
-  missing_items?: string[];
-}
 
 export default function Dashboard() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
-  const [projects, setProjects] = useState<ProjectData[]>([]);
-  const [teamProjects, setTeamProjects] = useState<ProjectData[]>([]);
+  const [projects, setProjects] = useState<ProjectCardProps[]>([]);
+  const [publicProjects, setPublicProjects] = useState<ProjectCardProps[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNewModal, setShowNewModal] = useState(false);
   const [newTitle, setNewTitle] = useState('');
   const [creating, setCreating] = useState(false);
 
-  const fetchProjects = async () => {
-    try {
-      const [mine, team] = await Promise.all([
-        client.get('/projects'),
-        client.get('/projects/team').catch(() => ({ data: [] })),
-      ]);
-      setProjects(mine.data);
-      setTeamProjects(team.data);
-    } catch (err) {
-      console.error('Failed to fetch projects:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   useEffect(() => {
-    fetchProjects();
+    (async () => {
+      try {
+        const [mine, pub] = await Promise.all([
+          client.get('/projects'),
+          client.get('/projects/public').catch(() => ({ data: [] })),
+        ]);
+        setProjects(mine.data);
+        setPublicProjects(pub.data);
+      } catch (err) {
+        console.error('Failed to fetch projects:', err);
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, []);
 
   const handleCreate = async () => {
@@ -61,8 +41,7 @@ export default function Dashboard() {
       setShowNewModal(false);
       setNewTitle('');
       navigate(`/projects/${res.data.id}/chat`);
-    } catch (err) {
-      console.error('Failed to create project:', err);
+    } catch {
       alert('프로젝트 생성에 실패했습니다.');
     } finally {
       setCreating(false);
@@ -71,18 +50,12 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950">
-      <InfraStatus />
-      {/* Header */}
       <header className="border-b border-gray-200 dark:border-gray-800 px-6 py-4 flex items-center justify-between">
         <h1 className="text-gray-900 dark:text-white text-xl font-bold">ax-builder</h1>
         <div className="flex items-center gap-3">
           <ThemeToggle />
           {user?.avatar_url && (
-            <img
-              src={user.avatar_url}
-              alt=""
-              className="w-8 h-8 rounded-full"
-            />
+            <img src={user.avatar_url} alt="" className="w-8 h-8 rounded-full" />
           )}
           <span className="text-gray-700 dark:text-gray-300 text-sm">{user?.name}</span>
           <button
@@ -94,7 +67,6 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {/* Content */}
       <main className="max-w-6xl mx-auto px-6 py-8">
         <div className="flex items-center justify-between mb-8">
           <h2 className="text-gray-900 dark:text-white text-2xl font-semibold">내 프로젝트</h2>
@@ -112,9 +84,7 @@ export default function Dashboard() {
           </div>
         ) : projects.length === 0 ? (
           <div className="text-center py-20">
-            <p className="text-gray-500 text-lg mb-2">
-              아직 프로젝트가 없습니다.
-            </p>
+            <p className="text-gray-500 text-lg mb-2">아직 프로젝트가 없습니다.</p>
             <p className="text-gray-400 dark:text-gray-600 text-sm">
               새 프로젝트를 만들어 아이디어를 제품으로 만들어보세요!
             </p>
@@ -127,22 +97,16 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* 팀 프로젝트 */}
-        {!loading && teamProjects.length > 0 && (
+        {!loading && publicProjects.length > 0 && (
           <div className="mt-12">
             <div className="flex items-center gap-3 mb-6">
-              <h2 className="text-gray-900 dark:text-white text-xl font-semibold">
-                팀 프로젝트
-              </h2>
+              <h2 className="text-gray-900 dark:text-white text-xl font-semibold">다른 프로젝트</h2>
               <span className="text-xs text-gray-500 bg-gray-100 dark:bg-gray-800 px-2 py-0.5 rounded-full">
-                {teamProjects.length}개
-              </span>
-              <span className="text-xs text-gray-400 dark:text-gray-500">
-                같은 도메인의 동료가 만든 프로젝트 · 보기 전용
+                {publicProjects.length}개
               </span>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 items-start">
-              {teamProjects.map((p) => (
+              {publicProjects.map((p) => (
                 <ProjectCard key={p.id} {...p} />
               ))}
             </div>
@@ -150,13 +114,10 @@ export default function Dashboard() {
         )}
       </main>
 
-      {/* New Project Modal */}
       {showNewModal && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-900 rounded-2xl p-6 w-full max-w-md mx-4 shadow-xl">
-            <h3 className="text-gray-900 dark:text-white text-lg font-medium mb-4">
-              새 프로젝트
-            </h3>
+            <h3 className="text-gray-900 dark:text-white text-lg font-medium mb-4">새 프로젝트</h3>
             <input
               type="text"
               value={newTitle}
@@ -168,18 +129,15 @@ export default function Dashboard() {
             />
             <div className="flex gap-3 justify-end">
               <button
-                onClick={() => {
-                  setShowNewModal(false);
-                  setNewTitle('');
-                }}
-                className="text-gray-500 hover:text-gray-900 dark:hover:text-white px-4 py-2 text-sm transition-colors"
+                onClick={() => { setShowNewModal(false); setNewTitle(''); }}
+                className="text-gray-500 hover:text-gray-900 dark:hover:text-white px-4 py-2 text-sm"
               >
                 취소
               </button>
               <button
                 onClick={handleCreate}
                 disabled={!newTitle.trim() || creating}
-                className="bg-green-600 hover:bg-green-500 disabled:bg-gray-300 dark:disabled:bg-gray-700 disabled:text-gray-500 text-white px-4 py-2 rounded-xl text-sm font-medium transition-colors"
+                className="bg-green-600 hover:bg-green-500 disabled:bg-gray-300 dark:disabled:bg-gray-700 text-white px-4 py-2 rounded-xl text-sm font-medium"
               >
                 {creating ? '생성 중...' : '만들기'}
               </button>

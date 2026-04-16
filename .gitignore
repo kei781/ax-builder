@@ -35,3 +35,11 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Smoke tests output
+orchestrator/smoke-*.mjs

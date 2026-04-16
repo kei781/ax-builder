@@ -4,9 +4,6 @@ import { io, Socket } from 'socket.io-client';
 interface BuildProgress {
   phase: string;
   current_task: string;
-  files_created: number;
-  files_total: number;
-  elapsed_seconds: number;
   progress_percent: number;
 }
 
@@ -15,6 +12,8 @@ interface WebSocketState {
   lastEvent: string | null;
   progress: BuildProgress | null;
   logs: string[];
+  /** 지금까지 수신된 phase 키 목록 (순서 유지, 중복 없음) */
+  completedPhases: string[];
 }
 
 export function useWebSocket(projectId: string | undefined): WebSocketState {
@@ -23,6 +22,7 @@ export function useWebSocket(projectId: string | undefined): WebSocketState {
     lastEvent: null,
     progress: null,
     logs: [],
+    completedPhases: [],
   });
   const socketRef = useRef<Socket | null>(null);
 
@@ -44,22 +44,46 @@ export function useWebSocket(projectId: string | undefined): WebSocketState {
     });
 
     socket.on('build_progress', (data: BuildProgress) => {
-      setState((prev) => ({ ...prev, lastEvent: 'build_progress', progress: data }));
+      setState((prev) => {
+        // _done 접미사가 붙은 phase는 해당 phase를 완료 목록에 추가
+        const phase = data.phase;
+        const completedPhases = [...prev.completedPhases];
+
+        if (phase.endsWith('_done') || phase.endsWith('_failed')) {
+          const basePhase = phase.replace(/_done$/, '').replace(/_failed$/, '');
+          if (!completedPhases.includes(basePhase)) {
+            completedPhases.push(basePhase);
+          }
+        }
+
+        return {
+          ...prev,
+          lastEvent: 'build_progress',
+          progress: data,
+          completedPhases,
+        };
+      });
     });
 
     socket.on('build_complete', () => {
       setState((prev) => ({ ...prev, lastEvent: 'build_complete' }));
     });
 
-    socket.on('build_failed', () => {
-      setState((prev) => ({ ...prev, lastEvent: 'build_failed' }));
+    socket.on('build_failed', (data?: { lastPhase?: string }) => {
+      setState((prev) => ({
+        ...prev,
+        lastEvent: 'build_failed',
+        progress: data?.lastPhase
+          ? { phase: data.lastPhase + '_failed', current_task: '빌드 실패', progress_percent: prev.progress?.progress_percent ?? 0 }
+          : prev.progress,
+      }));
     });
 
     socket.on('build_log', (data: { projectId: string; line: string }) => {
       if (data.projectId !== projectId) return;
       setState((prev) => ({
         ...prev,
-        logs: [...prev.logs.slice(-500), data.line], // 최근 500줄만 유지
+        logs: [...prev.logs.slice(-500), data.line],
       }));
     });
 
