@@ -226,8 +226,14 @@ async def run_turn(
                 }
             )
 
-        if finish_reason and finish_reason not in ("tool_calls", "function_call"):
-            # LLM signaled end-of-stream for a non-tool reason; treat as done.
+        # Only break on non-tool finish reason IF we didn't just execute tools.
+        # Gemini sometimes returns finish_reason="stop" alongside tool_calls;
+        # in that case we must continue so the tool results get fed back.
+        if (
+            finish_reason
+            and finish_reason not in ("tool_calls", "function_call")
+            and not tool_calls
+        ):
             break
     else:
         # Loop exhausted without natural termination — surface as error so
