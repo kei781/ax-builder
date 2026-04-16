@@ -88,7 +88,7 @@ export default function InfraStatus() {
           {s.label}
           {s.data.status !== 'ok' && (
             <span className={s.data.status === 'degraded' ? 'text-yellow-500' : 'text-red-500'}>
-              {statusLabel[s.data.status]}
+              {s.data.message}
             </span>
           )}
         </span>
