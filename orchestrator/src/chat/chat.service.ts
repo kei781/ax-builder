@@ -403,7 +403,11 @@ export class ChatService {
 
     if (event.event_type === 'completion') {
       const payload = (event.payload ?? {}) as { role?: string; content?: string };
-      if (payload.role === 'assistant' && typeof payload.content === 'string') {
+      if (
+        payload.role === 'assistant' &&
+        typeof payload.content === 'string' &&
+        payload.content.trim().length > 0
+      ) {
         await this.messageRepo.save(
           this.messageRepo.create({
             session_id: sessionId,

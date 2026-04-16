@@ -233,6 +233,23 @@ async def run_turn(
         return
 
     full_text = "".join(final_text_parts).strip()
+
+    # Guard: if the LLM produced no text and no tool calls in the final
+    # iteration, something went wrong (Gemini sometimes returns empty
+    # responses). Surface as an error so the user knows to retry.
+    if not full_text:
+        log.warning("LLM produced empty response for project=%s", project_id)
+        yield make_event(
+            "error",
+            project_id,
+            session_id=session_id,
+            payload={
+                "message": "에이전트가 빈 응답을 반환했습니다. 다시 시도해주세요.",
+                "kind": "EmptyResponse",
+            },
+        )
+        return
+
     yield make_event(
         "completion",
         project_id,
