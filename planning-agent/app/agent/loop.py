@@ -25,7 +25,12 @@ def _build_initial_messages(
     history: Sequence[dict[str, Any]],
     new_user_message: str,
 ) -> list[dict[str, Any]]:
-    """Compose the starting chat-completions message array."""
+    """Compose the starting chat-completions message array.
+
+    Merges consecutive same-role messages to avoid confusing the LLM
+    (Gemini's OpenAI-compat endpoint returns empty responses when it
+    sees consecutive user messages without an assistant turn between).
+    """
     msgs: list[dict[str, Any]] = [
         {"role": "system", "content": PLANNING_SYSTEM_PROMPT}
     ]
@@ -34,9 +39,18 @@ def _build_initial_messages(
     for m in recent:
         role = m.get("role")
         content = m.get("content") or ""
-        if role in ("user", "assistant") and content:
+        if role not in ("user", "assistant") or not content:
+            continue
+        # Merge if same role as previous
+        if msgs and msgs[-1]["role"] == role:
+            msgs[-1]["content"] += "\n" + content
+        else:
             msgs.append({"role": role, "content": content})
-    msgs.append({"role": "user", "content": new_user_message})
+    # Append or merge the new user message
+    if msgs and msgs[-1]["role"] == "user":
+        msgs[-1]["content"] += "\n" + new_user_message
+    else:
+        msgs.append({"role": "user", "content": new_user_message})
     return msgs
 
 
