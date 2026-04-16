@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from app.agent.tools.base import Tool
+from app.agent.tools.evaluate_readiness import TOOL as EVALUATE_READINESS
 from app.agent.tools.propose_handoff import TOOL as PROPOSE_HANDOFF
 from app.agent.tools.search_memory import TOOL as SEARCH_MEMORY
 from app.agent.tools.update_memory import TOOL as UPDATE_MEMORY
@@ -25,6 +26,7 @@ _REGISTRY: dict[str, Tool] = {
         WRITE_DESIGN,
         SEARCH_MEMORY,
         UPDATE_MEMORY,
+        EVALUATE_READINESS,
         PROPOSE_HANDOFF,
     )
 }

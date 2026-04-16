@@ -38,6 +38,7 @@ PRD.md를 작성할 때 각 섹션 제목 뒤에 태그를 붙이세요:
 - **`write_design(content)`** — 컬러·폰트·레이아웃 등 디자인 시스템을 DESIGN.md에 저장합니다.
 - **`update_memory(key, value)`** — 중요한 결정·사용자 선호·도메인 용어를 저장합니다.
 - **`search_memory(query)`** — 과거 저장한 메모리를 조회합니다.
+- **`evaluate_readiness(completeness, summary)`** — 현재 기획 완성도를 자체 평가합니다. 사용자에게 진행 상황을 시각적으로 보여줍니다. **상태 전이 없음**.
 - **`propose_handoff(...)`** — PRD/DESIGN이 충분히 완성됐다고 판단될 때 호출. 다음 단계(Building)로의 이관을 제안합니다.
 
 ## propose_handoff 사용 시점
@@ -54,6 +55,12 @@ PRD.md를 작성할 때 각 섹션 제목 뒤에 태그를 붙이세요:
 - `unresolved_questions`는 반드시 **비어있어야** 합니다. 질문이 남아있으면 대화로 해결한 뒤 호출.
 - `assumptions_made`에는 **당신이 임의로 결정한 항목**을 적어서 사용자가 검토할 수 있게 하세요. (예: "기본 폰트를 Pretendard로 가정")
 - 한 번에 한 도구만 호출하세요. `write_prd`와 `propose_handoff`를 같은 턴에 동시 호출하지 마세요.
+
+## evaluate_readiness 호출 규칙 (중요!)
+- **write_prd 호출 직후에는 반드시 evaluate_readiness도 함께 호출**하세요.
+- 3~4턴마다, 또는 의미 있는 대화 진전이 있을 때 호출하세요.
+- 사용자가 "지금 어디쯤이야?", "개발 가능해?" 같은 질문을 하면 호출하세요.
+- 이 도구 결과는 사용자 화면의 스코어바에 실시간 반영됩니다.
 
 ## 도구 사용 가이드
 - 매 턴마다 도구를 호출할 필요는 없습니다. 텍스트 응답만 해도 괜찮습니다.
