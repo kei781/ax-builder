@@ -8,10 +8,10 @@ interface ServiceHealth {
 }
 
 interface HealthData {
-  backend: ServiceHealth;
+  orchestrator: ServiceHealth;
   database: ServiceHealth;
+  planning_agent: ServiceHealth;
   docker: ServiceHealth;
-  hermes: ServiceHealth;
 }
 
 const statusDot: Record<string, string> = {
@@ -38,40 +38,39 @@ export default function InfraStatus() {
   const [health, setHealth] = useState<HealthData | null>(null);
   const [error, setError] = useState(false);
 
-  const fetchHealth = async () => {
-    try {
-      const res = await client.get('/health');
-      setHealth(res.data);
-      setError(false);
-    } catch {
-      setError(true);
-      setHealth(null);
-    }
-  };
-
   useEffect(() => {
+    const fetchHealth = async () => {
+      try {
+        const res = await client.get('/health');
+        setHealth(res.data);
+        setError(false);
+      } catch {
+        setError(true);
+        setHealth(null);
+      }
+    };
     fetchHealth();
-    const interval = setInterval(fetchHealth, 30000); // 30초마다
+    const interval = setInterval(fetchHealth, 30000);
     return () => clearInterval(interval);
   }, []);
 
   if (error || !health) {
     return (
       <div className="flex items-center gap-3 px-4 py-1.5 bg-gray-100 dark:bg-gray-900/50 border-b border-gray-200 dark:border-gray-800 text-xs">
-        <span className="text-gray-500">인프라 상태</span>
+        <span className="text-gray-500">인프라</span>
         <span className="flex items-center gap-1.5 text-gray-500">
           <Dot status="down" />
-          Backend 연결 안 됨
+          Orchestrator 연결 안 됨
         </span>
       </div>
     );
   }
 
   const services = [
-    { key: 'backend', label: 'Backend', data: health.backend },
+    { key: 'orchestrator', label: 'Orchestrator', data: health.orchestrator },
     { key: 'database', label: 'Database', data: health.database },
+    { key: 'planning_agent', label: 'Planning Agent', data: health.planning_agent },
     { key: 'docker', label: 'Docker', data: health.docker },
-    { key: 'hermes', label: 'Hermes', data: health.hermes },
   ];
 
   return (
@@ -86,13 +85,7 @@ export default function InfraStatus() {
           <Dot status={s.data.status} />
           {s.label}
           {s.data.status !== 'ok' && (
-            <span
-              className={
-                s.data.status === 'degraded'
-                  ? 'text-yellow-500'
-                  : 'text-red-500'
-              }
-            >
+            <span className={s.data.status === 'degraded' ? 'text-yellow-500' : 'text-red-500'}>
               {statusLabel[s.data.status]}
             </span>
           )}
