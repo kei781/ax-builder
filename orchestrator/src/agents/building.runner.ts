@@ -216,13 +216,37 @@ export class BuildingRunner {
     return { message: '빌드를 중단했습니다.', state: updated.state };
   }
 
-  async status(
-    projectId: string,
-  ): Promise<{ active: boolean; phase: string | null; state: string | null }> {
+  async status(projectId: string): Promise<Record<string, unknown>> {
     const project = await this.projectRepo.findOne({ where: { id: projectId } });
     if (!project) return { active: false, phase: null, state: null };
     const active = this.processes.has(projectId);
-    return { active, phase: active ? project.state : null, state: project.state };
+
+    // Fetch latest build + phases from DB so the UI can restore on page load
+    const latestBuild = await this.builds.getLatestBuild(projectId);
+    const phases = latestBuild
+      ? await this.builds.getPhasesForBuild(latestBuild.id)
+      : [];
+
+    return {
+      active,
+      state: project.state,
+      build: latestBuild
+        ? {
+            id: latestBuild.id,
+            status: latestBuild.status,
+            started_at: latestBuild.started_at,
+            finished_at: latestBuild.finished_at,
+            bounce_reason_gap_list: latestBuild.bounce_reason_gap_list,
+          }
+        : null,
+      phases: phases.map((p) => ({
+        idx: p.idx,
+        name: p.name,
+        status: p.status,
+        started_at: p.started_at,
+        finished_at: p.finished_at,
+      })),
+    };
   }
 
   // ---------- Private ----------

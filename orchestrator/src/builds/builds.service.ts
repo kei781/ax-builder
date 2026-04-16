@@ -67,6 +67,20 @@ export class BuildsService {
     await this.phaseRepo.update(phaseId, update);
   }
 
+  async getLatestBuild(projectId: string): Promise<Build | null> {
+    return this.buildRepo.findOne({
+      where: { project_id: projectId },
+      order: { started_at: 'DESC' },
+    });
+  }
+
+  async getPhasesForBuild(buildId: string): Promise<BuildPhase[]> {
+    return this.phaseRepo.find({
+      where: { build_id: buildId },
+      order: { idx: 'ASC' },
+    });
+  }
+
   async recordAgentEvent(
     partial: Partial<AgentLog>,
   ): Promise<AgentLog> {

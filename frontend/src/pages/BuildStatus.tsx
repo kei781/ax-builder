@@ -37,17 +37,46 @@ export default function BuildStatus() {
     return () => clearInterval(timer);
   }, []);
 
-  // Poll project state as fallback
+  // Load build status from API (survives page refresh)
   useEffect(() => {
     if (!id) return;
-    const poll = async () => {
+    const load = async () => {
       try {
-        const res = await client.get(`/projects/${id}`);
-        setProjectState(res.data.state);
-      } catch { /* ignore */ }
+        // Project state
+        const projRes = await client.get(`/projects/${id}`);
+        setProjectState(projRes.data.state);
+
+        // Build details from DB
+        const buildRes = await client.get(`/projects/${id}/build/status`);
+        const data = buildRes.data;
+        if (data.build?.started_at) {
+          startRef.current = new Date(data.build.started_at).getTime();
+        }
+        if (data.phases?.length) {
+          const phaseLines: string[] = [];
+          for (const p of data.phases as Array<{idx: number; name: string; status: string}>) {
+            const icon = p.status === 'success' ? '✓' : p.status === 'running' ? '▸' : '○';
+            phaseLines.push(`${icon} ${p.name} (${p.status})`);
+            if (p.status === 'running') setPhase(p.name);
+          }
+          if (phaseLines.length) setLogs(phaseLines);
+          // Estimate progress from completed phases
+          const total = data.phases.length || 1;
+          const done = (data.phases as Array<{status: string}>).filter(
+            (p) => p.status === 'success',
+          ).length;
+          setPercent(Math.round((done / total) * 85) + 10);
+        }
+        if (data.state === 'deployed') {
+          setProjectState('deployed');
+          setPercent(100);
+        }
+      } catch {
+        /* ignore */
+      }
     };
-    poll();
-    const iv = setInterval(poll, 5000);
+    load();
+    const iv = setInterval(load, 10000); // poll every 10s as fallback
     return () => clearInterval(iv);
   }, [id]);
 
