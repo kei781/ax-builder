@@ -84,6 +84,13 @@ export default function Chat() {
   const [myRole, setMyRole] = useState<'owner' | 'editor' | 'viewer'>('viewer');
   const [handoffBanner, setHandoffBanner] = useState<string | null>(null);
   const [building, setBuilding] = useState(false);
+  const [readiness, setReadiness] = useState<{
+    completeness: Record<string, number>;
+    score: number;
+    can_build: boolean;
+    summary: string;
+    label: string;
+  } | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -157,14 +164,32 @@ export default function Chat() {
     (event: AgentEvent) => {
       switch (event.event_type) {
         case 'progress': {
-          const p = event.payload as { detail?: string; is_sufficient?: boolean } | undefined;
-          setStatus(p?.detail ?? '');
-          // plan_ready transition from propose_handoff / building from build click
+          const p = event.payload as {
+            detail?: string;
+            is_sufficient?: boolean;
+            completeness?: Record<string, number>;
+            score?: number;
+            can_build?: boolean;
+            summary?: string;
+            label?: string;
+          } | undefined;
+          if (p?.detail) setStatus(p.detail);
+
+          // readiness_update from evaluate_readiness tool
+          if (event.phase === 'readiness_update' && p?.completeness) {
+            setReadiness({
+              completeness: p.completeness,
+              score: p.score ?? 0,
+              can_build: p.can_build ?? false,
+              summary: p.summary ?? '',
+              label: p.label ?? '',
+            });
+          }
+          // plan_ready transition
           if (event.phase === 'plan_ready' || event.phase === 'build_requested') {
             if (event.phase === 'plan_ready' && p?.detail) {
               setHandoffBanner(p.detail);
             }
-            // refresh project state
             void fetchProject();
           }
           break;
@@ -278,9 +303,25 @@ export default function Chat() {
   const canEdit = myRole === 'owner' || myRole === 'editor';
   const state = project?.state ?? 'draft';
 
+  const scoreColor = (readiness?.score ?? 0) >= 600
+    ? 'text-green-400'
+    : (readiness?.score ?? 0) >= 400
+      ? 'text-yellow-400'
+      : 'text-red-400';
+
+  const CATEGORY_LABELS: Record<string, string> = {
+    problem_definition: '문제 정의',
+    feature_list: '기능 목록',
+    user_flow: '사용 흐름',
+    feasibility: '기술 실현성',
+    user_experience: '사용자 경험',
+  };
+
   return (
-    <div className="h-screen bg-gray-50 dark:bg-gray-950 flex flex-col">
-      <header className="border-b border-gray-200 dark:border-gray-800 px-6 py-4 flex items-center gap-4">
+    <div className="h-screen bg-gray-50 dark:bg-gray-950 flex overflow-hidden">
+      {/* Chat column */}
+      <div className="flex-1 flex flex-col min-h-0">
+      <header className="shrink-0 border-b border-gray-200 dark:border-gray-800 px-6 py-4 flex items-center gap-4">
         <a href="/" className="text-gray-500 hover:text-gray-900 dark:hover:text-white">
           ← 대시보드
         </a>
@@ -397,6 +438,80 @@ export default function Chat() {
           <p className="text-gray-500 text-sm">읽기 전용 — 대화 내역만 확인할 수 있습니다.</p>
         </div>
       )}
+      </div>{/* end chat column */}
+
+      {/* Score sidebar */}
+      <div className="w-80 border-l border-gray-200 dark:border-gray-800 p-6 flex flex-col overflow-y-auto shrink-0">
+        {/* Score */}
+        <div className="mb-6">
+          <div className="flex items-baseline justify-between mb-2">
+            <span className="text-gray-500 dark:text-gray-400 text-sm">스코어</span>
+            <span className={`text-2xl font-bold ${scoreColor}`}>
+              {readiness?.score ?? 0}
+              <span className="text-gray-500 text-sm font-normal">/1000</span>
+            </span>
+          </div>
+          <div className="w-full bg-gray-200 dark:bg-gray-800 rounded-full h-3 mb-2">
+            <div
+              className="bg-green-500 h-3 rounded-full transition-all duration-500"
+              style={{ width: `${((readiness?.score ?? 0) / 1000) * 100}%` }}
+            />
+          </div>
+          <p className={`text-sm ${scoreColor}`}>{readiness?.label ?? '대화를 시작하세요'}</p>
+          {readiness?.summary && (
+            <p className="text-gray-500 text-xs mt-1">{readiness.summary}</p>
+          )}
+        </div>
+
+        {/* Category bars */}
+        <div className="mb-6">
+          <h3 className="text-gray-500 dark:text-gray-400 text-xs uppercase mb-3">항목별 점수</h3>
+          {Object.entries(readiness?.completeness ?? {}).map(([key, val]) => (
+            <div key={key} className="mb-2">
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-gray-600 dark:text-gray-400">
+                  {CATEGORY_LABELS[key] ?? key}
+                </span>
+                <span className="text-gray-500">{Math.round((val as number) * 100)}%</span>
+              </div>
+              <div className="w-full bg-gray-200 dark:bg-gray-800 rounded-full h-1.5">
+                <div
+                  className={`h-1.5 rounded-full transition-all duration-500 ${
+                    (val as number) >= 0.6 ? 'bg-green-500' : (val as number) >= 0.3 ? 'bg-yellow-500' : 'bg-red-500'
+                  }`}
+                  style={{ width: `${(val as number) * 100}%` }}
+                />
+              </div>
+            </div>
+          ))}
+          {!readiness && (
+            <p className="text-gray-500 dark:text-gray-600 text-xs">
+              대화가 진행되면 AI가 자동으로 평가합니다.
+            </p>
+          )}
+        </div>
+
+        {/* Build button */}
+        {canEdit && (
+          <div className="mt-auto">
+            <button
+              onClick={handleBuild}
+              disabled={!canBuild && !(readiness?.can_build)}
+              className={`w-full py-3 rounded-xl text-sm font-medium transition-colors ${
+                canBuild || readiness?.can_build
+                  ? 'bg-green-600 hover:bg-green-500 text-white'
+                  : 'bg-gray-200 dark:bg-gray-800 text-gray-400 dark:text-gray-600 cursor-not-allowed'
+              }`}
+            >
+              {canBuild
+                ? '🚀 제작 시작'
+                : readiness?.can_build
+                  ? '기획 완성 → 제작 시작 가능'
+                  : `스코어 600점 이상 시 제작 가능`}
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

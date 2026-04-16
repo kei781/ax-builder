@@ -361,6 +361,37 @@ export class ChatService {
       }
     }
 
+    // evaluate_readiness — forward score to frontend for sidebar display.
+    if (event.event_type === 'tool_result') {
+      const trPayload = (event.payload ?? {}) as {
+        name?: string;
+        result?: {
+          ok?: boolean;
+          completeness?: Record<string, number>;
+          score?: number;
+          can_build?: boolean;
+          summary?: string;
+          label?: string;
+        };
+      };
+      if (trPayload.name === 'evaluate_readiness' && trPayload.result?.ok) {
+        this.gateway.emit({
+          agent: 'planning',
+          project_id: event.project_id,
+          session_id: sessionId,
+          event_type: 'progress',
+          phase: 'readiness_update',
+          payload: {
+            completeness: trPayload.result.completeness,
+            score: trPayload.result.score,
+            can_build: trPayload.result.can_build,
+            summary: trPayload.result.summary,
+            label: trPayload.result.label,
+          },
+        });
+      }
+    }
+
     // propose_handoff notification — the Python tool writes the handoff row
     // and transitions projects.state directly via SQL; here we surface the
     // transition to the frontend so UI can flip to "빌드 시작" mode.
