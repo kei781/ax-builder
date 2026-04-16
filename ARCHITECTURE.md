@@ -432,6 +432,11 @@ draft ──> planning ──> plan_ready ──> building ──> qa ──> de
 5. **로컬 모델 전환 시 GPU 동시 실행 수 제약** — 128GB 통합 메모리 기준 qwen3:32b int4 동시 6~7개가 한계. 시스템 동시 building 3개 + planning 활성 N개가 이 한도를 넘지 않는지 실측 필요.
 6. **bounce-back 무한 루프 가능성** — Building 실패 → Planning 반송 → 유저가 같은 PRD 제출 → 같은 실패. 동일 gap이 K회 반복 반송되면 강제 중단 + 유저에게 에스컬레이션 필요.
 7. **slot 매핑 오설정 리스크** — `.env`의 slot 모델이 해당 역할에 부적합(예: `SLOT_CHAT=gemma-1b` 같은 과소 모델)하면 에이전트 품질이 급락. 운영 가이드에 slot별 최소 권장 체급 문서화 필요.
+8. **3-서비스 독립 분리** — 현재 모노레포(`orchestrator/`, `planning-agent/`, `building-agent/`)가 `.env`와 SQLite를 공유하여 서비스 경계가 흐릿함. 안정화 후 다음 마일스톤에서:
+   - Planning Agent: SQLite 직접 접근 제거 → orchestrator API를 통해서만 데이터 접근
+   - Building Agent: subprocess spawn → 독립 HTTP 서비스로 승격
+   - 공유 `.env` → 서비스별 config 분리, 서비스 간 통신은 API 계약으로
+   - 이를 통해 각 서비스의 권한·책임·배포 독립성 확보
 
 ---
 
