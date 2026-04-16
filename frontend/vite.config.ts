@@ -10,7 +10,7 @@ export default defineConfig({
     allowedHosts: ['hackathon.acaxiaa.store'],
     proxy: {
       '/api': { target: 'http://localhost:4000', changeOrigin: true },
-      '/ws': { target: 'http://localhost:4000', ws: true, changeOrigin: true },
+      '/socket.io': { target: 'http://localhost:4000', ws: true, changeOrigin: true },
     },
   },
 })

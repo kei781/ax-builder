@@ -141,7 +141,7 @@ export default function Chat() {
 
   useEffect(() => {
     if (!id) return;
-    const socket = io('/ws', { transports: ['websocket'] });
+    const socket = io('/ws', { transports: ['polling', 'websocket'] });
     socketRef.current = socket;
 
     socket.on('connect', () => {

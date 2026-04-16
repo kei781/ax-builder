@@ -54,7 +54,7 @@ export default function BuildStatus() {
   // Real-time events via WS
   useEffect(() => {
     if (!id) return;
-    const socket: Socket = io('/ws', { transports: ['websocket'] });
+    const socket: Socket = io('/ws', { transports: ['polling', 'websocket'] });
     socket.on('connect', () => {
       setConnected(true);
       socket.emit('join', { projectId: id });
