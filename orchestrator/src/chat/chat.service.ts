@@ -14,6 +14,7 @@ import { ProjectPermission } from '../projects/entities/project-permission.entit
 import { Session } from '../sessions/entities/session.entity.js';
 import { ConversationMessage } from '../sessions/entities/conversation-message.entity.js';
 import { AgentLog } from '../builds/entities/agent-log.entity.js';
+import { Handoff } from '../handoffs/entities/handoff.entity.js';
 import { StateMachineService } from '../state-machine/state-machine.service.js';
 import { PlanningClient } from '../agents/planning.client.js';
 import { BuildGateway } from '../websocket/build.gateway.js';
@@ -57,6 +58,8 @@ export class ChatService {
     private readonly messageRepo: Repository<ConversationMessage>,
     @InjectRepository(AgentLog)
     private readonly agentLogRepo: Repository<AgentLog>,
+    @InjectRepository(Handoff)
+    private readonly handoffRepo: Repository<Handoff>,
     private readonly dataSource: DataSource,
     private readonly stateMachine: StateMachineService,
     private readonly planning: PlanningClient,
@@ -74,15 +77,47 @@ export class ChatService {
     });
     if (!project) throw new NotFoundException('프로젝트를 찾을 수 없습니다.');
 
-    if (!project.current_session_id) return { session_id: null, messages: [] };
+    if (!project.current_session_id) {
+      return { session_id: null, messages: [], readiness: null };
+    }
 
-    const messages = await this.messageRepo.find({
-      where: { session_id: project.current_session_id },
-      order: { created_at: 'ASC' },
-    });
+    const [messages, handoff] = await Promise.all([
+      this.messageRepo.find({
+        where: { session_id: project.current_session_id },
+        order: { created_at: 'ASC' },
+      }),
+      this.handoffRepo.findOne({
+        where: { session_id: project.current_session_id },
+        order: { created_at: 'DESC' },
+      }),
+    ]);
+
+    // Build readiness from latest handoff (so page refresh preserves scores)
+    const readiness = handoff
+      ? {
+          completeness: handoff.completeness,
+          score: Math.round(
+            (Object.values(handoff.completeness).reduce(
+              (a: number, b: number) => a + b,
+              0,
+            ) /
+              Object.values(handoff.completeness).length) *
+              1000,
+          ),
+          can_build:
+            Math.min(...Object.values(handoff.completeness)) >= 0.6 &&
+            handoff.unresolved_questions.length === 0,
+          summary: '',
+          label:
+            Math.min(...Object.values(handoff.completeness)) >= 0.6
+              ? '빌드 가능'
+              : '보완 필요',
+        }
+      : null;
 
     return {
       session_id: project.current_session_id,
+      readiness,
       messages: messages.map((m) => ({
         id: m.id,
         role: m.role,

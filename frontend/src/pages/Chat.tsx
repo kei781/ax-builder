@@ -119,6 +119,10 @@ export default function Chat() {
               }),
             );
             setMessages(loaded);
+            // Restore readiness from handoff (survives page refresh)
+            if (res.data.readiness) {
+              setReadiness(res.data.readiness);
+            }
           })
           .catch(() => {
             /* empty history */
