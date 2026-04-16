@@ -255,20 +255,45 @@ async def run_turn(
     full_text = "".join(final_text_parts).strip()
 
     # Guard: if the LLM produced no text and no tool calls in the final
-    # iteration, something went wrong (Gemini sometimes returns empty
-    # responses). Surface as an error so the user knows to retry.
+    # iteration, retry ONCE without tools. Gemini sometimes returns empty
+    # when tools + short/ambiguous user input combine.
     if not full_text:
-        log.warning("LLM produced empty response for project=%s", project_id)
-        yield make_event(
-            "error",
+        log.warning(
+            "LLM produced empty response for project=%s — retrying without tools",
             project_id,
-            session_id=session_id,
-            payload={
-                "message": "에이전트가 빈 응답을 반환했습니다. 다시 시도해주세요.",
-                "kind": "EmptyResponse",
-            },
         )
-        return
+        retry_buf: list[str] = []
+        try:
+            async for chunk in lifecycle.ask_stream("chat", messages):
+                retry_buf.append(chunk)
+                yield make_event(
+                    "token",
+                    project_id,
+                    session_id=session_id,
+                    payload={"delta": chunk},
+                )
+        except Exception as e:  # noqa: BLE001
+            log.exception("Retry without tools also failed for project=%s", project_id)
+            yield make_event(
+                "error",
+                project_id,
+                session_id=session_id,
+                payload={"message": str(e), "kind": e.__class__.__name__},
+            )
+            return
+
+        full_text = "".join(retry_buf).strip()
+        if not full_text:
+            yield make_event(
+                "error",
+                project_id,
+                session_id=session_id,
+                payload={
+                    "message": "에이전트가 빈 응답을 반환했습니다. 다시 시도해주세요.",
+                    "kind": "EmptyResponse",
+                },
+            )
+            return
 
     yield make_event(
         "completion",
