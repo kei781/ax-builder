@@ -342,16 +342,38 @@ export class BuildingRunner {
           `Container deployed: project=${projectId} port=${port} container=${containerId}`,
         );
       } catch (err: any) {
+        // Docker failure = build failure. We won't transition to 'deployed'
+        // with a non-accessible project. Better to mark failed and let the
+        // user see the root cause.
         this.logger.error(
-          `Docker deploy failed (non-fatal): ${err?.message ?? err}`,
+          `Docker deploy failed: ${err?.message ?? err}`,
         );
-        // Build succeeded even if Docker fails — the code is there.
+        await this.builds.closeBuild(buildId, 'failed');
+        try {
+          await this.stateMachine.transition(
+            projectId,
+            'failed',
+            `docker deploy failed: ${err?.message ?? 'unknown'}`,
+          );
+        } catch {
+          /* ignore */
+        }
+        this.gateway.emit({
+          agent: 'building',
+          project_id: projectId,
+          event_type: 'error',
+          payload: {
+            kind: 'docker_deploy_failed',
+            message: err?.message ?? 'Docker container 생성 실패',
+          },
+        });
+        return;
       }
 
       await this.projectRepo.update(projectId, {
         current_version: newVersion,
-        port: port ?? proj.port,
-        container_id: containerId ?? proj.container_id,
+        port,
+        container_id: containerId,
       });
       await this.builds.createVersion(projectId, newVersion, containerId);
 

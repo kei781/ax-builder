@@ -19,6 +19,9 @@ export class DockerService {
       `Creating container for project ${projectId} on port ${port}`,
     );
 
+    // Ensure base image is available; pull if missing.
+    await this.ensureImage('node:20-slim');
+
     const container = await this.docker.createContainer({
       Image: 'node:20-slim',
       name: `project-${projectId}`,
@@ -39,6 +42,27 @@ export class DockerService {
     });
 
     return container.id;
+  }
+
+  /** Pull the image if it isn't already present locally. */
+  private async ensureImage(image: string): Promise<void> {
+    try {
+      await this.docker.getImage(image).inspect();
+      return; // already present
+    } catch {
+      // not found — pull
+    }
+    this.logger.log(`Pulling image: ${image}`);
+    await new Promise<void>((resolve, reject) => {
+      this.docker.pull(image, (err: Error | null, stream: NodeJS.ReadableStream) => {
+        if (err) return reject(err);
+        this.docker.modem.followProgress(
+          stream,
+          (err2: Error | null) => (err2 ? reject(err2) : resolve()),
+        );
+      });
+    });
+    this.logger.log(`Pulled image: ${image}`);
   }
 
   async startContainer(containerId: string): Promise<void> {
