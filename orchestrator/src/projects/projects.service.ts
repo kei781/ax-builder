@@ -124,7 +124,7 @@ export class ProjectsService {
       }
     }
 
-    return { ...project, failure_reason };
+    return Object.assign(project, { failure_reason });
   }
 
   async getUserRole(
