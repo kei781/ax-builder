@@ -104,7 +104,7 @@ export class ProjectsService {
       throw new NotFoundException('프로젝트를 찾을 수 없습니다.');
     }
 
-    // Include failure reason from the most recent failed build if state=failed.
+    // Include failure reason for failed projects.
     let failure_reason: string[] | null = null;
     if (project.state === 'failed') {
       const failed = await this.dataSource
@@ -120,6 +120,22 @@ export class ProjectsService {
           failure_reason = JSON.parse(failed.b_bounce_reason_gap_list);
         } catch {
           failure_reason = [String(failed.b_bounce_reason_gap_list)];
+        }
+      }
+      // Fallback when the build row has no structured reason (legacy data,
+      // or the process crashed before writing it). Infer from observable
+      // state so the user at least sees something actionable.
+      if (!failure_reason || failure_reason.length === 0) {
+        if (!project.container_id && !project.port) {
+          failure_reason = [
+            '빌드 후 Docker 컨테이너 배포에 실패했습니다.',
+            'Docker daemon 상태 및 node:20-slim 이미지 사용 가능 여부를 확인한 뒤 다시 시도하거나, 기획 내용을 보강해주세요.',
+          ];
+        } else {
+          failure_reason = [
+            '빌드가 실패했습니다. 상세 사유가 기록되지 않았습니다 (이전 버전에서 발생한 빌드일 수 있음).',
+            '기획 내용을 다시 확인하시고, 필요하면 추가 설명을 입력한 뒤 다시 빌드해주세요.',
+          ];
         }
       }
     }
