@@ -92,28 +92,57 @@ export class ChatService {
       }),
     ]);
 
-    // Build readiness from latest handoff (so page refresh preserves scores)
-    const readiness = handoff
-      ? {
-          completeness: handoff.completeness,
-          score: Math.round(
-            (Object.values(handoff.completeness).reduce(
-              (a: number, b: number) => a + b,
-              0,
-            ) /
-              Object.values(handoff.completeness).length) *
-              1000,
-          ),
-          can_build:
-            Math.min(...Object.values(handoff.completeness)) >= 0.6 &&
-            handoff.unresolved_questions.length === 0,
-          summary: '',
-          label:
-            Math.min(...Object.values(handoff.completeness)) >= 0.6
-              ? '빌드 가능'
-              : '보완 필요',
+    // Build readiness from latest handoff (if handoff exists — plan_ready state).
+    let readiness: {
+      completeness: Record<string, number>;
+      score: number;
+      can_build: boolean;
+      summary: string;
+      label: string;
+    } | null = null;
+
+    if (handoff) {
+      const values = Object.values(handoff.completeness) as number[];
+      const minScore = Math.min(...values);
+      readiness = {
+        completeness: handoff.completeness,
+        score: Math.round((values.reduce((a, b) => a + b, 0) / values.length) * 1000),
+        can_build: minScore >= 0.6 && handoff.unresolved_questions.length === 0,
+        summary: '',
+        label: minScore >= 0.6 ? '빌드 가능' : '보완 필요',
+      };
+    } else {
+      // No handoff yet — fall back to the latest evaluate_readiness tool_result
+      // stored in agent_logs (live scoring mid-conversation).
+      const latestEval = await this.agentLogRepo
+        .createQueryBuilder('log')
+        .where('log.project_id = :pid', { pid: projectId })
+        .andWhere("log.event_type = 'tool_result'")
+        .andWhere("json_extract(log.payload, '$.name') = 'evaluate_readiness'")
+        .andWhere("json_extract(log.payload, '$.result.ok') = 1")
+        .orderBy('log.created_at', 'DESC')
+        .getOne();
+      if (latestEval?.payload) {
+        const p = latestEval.payload as {
+          result?: {
+            completeness?: Record<string, number>;
+            score?: number;
+            can_build?: boolean;
+            summary?: string;
+            label?: string;
+          };
+        };
+        if (p.result?.completeness) {
+          readiness = {
+            completeness: p.result.completeness,
+            score: p.result.score ?? 0,
+            can_build: p.result.can_build ?? false,
+            summary: p.result.summary ?? '',
+            label: p.result.label ?? '',
+          };
         }
-      : null;
+      }
+    }
 
     return {
       session_id: project.current_session_id,
