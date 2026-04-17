@@ -464,3 +464,125 @@ draft ──> planning ──> plan_ready ──> building ──> qa ──> de
 - **phase**: Building이 코드를 만들어내는 단위. PHASES.md에 순서대로 기재.
 - **session**: 한 프로젝트의 대화·빌드 전체 생명주기 단위. 빌드 완료 전까지 유지.
 - **lock (프로젝트)**: 무의미 입력 반복 등으로 일시 사용 제한된 상태. 유저의 planning 세션 한도에서 차감됨.
+
+---
+
+## 18. 운영 중 발견한 버그와 해결 패턴
+
+> 같은 실수 반복 방지용 기록. 새 기능 추가 시 먼저 이 목록을 훑어볼 것.
+
+### 18.1 Gemini OpenAI-compat 엔드포인트의 특이 동작
+
+1. **tools + 짧거나 모호한 입력 → 빈 응답**
+   - 증상: `{text: "", tool_calls: []}` 반환, finish_reason=stop
+   - 예: "ㄱㄱ" 같은 짧은 한국어 답변
+   - 해결: `loop.py`에서 빈 응답 시 **tools 제거하고 재시도**하는 fallback
+   - 위치: `planning-agent/app/agent/loop.py` `run_turn()` 말단
+
+2. **finish_reason="stop" + tool_calls 동시 반환**
+   - 증상: 도구 호출은 있는데 finish_reason이 `stop`이라 루프가 조기 종료
+   - 해결: `tool_calls`가 있었으면 finish_reason 무시하고 다음 iteration 진행
+   - 위치: `planning-agent/app/agent/loop.py` `finish_reason` 체크
+
+3. **연속 동일 role 메시지 → 빈 응답**
+   - 증상: `user → user → user` 연속되면 응답 안 함
+   - 해결: `_build_initial_messages`에서 동일 role 연속 시 `\n`으로 병합
+   - 위치: `planning-agent/app/agent/loop.py`
+
+4. **JSON 예시가 포함된 프롬프트 + Python `.format()`**
+   - 증상: `KeyError: '\n "name"'` 같은 포맷 에러
+   - 원인: `{...}`가 format specifier로 해석됨
+   - 해결: `f-string` 사용 또는 `{{}}` 이스케이프
+   - 위치: `building-agent/phase_planner.py`
+
+### 18.2 WebSocket 프로덕션 연결
+
+1. **socket.io는 `/ws/`가 아니라 `/socket.io/` 경로 사용**
+   - 증상: 프로덕션에서 "연결 중"이 지속, WS 안 붙음
+   - 해결: Vite proxy에 `/socket.io` 프록시 룰 추가 (`/ws`는 네임스페이스지 HTTP 경로 아님)
+   - 위치: `frontend/vite.config.ts`, `docker/nginx.conf`
+
+2. **`transports: ['websocket']` 전용 → Cloudflare 등 프록시 환경에서 실패**
+   - 해결: `transports: ['polling', 'websocket']`로 fallback 허용
+   - 위치: `frontend/src/pages/Chat.tsx`, `BuildStatus.tsx`
+
+### 18.3 상태 지속성 (새로고침 대응)
+
+**대원칙**: WS 이벤트만 의존하면 새로고침 시 UI가 리셋됨. 반드시 **API로 초기 로드 + WS로 실시간 갱신** 이중 구조로 할 것.
+
+1. **스코어 사이드바 초기화**
+   - 해결: `GET /chat/history`가 `readiness` 필드 반환
+   - 우선순위: 최신 handoff → 최신 `evaluate_readiness` tool_result → null
+   - 위치: `orchestrator/src/chat/chat.service.ts` `getHistory()`
+
+2. **빌드 진행 상태 초기화**
+   - 해결: `GET /build/status`가 phases 목록 반환
+   - 위치: `orchestrator/src/agents/building.runner.ts` `status()`
+
+3. **실패 사유 표시**
+   - 해결: `GET /projects/:id`가 `failure_reason` 필드 반환
+   - 위치: `orchestrator/src/projects/projects.service.ts` `findOne()`
+
+### 18.4 Docker 배포
+
+1. **이미지 없으면 `createContainer` 404**
+   - 해결: `ensureImage()` 선제 pull
+   - 위치: `orchestrator/src/infra/docker.service.ts`
+
+2. **Docker 실패를 non-fatal로 삼키면 안 됨**
+   - 증상: `container_id=NULL`인데 `state=deployed`로 전이, localhost 접속 불가
+   - 해결: Docker 실패 → `build=failed, state=failed` + 프론트에 error 이벤트
+   - 위치: `orchestrator/src/agents/building.runner.ts` `handleExit()`
+
+### 18.5 NestJS 모듈 의존성
+
+1. **순환 의존**
+   - 증상: `UndefinedModuleException` at startup
+   - 해결 우선순위:
+     1. 가드/서비스가 Repo만 필요하면 `TypeOrmModule.forFeature([Entity])`로 Repo 직접 주입 (모듈 import 불필요)
+     2. 공유 서비스는 중립 모듈(예: `InfraModule`)로 분리
+     3. 최후의 수단: `forwardRef()`
+   - 사례: `PermissionsGuard`가 `ProjectsService` 대신 `Repository<ProjectPermission>` 직접 주입
+
+2. **자식 모듈이 주입받는 서비스는 export 필수**
+   - `TypeOrmModule.forFeature([X])`로 Repo 쓰려면 같은 모듈 또는 부모에서 선언해야 함
+
+### 18.6 DB 외래키
+
+1. **프로젝트 삭제 시 CASCADE 없음 (SQLite)**
+   - 증상: `SQLITE_CONSTRAINT_FOREIGNKEY`
+   - 해결: 의존 테이블 FK-safe 순서로 명시적 삭제
+     - `build_phases → builds`
+     - `handoffs/conversation_messages/session_summaries → sessions`
+     - `project_memory, project_versions, agent_logs, ProjectPermission`
+     - 마지막에 `projects.current_session_id = NULL` → `Project` 삭제
+   - 위치: `orchestrator/src/projects/projects.service.ts` `delete()`
+
+2. **State machine 전이 누락**
+   - 증상: 정상 플로우인데 `BadRequestException: Invalid transition`
+   - 체크: `VALID_TRANSITIONS` 맵에 전이 추가됐는지
+   - 사례: `building → deployed` (inline QA 통과 시) 추가
+
+### 18.7 프로세스 생명주기
+
+1. **Orchestrator 재시작 시 Building Agent subprocess 오펀**
+   - 증상: DB는 `status=running`인데 실제 프로세스 없음, 빌드 영원히 대기
+   - 해결 (임시): 관리자가 수동으로 DB state를 `failed`로, project state를 `plan_ready`로 복원
+   - 해결 (근본): orchestrator shutdown hook에서 활성 빌드들을 failed 처리 (미구현)
+
+2. **코드 변경 후 재시작 필수**
+   - 빌드만 하고 프로세스 재시작 안 하면 구 빌드가 계속 동작
+   - 체크리스트: orchestrator 코드 수정 → `npm run build && pkill dist/main.js && node dist/main.js`
+   - Python 코드 수정 → uvicorn 재시작
+   - Frontend 수정 → Vite는 HMR 자동, 프로덕션은 `npm run build` 필요
+
+### 18.8 메시지 DB 저장
+
+1. **빈 assistant 메시지 저장 금지**
+   - 증상: DB에 빈 assistant row 생김 → 다음 턴에 연속 user 메시지 패턴 유발 (Gemini 빈 응답의 원인)
+   - 해결: `ChatService.handleAgentEvent`에서 `content.trim().length > 0`일 때만 저장
+   - 위치: `orchestrator/src/chat/chat.service.ts`
+
+2. **Chat lock stale 방지**
+   - 5분 이상 된 lock은 crash로 간주하고 auto-release
+   - 위치: `orchestrator/src/chat/chat.service.ts` `sendUserMessage`
