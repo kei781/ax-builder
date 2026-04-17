@@ -168,7 +168,53 @@ export class ProjectsService {
   async delete(id: string, userId: string): Promise<void> {
     await this.requireRole(id, userId, ['owner']);
     await this.dataSource.transaction(async (manager) => {
+      // Collect all dependent ids first (raw SQL — simpler than entity refs)
+      const sessionIds: Array<{ id: string }> = await manager.query(
+        'SELECT id FROM sessions WHERE project_id = ?',
+        [id],
+      );
+      const sids = sessionIds.map((r) => r.id);
+
+      const buildIds: Array<{ id: string }> = await manager.query(
+        'SELECT id FROM builds WHERE project_id = ?',
+        [id],
+      );
+      const bids = buildIds.map((r) => r.id);
+
+      // Delete in FK-safe order: children first
+      if (bids.length) {
+        await manager.query(
+          `DELETE FROM build_phases WHERE build_id IN (${bids.map(() => '?').join(',')})`,
+          bids,
+        );
+      }
+      if (sids.length) {
+        await manager.query(
+          `DELETE FROM handoffs WHERE session_id IN (${sids.map(() => '?').join(',')})`,
+          sids,
+        );
+        await manager.query(
+          `DELETE FROM conversation_messages WHERE session_id IN (${sids.map(() => '?').join(',')})`,
+          sids,
+        );
+        await manager.query(
+          `DELETE FROM session_summaries WHERE session_id IN (${sids.map(() => '?').join(',')})`,
+          sids,
+        );
+      }
+
+      await manager.query('DELETE FROM builds WHERE project_id = ?', [id]);
+      await manager.query('DELETE FROM sessions WHERE project_id = ?', [id]);
+      await manager.query('DELETE FROM project_memory WHERE project_id = ?', [id]);
+      await manager.query('DELETE FROM project_versions WHERE project_id = ?', [id]);
+      await manager.query('DELETE FROM agent_logs WHERE project_id = ?', [id]);
       await manager.delete(ProjectPermission, { project_id: id });
+
+      // Clear current_session_id reference before deleting project
+      await manager.query(
+        'UPDATE projects SET current_session_id = NULL WHERE id = ?',
+        [id],
+      );
       await manager.delete(Project, id);
     });
   }
