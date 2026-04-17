@@ -288,16 +288,36 @@ export default function Chat() {
 
   const handleBuild = async () => {
     if (!id || building) return;
+
+    // can_build이지만 아직 plan_ready가 아니면 = AI가 propose_handoff 안 함.
+    // 자동으로 AI에게 핸드오프 요청 메시지를 보냄 (유저가 직접 프롬프트 안 쳐도 됨)
+    if (project?.state !== 'plan_ready' && readiness?.can_build) {
+      const autoMsg =
+        '기획이 충분히 정리됐습니다. propose_handoff 도구를 호출해서 ' +
+        '다음 단계(Building)로 이관을 제안해주세요.';
+      setMessages((prev) => [...prev, { role: 'user', content: autoMsg }]);
+      setLoading(true);
+      setStatus('핸드오프 요청 중...');
+      try {
+        await client.post(`/projects/${id}/chat/messages`, { content: autoMsg });
+      } catch (err: unknown) {
+        const e = err as { response?: { data?: { message?: string } } };
+        setStatus(`⚠ ${e.response?.data?.message ?? '요청 실패'}`);
+        setLoading(false);
+      }
+      return;
+    }
+
     setBuilding(true);
     try {
       await client.post(`/projects/${id}/build`);
-      // Server transitions state; socket will push a `build_requested` event.
-      // UI awaits the next state fetch to flip views.
       setTimeout(() => {
         void fetchProject();
       }, 300);
     } catch (err: unknown) {
       const e = err as { response?: { data?: { message?: string } } };
+      // 프로미넌트한 alert — status bar에 묻히지 않게
+      alert(`빌드 시작 실패: ${e.response?.data?.message ?? '알 수 없는 오류'}`);
       setStatus(`⚠ ${e.response?.data?.message ?? '빌드 시작 실패'}`);
     } finally {
       setBuilding(false);
@@ -525,7 +545,9 @@ export default function Chat() {
               {canBuild
                 ? '🚀 제작 시작'
                 : readiness?.can_build
-                  ? '기획 완성 → 제작 시작 가능'
+                  ? loading
+                    ? '핸드오프 요청 중...'
+                    : '📋 AI에게 핸드오프 요청'
                   : `스코어 600점 이상 시 제작 가능`}
             </button>
           </div>
