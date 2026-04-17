@@ -21,12 +21,6 @@ const statusDot: Record<string, string> = {
   down: 'bg-red-500',
 };
 
-const statusLabel: Record<string, string> = {
-  ok: '정상',
-  degraded: '느림',
-  down: '중단',
-};
-
 function Dot({ status }: { status: string }) {
   return (
     <span
