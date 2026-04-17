@@ -95,7 +95,7 @@ export class ProjectsService {
     return saved;
   }
 
-  async findOne(id: string): Promise<Project> {
+  async findOne(id: string): Promise<Project & { failure_reason?: string[] | null }> {
     const project = await this.projectRepo.findOne({
       where: { id },
       relations: ['owner'],
@@ -103,7 +103,28 @@ export class ProjectsService {
     if (!project) {
       throw new NotFoundException('프로젝트를 찾을 수 없습니다.');
     }
-    return project;
+
+    // Include failure reason from the most recent failed build if state=failed.
+    let failure_reason: string[] | null = null;
+    if (project.state === 'failed') {
+      const failed = await this.dataSource
+        .getRepository('Build')
+        .createQueryBuilder('b')
+        .where('b.project_id = :pid', { pid: id })
+        .andWhere("b.status IN ('failed', 'bounced')")
+        .orderBy('b.finished_at', 'DESC')
+        .limit(1)
+        .getRawOne();
+      if (failed?.b_bounce_reason_gap_list) {
+        try {
+          failure_reason = JSON.parse(failed.b_bounce_reason_gap_list);
+        } catch {
+          failure_reason = [String(failed.b_bounce_reason_gap_list)];
+        }
+      }
+    }
+
+    return { ...project, failure_reason };
   }
 
   async getUserRole(

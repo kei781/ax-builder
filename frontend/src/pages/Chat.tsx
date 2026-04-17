@@ -46,6 +46,7 @@ interface ProjectInfo {
   state: ProjectState;
   current_session_id: string | null;
   port: number | null;
+  failure_reason?: string[] | null;
 }
 
 const STATE_LABELS: Record<ProjectState, string> = {
@@ -346,6 +347,20 @@ export default function Chat() {
         </span>
         {status && <span className="text-xs text-gray-500 ml-auto">{status}</span>}
       </header>
+
+      {/* Failure banner */}
+      {state === 'failed' && project?.failure_reason && project.failure_reason.length > 0 && (
+        <div className="px-6 py-3 bg-red-500/10 border-b border-red-500/30">
+          <p className="text-sm text-red-700 dark:text-red-400 font-medium mb-1">
+            ⚠ 이전 빌드가 실패했습니다. 아래 내용을 참고하여 기획을 보강하거나 재시도해주세요.
+          </p>
+          <ul className="text-xs text-red-600 dark:text-red-300 ml-4 list-disc space-y-0.5">
+            {project.failure_reason.map((reason, i) => (
+              <li key={i}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* Handoff banner */}
       {handoffBanner && (

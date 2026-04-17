@@ -208,6 +208,13 @@ export class ChatService {
         'planning',
         'first user message',
       );
+    } else if (project.state === 'failed') {
+      // Resume planning after a build failure — user is fixing the PRD.
+      await this.stateMachine.transition(
+        projectId,
+        'planning',
+        'resuming after failure',
+      );
     }
 
     // Persist the user message before dispatching. Single-writer pattern:

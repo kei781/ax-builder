@@ -348,7 +348,10 @@ export class BuildingRunner {
         this.logger.error(
           `Docker deploy failed: ${err?.message ?? err}`,
         );
-        await this.builds.closeBuild(buildId, 'failed');
+        await this.builds.closeBuild(buildId, 'failed', [
+          `Docker 배포 실패: ${err?.message ?? '알 수 없는 오류'}`,
+          'node:20-slim 이미지를 로컬에서 받을 수 있는지, Docker daemon이 동작하는지 확인해주세요.',
+        ]);
         try {
           await this.stateMachine.transition(
             projectId,
@@ -415,7 +418,10 @@ export class BuildingRunner {
       });
     } else {
       // Unrecoverable failure
-      await this.builds.closeBuild(buildId, 'failed');
+      await this.builds.closeBuild(buildId, 'failed', [
+        `Building Agent가 비정상 종료했습니다 (exit code ${code})`,
+        '빌드 로그를 확인하고, 기획 문서에 누락된 정보가 있다면 보완해주세요.',
+      ]);
       try {
         await this.stateMachine.transition(projectId, 'failed', `exit code ${code}`);
       } catch {
