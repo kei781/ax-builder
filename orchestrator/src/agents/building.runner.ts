@@ -284,16 +284,19 @@ export class BuildingRunner {
       const phaseId = this.phaseIds.get(projectId)?.get(phaseName);
       if (phaseId) {
         const ok = p['ok'] === true;
+        // QA phases emit {detail, gap_list}. Code phases emit {stdout_tail, stderr_tail}.
+        // Both must land in output_log so the build viewer has something to show.
+        const gapList = Array.isArray(p['gap_list']) ? p['gap_list'] : [];
+        const fragments = [
+          p['stdout_tail'] ?? '',
+          p['stderr_tail'] ?? '',
+          p['detail'] ?? '',
+          gapList.length ? `gap_list:\n- ${gapList.join('\n- ')}` : '',
+        ].filter(Boolean);
         this.builds
           .updatePhase(phaseId, {
             status: ok ? 'success' : 'failed',
-            output_log: [
-              p['stdout_tail'] ?? '',
-              p['stderr_tail'] ?? '',
-            ]
-              .filter(Boolean)
-              .join('\n---\n')
-              .slice(0, 10000),
+            output_log: fragments.join('\n---\n').slice(0, 10000),
             finished_at: new Date(),
           })
           .catch((e) => this.logger.warn(`phase_end persist: ${e.message}`));
