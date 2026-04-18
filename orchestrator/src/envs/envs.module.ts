@@ -9,6 +9,7 @@ import { EnvsService } from './envs.service.js';
 import { EnvsController } from './envs.controller.js';
 import { EnvCryptoService } from './env-crypto.service.js';
 import { EnvDeployService } from './env-deploy.service.js';
+import { FailureClassifierService } from './failure-classifier.service.js';
 import { StateMachineModule } from '../state-machine/state-machine.module.js';
 import { InfraModule } from '../infra/infra.module.js';
 import { BuildsModule } from '../builds/builds.module.js';
@@ -28,7 +29,12 @@ import { PermissionsModule } from '../permissions/permissions.module.js';
     PermissionsModule,
   ],
   controllers: [EnvsController],
-  providers: [EnvsService, EnvCryptoService, EnvDeployService],
-  exports: [EnvsService, EnvDeployService],
+  providers: [
+    EnvsService,
+    EnvCryptoService,
+    EnvDeployService,
+    FailureClassifierService,
+  ],
+  exports: [EnvsService, EnvDeployService, FailureClassifierService],
 })
 export class EnvsModule {}

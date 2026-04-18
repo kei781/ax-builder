@@ -10,6 +10,14 @@ import { PortAllocatorService } from '../infra/port-allocator.service.js';
 import { BuildsService } from '../builds/builds.service.js';
 import { BuildGateway } from '../websocket/build.gateway.js';
 import { EnvsService } from './envs.service.js';
+import {
+  FailureClassifierService,
+  FailureKind,
+} from './failure-classifier.service.js';
+
+const MAX_ENV_ATTEMPTS = 3;
+
+type FailureKindEffective = FailureKind | 'schema_bug';
 
 /**
  * Turns a filled-in set of env values into a running container.
@@ -40,6 +48,7 @@ export class EnvDeployService {
     private readonly portAllocator: PortAllocatorService,
     private readonly builds: BuildsService,
     private readonly gateway: BuildGateway,
+    private readonly classifier: FailureClassifierService,
   ) {}
 
   /**
@@ -94,9 +103,10 @@ export class EnvDeployService {
       await this.docker.startContainer(containerId);
     } catch (err: any) {
       this.logger.error(`container create/start failed: ${err?.message ?? err}`);
-      await this.failBackToAwaitingEnv(
+      // No container to fetch logs from — hand the error text directly.
+      await this.handleFailure(
         projectId,
-        `컨테이너 기동 실패: ${err?.message ?? '알 수 없는 오류'}`,
+        `container start failed: ${err?.message ?? 'unknown'}`,
       );
       return;
     }
@@ -105,15 +115,14 @@ export class EnvDeployService {
     const ok = await this.pollHealth(port, 30_000);
     if (!ok) {
       this.logger.warn(`health poll failed for project ${projectId} port ${port}`);
+      // Grab logs BEFORE removing the container — classifier needs them.
+      const logs = await this.docker.getLogs(containerId, 500);
       try {
         await this.docker.removeContainer(containerId);
       } catch {
         /* ignore */
       }
-      await this.failBackToAwaitingEnv(
-        projectId,
-        `컨테이너는 떴지만 HTTP 응답이 없습니다. 입력하신 값에 문제가 없는지 확인해주세요.`,
-      );
+      await this.handleFailure(projectId, logs);
       return;
     }
 
@@ -122,6 +131,7 @@ export class EnvDeployService {
       current_version: newVersion,
       port,
       container_id: containerId,
+      env_attempts: 0, // reset on successful deploy
     });
     await this.builds.createVersion(projectId, newVersion, containerId);
 
@@ -145,32 +155,74 @@ export class EnvDeployService {
     });
   }
 
-  private async failBackToAwaitingEnv(
+  /**
+   * ADR 0002 — run classifier, then route:
+   *   env_rejected + attempts < 3 → awaiting_env (retry)
+   *   env_rejected + attempts >= 3 → schema_bug → planning
+   *   transient  → awaiting_env (user can hit "다시 시도")
+   *   code_bug / unknown → planning (bounce-back, gap에 분류 근거 첨부)
+   */
+  private async handleFailure(
     projectId: string,
-    message: string,
+    containerLogs: string,
   ): Promise<void> {
-    // For MVP we route every env_qa failure back to awaiting_env. A
-    // proper FailureClassifier (ADR 0002) will split this into
-    // env_rejected / transient / code_bug / schema_bug. See PRD §8.3.
+    const proj = await this.projectRepo.findOne({ where: { id: projectId } });
+    if (!proj) return;
+
+    const verdict = this.classifier.classify(containerLogs);
+    this.logger.log(
+      `env_qa classifier verdict for ${projectId}: ${verdict.kind} (${verdict.matched_rule ?? 'default'})`,
+    );
+
+    let nextState: 'awaiting_env' | 'planning' = 'awaiting_env';
+    let effectiveKind: FailureKindEffective = verdict.kind;
+    let userMessage: string;
+
+    if (verdict.kind === 'env_rejected') {
+      const nextAttempts = (proj.env_attempts ?? 0) + 1;
+      await this.projectRepo.update(projectId, { env_attempts: nextAttempts });
+      if (nextAttempts >= MAX_ENV_ATTEMPTS) {
+        effectiveKind = 'schema_bug';
+        nextState = 'planning';
+        userMessage = `같은 항목에서 ${MAX_ENV_ATTEMPTS}회 연속 거부됐어요. 기획부터 다시 점검합니다.`;
+      } else {
+        userMessage = '입력하신 값이 거부됐어요. 확인 후 다시 입력해주세요.';
+      }
+    } else if (verdict.kind === 'transient') {
+      userMessage =
+        '연결한 외부 서비스에서 응답이 없어요. 잠시 뒤 [다시 시도]를 눌러주세요.';
+    } else if (verdict.kind === 'code_bug') {
+      nextState = 'planning';
+      userMessage = '앱 코드에 문제가 있어 기획을 다시 다듬어야 해요.';
+    } else {
+      // unknown → 안전하게 planning (ADR 0002 폴백)
+      nextState = 'planning';
+      userMessage = '원인을 특정하지 못했어요. 기획부터 점검합니다.';
+    }
+
     try {
-      const proj = await this.projectRepo.findOne({ where: { id: projectId } });
-      if (proj?.state === 'env_qa') {
+      if (proj.state === 'env_qa') {
         await this.stateMachine.transition(
           projectId,
-          'awaiting_env',
-          'env_qa failed — user to retry',
+          nextState,
+          `classifier=${effectiveKind}`,
         );
       }
-    } catch {
-      /* ignore */
+    } catch (err: any) {
+      this.logger.warn(`state transition failed: ${err?.message ?? err}`);
     }
+
     this.gateway.emit({
       agent: 'building',
       project_id: projectId,
       event_type: 'error',
       payload: {
         kind: 'env_qa_failure',
-        message,
+        classifier: effectiveKind,
+        matched_rule: verdict.matched_rule,
+        message: userMessage,
+        reason_snippet: verdict.reason,
+        next_state: nextState,
       },
     });
   }

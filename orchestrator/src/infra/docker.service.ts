@@ -107,4 +107,46 @@ export class DockerService {
     await container.restart();
     this.logger.log(`Container ${containerId} restarted`);
   }
+
+  /**
+   * Fetch combined stdout+stderr logs of a container (as text).
+   * Used by FailureClassifier to figure out why env_qa failed.
+   */
+  async getLogs(
+    containerId: string,
+    tailLines = 500,
+  ): Promise<string> {
+    try {
+      const container = this.docker.getContainer(containerId);
+      const stream = (await container.logs({
+        stdout: true,
+        stderr: true,
+        tail: tailLines,
+        timestamps: false,
+      })) as unknown as Buffer;
+      // When follow=false, dockerode returns the raw multiplexed buffer.
+      // Each frame = 8-byte header + payload. We strip headers; for non-TTY
+      // containers the header's first byte is stream-id (1=stdout, 2=stderr).
+      return demultiplex(Buffer.isBuffer(stream) ? stream : Buffer.from(stream));
+    } catch (err: any) {
+      this.logger.warn(`getLogs failed: ${err?.message ?? err}`);
+      return '';
+    }
+  }
+}
+
+/** Strip the 8-byte per-frame header from Docker's multiplexed log stream. */
+function demultiplex(buf: Buffer): string {
+  const parts: Buffer[] = [];
+  let i = 0;
+  while (i + 8 <= buf.length) {
+    const size = buf.readUInt32BE(i + 4);
+    const start = i + 8;
+    const end = start + size;
+    if (end > buf.length) break;
+    parts.push(buf.subarray(start, end));
+    i = end;
+  }
+  if (parts.length === 0) return buf.toString('utf8');
+  return Buffer.concat(parts).toString('utf8');
 }
