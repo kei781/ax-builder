@@ -7,6 +7,8 @@ export type ProjectState =
   | 'plan_ready'
   | 'building'
   | 'qa'
+  | 'awaiting_env'
+  | 'env_qa'
   | 'deployed'
   | 'failed'
   | 'modifying';
@@ -28,6 +30,8 @@ const stateConfig: Record<ProjectState, { label: string; color: string }> = {
   plan_ready: { label: '빌드 준비', color: 'bg-green-500' },
   building: { label: '빌드 중', color: 'bg-yellow-500' },
   qa: { label: 'QA 중', color: 'bg-yellow-500' },
+  awaiting_env: { label: '설정 필요', color: 'bg-orange-500' },
+  env_qa: { label: '환경 검증 중', color: 'bg-purple-500' },
   deployed: { label: '운영 중', color: 'bg-emerald-500' },
   failed: { label: '실패', color: 'bg-red-500' },
   modifying: { label: '수정 중', color: 'bg-purple-500' },
@@ -49,6 +53,7 @@ export default function ProjectCard({
 
   const goChat = () => navigate(`/projects/${id}/chat`);
   const goBuild = () => navigate(`/projects/${id}/build`);
+  const goEnv = () => navigate(`/projects/${id}/env`);
 
   return (
     <div className="bg-white dark:bg-gray-900 rounded-xl p-5 border border-gray-200 dark:border-gray-800 hover:border-gray-300 dark:hover:border-gray-700 transition-colors shadow-sm dark:shadow-none">
@@ -104,6 +109,18 @@ export default function ProjectCard({
         {(state === 'building' || state === 'qa') && (
           <button onClick={goBuild} className="text-sm bg-yellow-500/10 text-yellow-400 px-3 py-1.5 rounded-lg hover:bg-yellow-500/20 transition-colors">
             빌드 상태
+          </button>
+        )}
+        {/* Awaiting env → input screen */}
+        {state === 'awaiting_env' && canEdit && (
+          <button onClick={goEnv} className="text-sm bg-orange-500/10 text-orange-500 px-3 py-1.5 rounded-lg hover:bg-orange-500/20 transition-colors">
+            환경 설정
+          </button>
+        )}
+        {/* env_qa → viewing in env page */}
+        {state === 'env_qa' && canEdit && (
+          <button onClick={goEnv} className="text-sm bg-purple-500/10 text-purple-400 px-3 py-1.5 rounded-lg hover:bg-purple-500/20 transition-colors">
+            적용 진행 상태
           </button>
         )}
         {/* Deployed → view app + modify */}

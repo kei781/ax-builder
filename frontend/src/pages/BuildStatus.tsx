@@ -71,6 +71,11 @@ export default function BuildStatus() {
           setProjectState('deployed');
           setPercent(100);
         }
+        // Env stage — redirect to env input flow
+        if (projRes.data.state === 'awaiting_env') {
+          navigate(`/projects/${id}/env`, { replace: true });
+          return;
+        }
       } catch {
         /* ignore */
       }
@@ -106,6 +111,9 @@ export default function BuildStatus() {
         case 'phase_start': {
           const desc = (event.payload?.description as string) || event.phase || '';
           setLogs((p) => [...p, `\n== Phase: ${event.phase} ==`, desc]);
+          if (event.phase === 'awaiting_env') {
+            navigate(`/projects/${id}/env`, { replace: true });
+          }
           break;
         }
         case 'phase_end': {
