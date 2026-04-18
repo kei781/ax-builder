@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { io, Socket } from 'socket.io-client';
 import client from '../api/client';
 
 /**
@@ -7,7 +8,7 @@ import client from '../api/client';
  *
  * Loads /env/guide, renders required + optional sections, posts to PUT /env.
  * After submit, server goes env_qa → polls health → deployed or back.
- * Polling project state until it leaves awaiting_env/env_qa.
+ * FailureClassifier(ADR 0002) verdict is surfaced via WS `error` event.
  */
 
 interface EnvVarView {
@@ -21,6 +22,29 @@ interface EnvVarView {
   masked_preview: string | null;
 }
 
+type FailureKind =
+  | 'env_rejected'
+  | 'transient'
+  | 'code_bug'
+  | 'schema_bug'
+  | 'unknown';
+
+interface FailureVerdict {
+  kind: FailureKind;
+  message: string;
+  matched_rule: string | null;
+  reason_snippet: string | null;
+  next_state: string;
+}
+
+const FAILURE_COPY: Record<FailureKind, { title: string; tone: 'warn' | 'info' | 'error' }> = {
+  env_rejected: { title: '입력하신 값이 거부됐어요', tone: 'warn' },
+  transient:    { title: '외부 서비스 응답이 없어요', tone: 'info' },
+  code_bug:     { title: '앱 코드에 문제가 있어요', tone: 'error' },
+  schema_bug:   { title: '환경변수 정의 자체에 문제가 있어요', tone: 'error' },
+  unknown:      { title: '원인을 특정하지 못했어요', tone: 'error' },
+};
+
 export default function EnvInput() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -31,6 +55,9 @@ export default function EnvInput() {
   const [error, setError] = useState<string | null>(null);
   const [state, setState] = useState<string>('awaiting_env');
   const [showOptional, setShowOptional] = useState(false);
+  const [verdict, setVerdict] = useState<FailureVerdict | null>(null);
+  const [showReason, setShowReason] = useState(false);
+  const socketRef = useRef<Socket | null>(null);
 
   useEffect(() => {
     if (!id) return;
@@ -50,29 +77,66 @@ export default function EnvInput() {
     })();
   }, [id]);
 
-  // Poll state after submit so we know when to leave this page.
+  // Subscribe to WS for classifier verdicts + live state changes.
+  useEffect(() => {
+    if (!id) return;
+    const socket = io('/ws', { transports: ['polling', 'websocket'] });
+    socketRef.current = socket;
+    socket.on('connect', () => {
+      socket.emit('join', { projectId: id });
+    });
+    socket.on('agent_event', async (event: { event_type: string; project_id: string; payload?: Record<string, unknown> }) => {
+      if (event.project_id !== id) return;
+      if (event.event_type === 'error' && event.payload?.kind === 'env_qa_failure') {
+        const p = event.payload;
+        setVerdict({
+          kind: (p.classifier as FailureKind) ?? 'unknown',
+          message: (p.message as string) ?? '실패했어요.',
+          matched_rule: (p.matched_rule as string | null) ?? null,
+          reason_snippet: (p.reason_snippet as string | null) ?? null,
+          next_state: (p.next_state as string) ?? 'awaiting_env',
+        });
+        setSubmitting(false);
+        // If server sent us to planning, it's over — navigate.
+        if (p.next_state === 'planning') {
+          setTimeout(() => navigate(`/projects/${id}/chat`), 2500);
+        } else {
+          // Came back to awaiting_env — refresh guide to see masked previews.
+          try {
+            const g = await client.get(`/projects/${id}/env/guide`);
+            setVars(g.data.vars);
+            setState('awaiting_env');
+          } catch {
+            /* ignore */
+          }
+        }
+      } else if (event.event_type === 'completion') {
+        setState('deployed');
+        setTimeout(() => navigate(`/`), 800);
+      }
+    });
+    return () => {
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, [id, navigate]);
+
+  // Safety fallback poll — in case WS missed.
   useEffect(() => {
     if (state !== 'env_qa') return;
     const iv = setInterval(async () => {
       if (!id) return;
       try {
         const r = await client.get(`/projects/${id}`);
-        setState(r.data.state);
+        if (r.data.state !== state) setState(r.data.state);
         if (r.data.state === 'deployed') {
           clearInterval(iv);
           setTimeout(() => navigate(`/`), 800);
-        } else if (r.data.state === 'awaiting_env') {
-          clearInterval(iv);
-          // env_qa failed, we're back at awaiting — refresh guide (masked preview)
-          const g = await client.get(`/projects/${id}/env/guide`);
-          setVars(g.data.vars);
-          setSubmitting(false);
-          setError('입력하신 값으로 기동에 실패했어요. 값을 다시 확인해주세요.');
         }
       } catch {
         /* ignore */
       }
-    }, 1500);
+    }, 3000);
     return () => clearInterval(iv);
   }, [state, id, navigate]);
 
@@ -88,6 +152,7 @@ export default function EnvInput() {
     if (!id) return;
     setSubmitting(true);
     setError(null);
+    setVerdict(null);
     const payload = Object.entries(values)
       .filter(([, v]) => v != null && v !== '')
       .map(([key, value]) => ({ key, value }));
@@ -127,10 +192,20 @@ export default function EnvInput() {
           이 앱을 실행하려면 아래 값이 필요해요.
         </p>
 
-        {error && (
+        {error && !verdict && (
           <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-6 text-sm text-red-500">
             {error}
           </div>
+        )}
+
+        {verdict && (
+          <FailureBanner
+            verdict={verdict}
+            showReason={showReason}
+            onToggleReason={() => setShowReason((s) => !s)}
+            onRetry={onSubmit}
+            onGoPlanning={() => id && navigate(`/projects/${id}/chat`)}
+          />
         )}
 
         {required.length > 0 && (
@@ -251,6 +326,75 @@ function EnvField({
           {show ? '숨기기' : '보기'}
         </button>
       </div>
+    </div>
+  );
+}
+
+function FailureBanner({
+  verdict,
+  showReason,
+  onToggleReason,
+  onRetry,
+  onGoPlanning,
+}: {
+  verdict: FailureVerdict;
+  showReason: boolean;
+  onToggleReason: () => void;
+  onRetry: () => void;
+  onGoPlanning: () => void;
+}) {
+  const copy = FAILURE_COPY[verdict.kind];
+  const bg =
+    copy.tone === 'warn'
+      ? 'bg-orange-500/10 border-orange-500/30 text-orange-600 dark:text-orange-400'
+      : copy.tone === 'info'
+        ? 'bg-blue-500/10 border-blue-500/30 text-blue-600 dark:text-blue-400'
+        : 'bg-red-500/10 border-red-500/30 text-red-600 dark:text-red-400';
+  const willBounce = verdict.next_state === 'planning';
+
+  return (
+    <div className={`border rounded-xl p-4 mb-6 ${bg}`}>
+      <p className="font-medium mb-1">{copy.title}</p>
+      <p className="text-sm opacity-90">{verdict.message}</p>
+
+      <div className="flex gap-2 mt-3">
+        {!willBounce && verdict.kind === 'transient' && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="text-sm bg-white/60 dark:bg-gray-900 border border-current px-3 py-1.5 rounded-lg hover:opacity-80"
+          >
+            다시 시도
+          </button>
+        )}
+        {willBounce && (
+          <button
+            type="button"
+            onClick={onGoPlanning}
+            className="text-sm bg-white/60 dark:bg-gray-900 border border-current px-3 py-1.5 rounded-lg hover:opacity-80"
+          >
+            기획 대화로
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={onToggleReason}
+          className="text-sm opacity-70 hover:opacity-100 ml-auto"
+        >
+          {showReason ? '▾ 세부 내용' : '▸ 세부 내용'}
+        </button>
+      </div>
+
+      {showReason && (
+        <div className="mt-3 pt-3 border-t border-current/20 text-xs opacity-80 font-mono whitespace-pre-wrap">
+          <div>분류: {verdict.kind}</div>
+          {verdict.matched_rule && <div>매칭 규칙: {verdict.matched_rule}</div>}
+          <div>다음 상태: {verdict.next_state}</div>
+          {verdict.reason_snippet && (
+            <div className="mt-2">{verdict.reason_snippet}</div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
