@@ -22,26 +22,35 @@
 ## 2. 3-tier 책임 분리
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ NestJS Orchestrator                                          │
-│  - UI 서빙 / 인증 / 권한 검증                                 │
-│  - 프로젝트 상태 머신 소유                                    │
-│  - 에이전트 프로세스 생명주기 관리 (spawn/timeout/cleanup)    │
-│  - WebSocket 이벤트 허브                                      │
-│  - DB 소유자 (Project / Conversation / Memory / Session)     │
-└─────────────────────┬────────────────────┬──────────────────┘
-                      │                    │
-                      ▼                    ▼
-┌──────────────────────────────┐  ┌──────────────────────────────┐
-│ Planning Agent                │  │ Building Agent                │
-│  - 유저와 대화 (스트리밍)      │  │  - PRD/DESIGN → PHASES.md     │
-│  - PRD.md / DESIGN.md 생성    │  │  - phase별 Claude Code 위임   │
-│  - 핸드오프 페이로드 생성      │  │  - QA 감독 / bounce-back 판단 │
-│  자체 구현(OpenAI 호환 API)    │  │  Hermes(Gemini) + Claude Code │
-└──────────────────────────────┘  └──────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ NestJS Orchestrator                                           │
+│  - UI 서빙 / 인증 / 권한 검증                                  │
+│  - 프로젝트 상태 머신 소유 (§7)                                │
+│  - 에이전트 프로세스 생명주기 관리 (spawn/timeout/cleanup)     │
+│  - WebSocket 이벤트 허브                                       │
+│  - DB 소유자 (Project / Conversation / Memory / Session / Env)│
+│  - Env 파서·암호화·컨테이너 주입 (§19)                         │
+│  - FailureClassifier — env_qa 실패 라우팅 (§11.2)              │
+│  - AI Gateway 토큰 발급·주입 (§20)                             │
+└──────┬──────────────────┬──────────────────┬─────────────────┘
+       │                  │                  │
+       ▼                  ▼                  ▼
+┌───────────────┐ ┌───────────────┐ ┌──────────────────────────┐
+│ Planning      │ │ Building      │ │ AI Gateway               │
+│ Agent (Py)    │ │ Agent (Py)    │ │ (agent-model-mcp)        │
+│ 대화/PRD/DSN  │ │ PHASES/Claude │ │ OpenAI-호환 HTTP + MCP    │
+│ 스트리밍       │ │ Code/QA 감독  │ │ 토큰 auth / 예산 / 감사   │
+└──────┬────────┘ └──────┬────────┘ └─────────▲────────────────┘
+       │  LLM            │  LLM              │  LLM (생성 앱)
+       └─────────────────┴───────────────────┤
+                                             │
+                               ┌─────────────┴────────────┐
+                               │ 생성 앱 컨테이너(들)      │
+                               │ AX_AI_TOKEN 주입 (§19)    │
+                               └──────────────────────────┘
 ```
 
-"Nest는 단순 서빙"이라는 표현은 쓰지 않는다. **Orchestrator**가 정확한 포지션이다.
+"Nest는 단순 서빙"이라는 표현은 쓰지 않는다. **Orchestrator**가 정확한 포지션이다. 플랫폼의 모든 LLM 트래픽은 **AI Gateway를 단일 경유**(§20) — 생성된 앱은 Anthropic/OpenAI/Gemini 키를 직접 보유하지 않는다.
 
 ---
 
@@ -216,32 +225,47 @@ NestJS ──spawn──> orchestrator.py (Hermes, Python)
 
 ### 7.1 상태 목록
 ```
-draft ──> planning ──> plan_ready ──> building ──> qa ──> deployed
-               ↑                         │
-               └─────── bounce-back ─────┘
-                                                              │
-                                                              └─> modifying (새 세션)
+draft → planning → plan_ready → building → qa ──┬→ awaiting_env → env_qa ─┬→ deployed
+   ↑                   ↑            │           │                          │
+   │                   │            │           └─── (env 없음, 바로) ─────┘
+   │                   │            │                                      │
+   │                   │            │   ┌── env_rejected (유저 재입력, 최대 3회) ─┐
+   │                   │            │   │                                        │
+   │                   │            │   └→ awaiting_env ←──────────────────────── ┘
+   │                   │            │
+   │                   └─── bounce-back (phase 실패 / code_bug / schema_bug)
+   │
+   └─── (deployed → modifying: 수정 요청, 새 세션)
 ```
+
+실패 분기는 전부 FailureClassifier(§11.2, ADR 0002)가 판정한다. `transient`은 재시도, 그 외는 classifier kind에 따라 전이.
 
 | 상태 | 의미 |
 |---|---|
 | `draft` | 프로젝트 생성 직후, Planning 시작 전 |
-| `planning` | Planning Agent와 대화 중 |
-| `plan_ready` | Planning Agent가 완료 제안, 유저의 "빌드 시작" 대기 |
-| `building` | Building Agent 실행 중 |
-| `qa` | 마지막 phase (QA) 진행 중 (UI 표시용 세부 상태) |
+| `planning` | Planning Agent와 대화 중 (신규 또는 bounce-back 수신) |
+| `plan_ready` | Planning 완료 제안, 유저의 "빌드 시작" 대기 |
+| `building` | Building Agent 실행 중 (phase 진행) |
+| `qa` | 관찰 기반 QA 진행 중 (ADR 0001) |
+| `awaiting_env` | QA 통과, `.env.example`에 user-required 변수 존재 → 유저 입력 대기 |
+| `env_qa` | 유저가 env 입력 후 컨테이너 재기동·health 검증 중 |
 | `deployed` | 컨테이너 기동 완료, 접속 가능 |
-| `failed` | Planning에서 해결 불가 (H1 lock 케이스) |
+| `failed` | 해결 불가 (H1 lock / 반복 실패 후 에스컬레이션) |
 | `modifying` | deployed 이후 수정 요청으로 새 세션 진입 |
 
 ### 7.2 전환 트리거
 | 전환 | 트리거 |
 |---|---|
 | `draft → planning` | 유저 첫 메시지 입력 |
-| `planning → plan_ready` | Planning Agent의 completeness 자체 평가 + 유저 UI 확인 (경계는 소프트) |
-| `plan_ready → building` | **유저가 "빌드 시작" 버튼 클릭** (수동 승인) |
-| `building → planning` | Building의 bounce-back (자동) |
-| `building → qa → deployed` | Building 자체 진행 (자동) |
+| `planning → plan_ready` | Planning Agent의 completeness 자체 평가 + 유저 UI 확인 |
+| `plan_ready → building` | **유저가 "빌드 시작" 버튼 클릭** |
+| `building → qa` | 모든 phase 성공 |
+| `qa → awaiting_env` | 관찰 QA 통과 + `.env.example`에 user-required 있음 |
+| `qa → env_qa` | 관찰 QA 통과 + user-required 없음 (system-injected만으로 바로 배포) |
+| `awaiting_env → env_qa` | 유저가 env 값 제출 |
+| `env_qa → deployed` | 컨테이너 health 검증 통과 |
+| `env_qa → awaiting_env` | classifier = `env_rejected` + env_attempts < 3, 또는 `transient` |
+| `env_qa → planning` | classifier = `code_bug` / `schema_bug` / `unknown`, 또는 env_attempts ≥ 3 |
 | `deployed → modifying` | 유저 수정 요청 (새 세션 생성) |
 
 ### 7.3 되감기
@@ -345,10 +369,26 @@ draft ──> planning ──> plan_ready ──> building ──> qa ──> de
   - lock 효과: 프로젝트 **24시간 잠금**. 이 lock은 유저당 planning 세션 한도(2개)에 계속 카운트됨.
   - 해제 조건: 유저가 프로젝트 삭제 **또는** 24시간 경과.
 
-### 11.2 Building 실패
-- **max retry 없음**. 어느 phase든 1회라도 실패 → 즉시 Planning 반송.
-- 부분 성공(백엔드 성공/프론트엔드 실패 등)도 "문서가 부족하다"로 간주 → Planning 반송.
-- 반송 시 실패 사유를 **구조화된 gap 리스트**로 Planning에 전달. UI에도 유저에게 명확히 표시.
+### 11.2 Building / QA 실패 — FailureClassifier (ADR 0002)
+
+> 이전 정책 "어느 phase든 1회 실패 = 즉시 Planning 반송"은 **phase 실행 실패**에 한정해서 유지. QA/env_qa 단계 실패는 classifier가 책임 주체로 쪼개서 라우팅한다.
+
+**phase 실행 실패 (code 생성 phase)**
+- max retry 없음 → 즉시 Planning 반송.
+- 부분 성공도 "문서 부족"으로 간주. 동일 정책.
+- 구조화된 gap 리스트를 Planning에 전달.
+
+**QA / env_qa 단계 실패 → classifier 4분류**
+
+| kind | 시그니처 예 | 전이 | 카운터 |
+|---|---|---|---|
+| `env_rejected` | 401/403, Unauthorized, Invalid API key | `awaiting_env` (재입력) | `env_attempts++`; ≥3이면 `schema_bug`로 에스컬레이트 → Planning |
+| `transient` | ECONNREFUSED/ETIMEDOUT/ENOTFOUND, 502/503 | `awaiting_env` + "다시 시도" 버튼 | 비카운트 |
+| `code_bug` | SyntaxError/TypeError/MODULE_NOT_FOUND | Planning 반송 | — |
+| `schema_bug` | env 반복 거부 3회 | Planning 반송 (변수 이력 첨부) | env_attempts 리셋 |
+| `unknown` | 위 규칙 미매칭 | `code_bug`로 폴백 (Planning 반송) | — |
+
+구현은 1차 regex 룰 + (TODO) 2차 `qa_judge` LLM. 상세 규칙은 `orchestrator/src/envs/failure-classifier.service.ts` 및 ADR 0002 참조.
 
 ### 11.3 수정 실패
 - git에 저장된 직전 성공 버전을 pull하여 복원.
@@ -586,3 +626,94 @@ draft ──> planning ──> plan_ready ──> building ──> qa ──> de
 2. **Chat lock stale 방지**
    - 5분 이상 된 lock은 crash로 간주하고 auto-release
    - 위치: `orchestrator/src/chat/chat.service.ts` `sendUserMessage`
+
+
+---
+
+## 19. 환경 변수 lifecycle
+
+PRD §9 / ADR 0004의 런타임 계약.
+
+### 19.1 흐름 요약
+
+```
+[빌드 완료 (code 0)]
+      │
+      ▼
+[orchestrator: EnvsService.syncFromExample(projectId)]
+      │  ├── .env.example 파싱 (env-parser.ts)
+      │  ├── provider-key 가드 (ANTHROPIC/OPENAI/GEMINI 등 user-tier 노출 금지)
+      │  └── project_env_vars upsert, 기존값 보존
+      │
+      ▼
+[EnvsService.hasUserRequired?]
+      ├── 있음 → 상태 `awaiting_env`로 전이, 프론트 EnvInput 화면 진입
+      │            │
+      │            ▼
+      │      [유저 PUT /env → AES-256-GCM 암호화 저장 →
+      │       상태 `env_qa` → EnvDeployService.applyAndDeploy]
+      │
+      └── 없음 → 곧바로 env_qa (system-injected만으로 배포)
+                   │
+                   ▼
+             [EnvDeployService.applyAndDeploy]
+                   ├── writeDotenv — 복호화해 프로젝트 디렉토리에 `.env` 기록
+                   ├── Docker 기존 컨테이너 제거 → 재생성 (PORT=3000 주입)
+                   ├── 호스트 HEAD 폴링 30초
+                   └── 성공 → deployed (env_attempts=0 리셋)
+                      실패 → getLogs → FailureClassifier → kind 기반 전이 (§11.2)
+```
+
+### 19.2 system-injected 값 해석
+`EnvsService.resolveSystemInjected`가 변수 이름 → 실제 값 매핑:
+
+| 변수 | 소스 |
+|---|---|
+| `AX_AI_BASE_URL` | `AI_GATEWAY_BASE_URL` 플랫폼 env |
+| `AX_AI_TOKEN` | **현재 MVP: `axt_stub_*` 스텁** (§20 Gateway 실구현 전까지) |
+| `AX_STORAGE_PATH` | 고정 `/app/data` |
+| 그 외 | null (유저에게 노출되지 않음, 앱이 직접 처리) |
+
+### 19.3 암호화
+- AES-256-GCM. 페이로드 = `IV(12) || AUTH_TAG(16) || CIPHERTEXT`, base64.
+- 키 유도: `AX_ENV_ENCRYPTION_KEY`를 SHA-256으로 32바이트 파생.
+- 미설정 시 `JWT_SECRET` 파생 dev 폴백 (기동 시 경고 로그). 운영 배포 전 전용 키 지정 권장.
+- API 응답에서 원문은 **절대 반환하지 않음** — 마스킹 preview(`••••••5432`)만.
+
+### 19.4 프론트엔드 제어
+- `/projects/:id/env` 라우트 (`EnvInput.tsx`) — DESIGN.md §4 구현.
+- BuildStatus가 `awaiting_env` 상태 감지 시 자동 replace 이동.
+- WS `agent_event` 구독으로 `env_qa_failure` payload(classifier/matched_rule/…) 수신 → `FailureBanner` 분기 노출.
+
+---
+
+## 20. AI Gateway (agent-model-mcp)
+
+PRD §9.0 / §18 / ADR 0003의 구조 계약. 리포: `github.com/kei781/agent-model-mcp`.
+
+### 20.1 위치
+플랫폼·에이전트·생성 앱의 **모든 LLM 호출** 단일 경유 레이어. 원본 provider 키(Anthropic/OpenAI/Gemini)는 게이트웨이 서버에만 존재한다.
+
+### 20.2 인터페이스
+- **OpenAI 호환 HTTP** (`/v1/chat/completions`, SSE 스트리밍, `/v1/embeddings`, `/v1/models`) — 생성 앱이 `openai` SDK `baseURL`만 바꿔 호출
+- **MCP** (Streamable HTTP) — `generate` / `complete_stream` / `embed` / `list_models` / `usage_today` 툴. Planning/Hermes/Claude Code 에이전트가 사용
+- **passthrough** (`/v1/anthropic/messages`, `/v1/gemini/...`) — OpenAI 포맷으로 담기 어려운 기능(tool use, thinking, caching) 원본 그대로 중계
+- **admin API** (`/admin/tokens`, `/admin/usage`, `/admin/models`) — 프로젝트 토큰 발급·폐기, 모델 매핑 관리
+
+### 20.3 인증·통제
+- 프로젝트당 1개 `AX_AI_TOKEN` (orchestrator가 빌드 완료 시 admin API로 발급, 컨테이너 env로 자동 주입)
+- 토큰별 일일/월 cap, RPS 제한, 모델 화이트리스트
+- 초과 → 429 (`retry_after_seconds`) 또는 저렴 모델 자동 폴백(opt-in)
+- 모든 호출 감사 로그 — 대시보드에서 프로젝트 단위 사용량·비용 조회
+
+### 20.4 내부 에이전트 통일
+Planning Agent의 `openai_compat` 백엔드(§3.1), Hermes(§4.1), Claude Code CLI(`ANTHROPIC_BASE_URL`)도 기본값을 Gateway로 설정. 플랫폼 전체 AI 비용을 단일 대시보드에서 본다.
+
+### 20.5 장애·레이턴시
+- Gateway `/healthz` 주기 ping을 orchestrator가 수행. 실패 시 "AI 기능 일시 중단" 배너 활성화.
+- 생성 앱 SDK 래퍼에 타임아웃·재시도·graceful degradation 힌트를 Claude Code 프롬프트에 예시 포함.
+- 같은 LAN (N100 로컬)에서 수 ms. LLM 호출 자체가 외부 의존이라 추가 단일 장애점의 체감 증가는 제한적.
+
+### 20.6 구현 상태
+- MVP 시점: **Gateway 실체 없음**. `AX_AI_TOKEN`은 `axt_stub_*` 더미 (§19.2). 생성 앱이 실제 LLM 호출을 하려면 현재는 직접 provider 키를 env에 넣어야 하지만, provider-key 가드(§19.1)가 이를 차단하므로 **MVP 단계에선 LLM 기반 앱이 실제로 작동하지 않는다**. 의도된 트레이드오프: 플랫폼 계약을 먼저 확정하고, Gateway 구현은 별도 마일스톤으로 분리.
+- 다음 마일스톤: OpenAI 호환 + 토큰 발급 + 사용량 로깅 MVP → orchestrator admin API 연동 → stub 제거.

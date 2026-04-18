@@ -50,8 +50,19 @@
 
 ## 연관 구현
 
-- `agent-model-mcp` 리포 — OpenAI-호환 + MCP + 토큰 발급 + 사용량 로깅 (별도 프로젝트).
-- `orchestrator` — 빌드 완료 시 Gateway admin API로 토큰 발급 + 컨테이너 env 주입.
-- `phase_runner.py` 프롬프트 — LLM 호출 예시 스니펫 포함 (openai SDK with base_url).
-- Planning Agent — `openai_compat` 백엔드를 Gateway 가리키도록 기본값 변경.
-- Claude Code CLI — `ANTHROPIC_BASE_URL` 설정으로 Gateway 경유 (Gateway가 Anthropic passthrough 제공).
+**현재 상태 (PR #4)**
+
+- `orchestrator/src/envs/envs.service.ts` `resolveSystemInjected` — `AX_AI_BASE_URL`(플랫폼 env `AI_GATEWAY_BASE_URL`), `AX_AI_TOKEN`(**현재 `axt_stub_*` 더미**), `AX_STORAGE_PATH` 매핑.
+- `orchestrator/src/envs/env-parser.ts` `findProviderKeyViolations` — `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `AZURE_OPENAI_*` 등 8종 provider 키가 user-tier로 노출되면 빌드 반송.
+- `phase_runner.py` PHASE 프롬프트 — AI Gateway 사용 규칙 + `.env.example` 메타라인 + provider 키 금지 문구 주입.
+
+**아직 안 한 것**
+
+- `agent-model-mcp` 실체 구현 — OpenAI 호환 + MCP + 토큰 admin API. **없음.**
+- Planning/Hermes/Claude Code의 Gateway 경유 전환 — 아직 Gemini/Anthropic 직접 호출.
+- `AX_AI_TOKEN` 실발급 경로 (orchestrator → Gateway admin API).
+- 프로젝트 단위 사용량 대시보드.
+
+**영향**
+
+MVP 단계에서 LLM을 필요로 하는 생성 앱은 **실제로 작동하지 않음.** provider-key 가드는 유저가 `ANTHROPIC_API_KEY`를 직접 넣는 길을 막지만, `AX_AI_TOKEN`은 스텁이라 게이트웨이에 실제 요청해도 실패. 의도된 트레이드오프 — 계약을 먼저 확정하고, Gateway 구현은 별도 마일스톤으로 분리한다.

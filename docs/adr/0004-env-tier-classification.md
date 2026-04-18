@@ -47,6 +47,23 @@
 
 ## 연관 구현
 
-- `phase_runner.py` PHASE 프롬프트 템플릿 — `.env.example` 예시 스니펫 포함 (§9.2 규격 그대로).
-- `orchestrator/src/envs/` 신규 — 파싱, 분류, 가드레일 체크, UI 노출 리스트 생성.
-- `frontend` — `user-required`만 UI 렌더링, `user-optional`은 접힘 섹션, `system-injected`는 노출 안 함.
+**현재 상태 (PR #4)**
+
+- `orchestrator/src/envs/env-parser.ts`
+  - 메타라인 키 한/영 동의어 수용 (`설명/desc/description`, `발급/issuance`, `주입/tier/source` 등)
+  - `parseEnvExample` — `ParsedEnvVar[]` 반환
+  - `findProviderKeyViolations` — provider 키 user-tier 노출 금지 (ADR 0003 가드)
+  - 메타라인 누락 시 `user-required` 기본값 (안전 측면)
+- `orchestrator/src/envs/entities/project-env-var.entity.ts` — `(project_id, key)` UNIQUE, `tier` / `value_ciphertext` / `required` 등.
+- `orchestrator/src/envs/envs.service.ts`
+  - `syncFromExample` — 파싱 → 가드 → upsert (기존 값 보존) → stale 제거 → 요약 반환 (system_injected / user_required_pending / ...)
+  - `resolveSystemInjected` — 키 이름 → 실제 값 매핑 (§20.2)
+  - `submit` — 유저 입력 쓰기. `system-injected`는 방어적으로 무시. required 빈값 거부.
+  - `writeDotenv` — 복호화해서 프로젝트 디렉토리에 `.env` 기록 (escape 포함)
+- `phase_runner.py` — PHASE 프롬프트 템플릿에 `.env.example` 규격 + provider 키 금지 규칙 주입.
+- `frontend/src/pages/EnvInput.tsx` — user-required(필수 섹션) / user-optional(접힘) / system-injected(숨김) 분리 렌더링. 보기·숨기기 토글, 기존값 마스킹 preview.
+
+**아직 안 한 것**
+
+- `resolveSystemInjected`가 인식하는 키 목록 확장 (AX_TELEMETRY_URL 등).
+- 메타라인 파서 테스트 스위트 — 현재 인라인 smoke 테스트 수준.

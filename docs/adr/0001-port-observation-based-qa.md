@@ -42,6 +42,20 @@ B는 장기적으로 병행 가치 있음(정적 프리체크 용도) — 지금
 
 ## 연관 구현
 
-- `building-agent/qa_supervisor.py` — `run_qa` 전면 리팩터.
-- `orchestrator/src/agents/building.runner.ts:290` — `phase_end` 페이로드에서 `detail`·`gap_list` 수신하도록 수정 (현재 `stdout_tail`/`stderr_tail` 키만 처리하여 QA 실패 사유가 DB에 유실되는 버그).
-- `phase_runner.py:42` PHASE 프롬프트 템플릿 — `PORT` env 관련 문구 제거, "원하는 포트에 바인드하면 됩니다" 문구 추가.
+**현재 상태 (PR #4)**
+
+- `building-agent/qa_supervisor.py` — 관찰 기반으로 전면 리팩터.
+  - `_listen_ports_for_pid(pid)` — `lsof -Fn` 로 LISTEN 포트 추출
+  - `_descendant_pids(pid)` — `npm start`가 fork한 node child까지 수집
+  - `_http_responds(port)` — 2xx/3xx/4xx 전부 pass (5xx/연결거부만 fail)
+  - QA 타임아웃 기본 30s로 상향 (기존 6s는 초기화 긴 앱에 부족)
+  - `.env.example` 선제 체크 포함 (ADR 0004)
+  - `QaResult.observed_port` 필드 추가
+- `building-agent/orchestrator.py` — `phase_end` payload에 `observed_port` 포함.
+- `orchestrator/src/agents/building.runner.ts` — QA phase의 `detail`·`gap_list`도 `output_log`에 저장 (이전엔 `stdout_tail`/`stderr_tail` 키만 처리해 QA 실패 사유가 DB에 유실).
+- `building-agent/phase_runner.py` — PHASE 프롬프트에 "포트 자유" 문구 포함.
+- `orchestrator/src/infra/docker.service.ts` — 컨테이너에 `PORT=3000 / NODE_ENV=production` 주입 (§2의 컨테이너 단계는 관찰 모드가 아닌 고정 계약).
+
+**검증**
+
+라이어 게임 프로젝트(`0e5a9962-*`)에서 실제 `npm start` → `lsof` 관찰 → `observed_port: 3666` → HTTP HEAD 통과 확인. 이전엔 `QA_TEST_PORT=3999` 주입 타임아웃으로 repeat 반송.

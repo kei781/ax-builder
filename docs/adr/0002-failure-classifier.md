@@ -51,7 +51,17 @@
 
 ## 연관 구현
 
-- `building-agent/failure_classifier.py` 신규 — regex 룰 테이블 + judge 호출 + 결과 타입.
-- `orchestrator/src/builds/` — 분류 결과를 `build_phases.failure_kind` 컬럼에 저장.
-- `orchestrator` 상태 머신 — `qa` / `env_qa`에서 분류 결과 기반 전이.
-- 대시보드 UI — 실패 시 분류 결과별 메시지/행동 유도.
+**현재 상태 (PR #4)**
+
+- `orchestrator/src/envs/failure-classifier.service.ts` — regex 룰 테이블 + `classify(logs)` API. 복수 매칭 시 "뒤쪽(= 실제 실패 라인) 우선" 로직 포함. LLM judge 2차는 **미구현 (TODO)**, 미매칭 시 `code_bug` 안전 폴백.
+- `orchestrator/src/envs/env-deploy.service.ts` — 실패 시 `docker.getLogs()` → classify → `handleFailure`에서 kind별 전이 분기 + `env_attempts` 카운터 관리 (3회 시 `schema_bug`로 에스컬레이션).
+- `orchestrator/src/projects/entities/project.entity.ts` — `env_attempts` INTEGER 컬럼 추가.
+- `orchestrator/src/infra/docker.service.ts` — `getLogs(containerId, tailLines)` (Docker 멀티플렉스 8바이트 프레임 헤더 파싱 포함).
+- WebSocket `error` 이벤트 payload에 `classifier / matched_rule / reason_snippet / next_state` 전달.
+- `frontend/src/pages/EnvInput.tsx` — `FailureBanner` 컴포넌트, kind별 톤(주황/파랑/빨강)·카피·행동 분기, 개발자용 "세부 내용" 토글.
+
+**아직 안 한 것**
+
+- `building-agent` 쪽 초기 QA 실패 분류: 현재는 exit 2 = 무조건 Planning 반송. env 주입 전 단계라 대부분 `code_bug`이므로 당장은 필요 없음.
+- LLM judge 2차 — regex 룰이 커버 못 하는 로그가 쌓이면 도입.
+- `build_phases.failure_kind` 컬럼: 현재는 `agent_logs` payload에만 남음. 통계가 필요해지면 별도 컬럼으로 승격.

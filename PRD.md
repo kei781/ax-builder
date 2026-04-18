@@ -147,12 +147,21 @@ CREATE TABLE projects (
   id TEXT PRIMARY KEY,
   owner_id TEXT NOT NULL,
   title TEXT NOT NULL,
-  status TEXT DEFAULT 'draft',
-  -- status: 'draft' | 'planning' | 'plan_ready' | 'building' | 'qa' | 'deployed' | 'failed' | 'modifying'
+  state TEXT DEFAULT 'draft',
+  -- state: 'draft' | 'planning' | 'plan_ready' | 'building' | 'qa'
+  --      | 'awaiting_env' | 'env_qa' | 'deployed' | 'failed' | 'modifying'
+  current_session_id TEXT DEFAULT NULL,
+  current_version INTEGER DEFAULT 0,
   port INTEGER DEFAULT NULL,
   container_id TEXT DEFAULT NULL,
   project_path TEXT DEFAULT NULL,
   git_remote TEXT DEFAULT NULL,
+  -- ADR 0002: env_qa 실패 누적 카운터 (env_rejected 한정).
+  -- 3회 도달 시 schema_bug로 에스컬레이트 → Planning bounce.
+  -- 성공 배포 시 0 리셋.
+  env_attempts INTEGER DEFAULT 0,
+  locked_until TEXT DEFAULT NULL,
+  lock_reason TEXT DEFAULT NULL,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now')),
   FOREIGN KEY (owner_id) REFERENCES users(id)
@@ -341,6 +350,32 @@ CREATE TABLE project_permissions (
 );
 ```
 
+### 4.13 project_env_vars
+
+`.env.example` 파싱 결과 + 유저(또는 system) 주입값. 값은 AES-256-GCM 암호화 저장. 자세한 의미와 흐름은 §9 / ADR 0004.
+
+```sql
+CREATE TABLE project_env_vars (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  -- tier: 'system-injected' | 'user-required' | 'user-optional' (§9.1.1)
+  tier TEXT NOT NULL,
+  -- IV(12) || AUTH_TAG(16) || CIPHERTEXT, base64. NULL = 아직 미입력.
+  value_ciphertext TEXT DEFAULT NULL,
+  description TEXT DEFAULT NULL,
+  issuance_guide TEXT DEFAULT NULL,
+  example TEXT DEFAULT NULL,
+  required INTEGER DEFAULT 1,  -- required=1 (기본) / optional=0
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (project_id) REFERENCES projects(id),
+  UNIQUE(project_id, key)
+);
+```
+
+암호화 키는 `AX_ENV_ENCRYPTION_KEY` 환경변수 (SHA-256으로 32바이트 파생). 미설정 시 `JWT_SECRET` 파생 dev 폴백 (운영 기동 시 경고 로그). API 응답에선 **절대 원문 반환하지 않고** 마지막 4자만 보이는 마스킹 preview(`••••••5432`)만 내려간다.
+
 ---
 
 ## 5. API 명세
@@ -424,11 +459,31 @@ Planning 이벤트:
 
 Building 이벤트:
   - phase_start:      { phase_name: string, phase_index: number, total_phases: number }
-  - phase_end:        { phase_name: string, status: 'success' | 'failed' }
+  - phase_end:        { phase_name: string, status: 'success' | 'failed',
+                        observed_port?: number, detail?: string, gap_list?: string[] }
   - build_complete:   { success: boolean, url: string, port: number }
   - build_failed:     { phase: string, reason: string, gap_list: string[] }
   - qa_result:        { passed: boolean, details: object }
+  - error(env_qa):    { kind: 'env_qa_failure',
+                        classifier: 'env_rejected' | 'transient' | 'code_bug' | 'schema_bug' | 'unknown',
+                        matched_rule: string | null,
+                        reason_snippet: string | null,
+                        next_state: 'awaiting_env' | 'planning' | 'env_qa',
+                        message: string }  // §8.3 ADR 0002
 ```
+
+### 5.7 환경 변수
+
+env 관리 엔드포인트는 §9.3 참조. 요약:
+
+```
+GET    /api/projects/:id/env           → user-tier 목록 (마스킹 preview, system 숨김)
+PUT    /api/projects/:id/env           → { vars: [{key, value}] } 일괄 저장 → env_qa 트리거
+GET    /api/projects/:id/env/guide     → 발급 가이드 + any_missing_required 플래그
+POST   /api/projects/:id/env/rollback  → (미구현, 501)
+```
+
+owner/editor만 호출 가능. 실제 값은 AES-256-GCM 암호화 저장 (§4.13).
 
 ---
 
@@ -1204,6 +1259,17 @@ GATEWAY_GEMINI_API_KEY=
 
 ## 15. 구현 우선순위
 
+> **현재 구현 상태 스냅샷 (2026-04-19)**
+>
+> Phase 1~4 일차 완료 상태에서 다음 네 갈래가 추가 반영됐다(브랜치 `docs/ai-gateway-and-failure-handling`, PR #4):
+>
+> - ✅ **ADR 0001** 관찰 기반 QA — `qa_supervisor.py` 실제 구현 + 검증됨
+> - ✅ **ADR 0004** env 3-tier 분류 — 파서/암호화/CRUD/컨테이너 주입, `/api/projects/:id/env` 엔드포인트, 프론트 EnvInput 페이지까지
+> - ✅ **ADR 0002** FailureClassifier — regex 룰 기반 1차 분류, env_qa 실패 라우팅, env_attempts 카운터, 프론트 FailureBanner. LLM judge 2차는 TODO.
+> - ⏳ **ADR 0003** AI Gateway — 계약만 확정. `AX_AI_TOKEN`은 `axt_stub_*` 더미. 실체(`agent-model-mcp`) 구현은 별도 마일스톤.
+>
+> → MVP 시점에 LLM을 요구하는 생성 앱은 실제 작동하지 않음 (provider-key 가드가 유저 직접 입력을 막고, Gateway도 아직 없음). 플랫폼 계약을 먼저 확정하려는 의도된 트레이드오프.
+
 ### Phase 1: 코어 (1주)
 1. NestJS orchestrator 프로젝트 생성 + SQLite(better-sqlite3) 연결 + 스키마 정의
 2. JWT 인증 + 프로젝트 CRUD
@@ -1230,6 +1296,21 @@ GATEWAY_GEMINI_API_KEY=
 17. 수정 요청 플로우 (새 세션 생성, modifying 상태)
 18. Nginx 리버스 프록시 설정
 19. 에러 핸들링 + Docker Compose 통합 테스트
+
+### Phase 5: QA·Env·Gateway 계약 (현재 PR #4)
+20. 관찰 기반 QA (`qa_supervisor.py`) — ADR 0001
+21. `.env.example` 3-tier 파서 + AES-256-GCM 암호화 + provider-key 가드 — ADR 0004
+22. `awaiting_env` / `env_qa` 상태 + `/api/projects/:id/env` + 프론트 EnvInput — PRD §9·DESIGN.md §4
+23. FailureClassifier regex 1차 + env_attempts 카운터 + 프론트 FailureBanner — ADR 0002
+24. AI Gateway 계약 확정 (PRD §18·ADR 0003) + system-injected 스텁 — **실체 구현은 Phase 6**
+
+### Phase 6: AI Gateway 실체 + QA 심화 (예정)
+25. `agent-model-mcp` MVP — OpenAI 호환 `/v1/chat/completions` SSE + 토큰 admin API
+26. orchestrator가 빌드 완료 시 실제 `AX_AI_TOKEN` 발급 (stub 제거)
+27. Planning / Hermes / Claude Code를 Gateway 경유로 전환
+28. 프로젝트별 사용량 대시보드 카드 (DESIGN.md §5.2)
+29. FailureClassifier LLM judge 2차 (`qa_judge` 슬롯)
+30. 기능 단위 QA — `npm install + health`를 넘어 주요 엔드포인트 curl 검증
 
 ---
 
