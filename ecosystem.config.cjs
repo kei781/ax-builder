@@ -13,7 +13,7 @@ module.exports = {
     {
       name: 'ax-planning-agent',
       cwd: './planning-agent',
-      script: 'uvicorn',
+      script: './venv/bin/uvicorn',
       args: 'app.main:app --host 127.0.0.1 --port 4100 --reload',
       interpreter: 'none',
       env: {
