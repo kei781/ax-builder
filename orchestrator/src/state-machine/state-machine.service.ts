@@ -17,8 +17,10 @@ const VALID_TRANSITIONS: Record<ProjectState, ProjectState[]> = {
   draft: ['planning'],
   planning: ['plan_ready', 'failed'],
   plan_ready: ['building', 'planning'],
-  building: ['qa', 'deployed', 'planning', 'failed'], // deployed = all phases + QA pass inline
-  qa: ['deployed', 'planning', 'failed'],
+  building: ['qa', 'awaiting_env', 'deployed', 'planning', 'failed'],
+  qa: ['awaiting_env', 'env_qa', 'deployed', 'planning', 'failed'],
+  awaiting_env: ['env_qa', 'planning', 'failed'],
+  env_qa: ['deployed', 'awaiting_env', 'planning', 'failed'],
   deployed: ['modifying'],
   modifying: ['planning', 'plan_ready'],
   failed: ['planning', 'draft'],

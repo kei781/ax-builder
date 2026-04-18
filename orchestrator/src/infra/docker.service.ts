@@ -22,9 +22,15 @@ export class DockerService {
     // Ensure base image is available; pull if missing.
     await this.ensureImage('node:20-slim');
 
+    // Inside-container port is fixed at 3000. Apps that honor process.env.PORT
+    // (the overwhelming majority of node templates) will pick this up.
+    // Apps that hardcode a different port are broken — host QA observation
+    // mode (ADR 0001) catches that before we get here, so in practice this
+    // assumption holds for the apps that graduated past QA.
     const container = await this.docker.createContainer({
       Image: 'node:20-slim',
       name: `project-${projectId}`,
+      Env: ['PORT=3000', 'NODE_ENV=production'],
       ExposedPorts: { '3000/tcp': {} },
       HostConfig: {
         PortBindings: {

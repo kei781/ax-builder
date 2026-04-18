@@ -16,6 +16,8 @@ import { BuildsService } from '../builds/builds.service.js';
 import { DockerService } from '../infra/docker.service.js';
 import { PortAllocatorService } from '../infra/port-allocator.service.js';
 import { BuildGateway } from '../websocket/build.gateway.js';
+import { EnvsService } from '../envs/envs.service.js';
+import { EnvDeployService } from '../envs/env-deploy.service.js';
 import type { AgentEvent } from '../websocket/events.js';
 
 /**
@@ -48,6 +50,8 @@ export class BuildingRunner {
     private readonly docker: DockerService,
     private readonly portAllocator: PortAllocatorService,
     private readonly gateway: BuildGateway,
+    private readonly envs: EnvsService,
+    private readonly envDeploy: EnvDeployService,
   ) {
     this.buildingAgentDir = path.resolve(process.cwd(), '..', 'building-agent');
     this.buildingAgentPython = path.resolve(
@@ -325,41 +329,24 @@ export class BuildingRunner {
     this.logger.log(`Building agent exited: code=${code} project=${projectId}`);
 
     if (code === 0) {
-      // Success — deploy via Docker
+      // Success — sync env, then branch: awaiting_env or deploy inline.
       await this.builds.closeBuild(buildId, 'success');
       const proj = await this.projectRepo.findOne({ where: { id: projectId } });
       if (!proj) return;
-      const newVersion = (proj.current_version ?? 0) + 1;
 
-      let port: number | null = null;
-      let containerId: string | null = null;
+      // Parse .env.example and upsert project_env_vars rows.
       try {
-        port = await this.portAllocator.allocate();
-        containerId = await this.docker.createContainer(
-          projectId,
-          proj.project_path!,
-          port,
-        );
-        await this.docker.startContainer(containerId);
-        this.logger.log(
-          `Container deployed: project=${projectId} port=${port} container=${containerId}`,
-        );
+        await this.envs.syncFromExample(projectId);
       } catch (err: any) {
-        // Docker failure = build failure. We won't transition to 'deployed'
-        // with a non-accessible project. Better to mark failed and let the
-        // user see the root cause.
-        this.logger.error(
-          `Docker deploy failed: ${err?.message ?? err}`,
+        // e.g. provider-key violation — treat as bounce-back per ADR 0004.
+        this.logger.warn(
+          `env sync failed for ${projectId}: ${err?.message ?? err}`,
         );
-        await this.builds.closeBuild(buildId, 'failed', [
-          `Docker 배포 실패: ${err?.message ?? '알 수 없는 오류'}`,
-          'node:20-slim 이미지를 로컬에서 받을 수 있는지, Docker daemon이 동작하는지 확인해주세요.',
-        ]);
         try {
           await this.stateMachine.transition(
             projectId,
-            'failed',
-            `docker deploy failed: ${err?.message ?? 'unknown'}`,
+            'planning',
+            `env sync bounce: ${err?.message ?? 'unknown'}`,
           );
         } catch {
           /* ignore */
@@ -369,37 +356,48 @@ export class BuildingRunner {
           project_id: projectId,
           event_type: 'error',
           payload: {
-            kind: 'docker_deploy_failed',
-            message: err?.message ?? 'Docker container 생성 실패',
+            kind: 'env_schema_violation',
+            message: err?.message ?? 'env 스키마가 잘못됐어요.',
           },
         });
         return;
       }
 
-      await this.projectRepo.update(projectId, {
-        current_version: newVersion,
-        port,
-        container_id: containerId,
-      });
-      await this.builds.createVersion(projectId, newVersion, containerId);
-
-      try {
-        await this.stateMachine.transition(projectId, 'deployed', 'build succeeded');
-      } catch {
-        // Already transitioned — ignore.
+      // If user-required vars exist, stop here and wait for user input.
+      if (await this.envs.hasUserRequired(projectId)) {
+        try {
+          await this.stateMachine.transition(
+            projectId,
+            'awaiting_env',
+            'user-required env pending',
+          );
+        } catch {
+          /* ignore */
+        }
+        this.gateway.emit({
+          agent: 'building',
+          project_id: projectId,
+          event_type: 'phase_start',
+          phase: 'awaiting_env',
+          payload: {
+            description: '환경설정이 필요합니다. 필요한 값을 입력해주세요.',
+          },
+        });
+        return;
       }
-      this.gateway.emit({
-        agent: 'building',
-        project_id: projectId,
-        event_type: 'completion',
-        progress_percent: 100,
-        payload: {
-          detail: '빌드 완료',
-          state: 'deployed',
-          port,
-          container_id: containerId,
-        },
-      });
+
+      // No user input needed — deploy straight away using the env deploy
+      // path (writes system-injected .env, creates container, polls
+      // health). Reuses the same logic as the env submit flow.
+      try {
+        // Project is in `qa` state at this point (from building agent's
+        // qa phase_start). Skip awaiting_env; env_qa state implies a
+        // container deploy check.
+        await this.stateMachine.transition(projectId, 'env_qa', 'deploying with system env only');
+      } catch {
+        /* ignore */
+      }
+      await this.envDeploy.applyAndDeploy(projectId);
     } else if (code === 2) {
       // Bounce-back to Planning
       await this.builds.closeBuild(buildId, 'bounced');

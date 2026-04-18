@@ -7,6 +7,7 @@ import { StateMachineModule } from '../state-machine/state-machine.module.js';
 import { HandoffsModule } from '../handoffs/handoffs.module.js';
 import { BuildsModule } from '../builds/builds.module.js';
 import { InfraModule } from '../infra/infra.module.js';
+import { EnvsModule } from '../envs/envs.module.js';
 
 /**
  * Agent process lifecycle management.
@@ -19,7 +20,15 @@ import { InfraModule } from '../infra/infra.module.js';
  * to the respective modules.
  */
 @Module({
-  imports: [WebsocketModule, ProjectsModule, StateMachineModule, HandoffsModule, BuildsModule, InfraModule],
+  imports: [
+    WebsocketModule,
+    ProjectsModule,
+    StateMachineModule,
+    HandoffsModule,
+    BuildsModule,
+    InfraModule,
+    EnvsModule,
+  ],
   providers: [PlanningClient, BuildingRunner],
   exports: [PlanningClient, BuildingRunner],
 })

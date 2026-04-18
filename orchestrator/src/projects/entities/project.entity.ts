@@ -30,6 +30,8 @@ export type ProjectState =
   | 'plan_ready'
   | 'building'
   | 'qa'
+  | 'awaiting_env'
+  | 'env_qa'
   | 'deployed'
   | 'failed'
   | 'modifying';
