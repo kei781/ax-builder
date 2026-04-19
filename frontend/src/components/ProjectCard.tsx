@@ -1,6 +1,12 @@
 import { useNavigate } from 'react-router-dom';
 import client from '../api/client';
 
+// 배포된 앱 접속 URL에 쓸 호스트. `VITE_PROJECT_HOST` 환경변수로 덮어쓰기.
+// 외부 IP(예: 221.150.9.241)나 도메인을 넣으면 그것으로, 없으면 localhost.
+const PROJECT_HOST =
+  (import.meta.env.VITE_PROJECT_HOST as string | undefined)?.trim() ||
+  'localhost';
+
 export type ProjectState =
   | 'draft'
   | 'planning'
@@ -71,9 +77,9 @@ export default function ProjectCard({
 
       {port && state === 'deployed' && (
         <p className="text-gray-600 dark:text-gray-400 text-sm mb-3">
-          🌐 localhost:{port}
+          🌐 {PROJECT_HOST}:{port}
           <a
-            href={`http://localhost:${port}`}
+            href={`http://${PROJECT_HOST}:${port}`}
             target="_blank"
             rel="noopener noreferrer"
             className="text-green-600 dark:text-green-400 hover:text-green-500 ml-2"
