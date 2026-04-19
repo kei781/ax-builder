@@ -22,10 +22,25 @@ export class DockerService {
     // Ensure base image is available; pull if missing.
     await this.ensureImage('node:20-slim');
 
+    // Inside-container port is fixed at 3000. Apps that honor process.env.PORT
+    // (the overwhelming majority of node templates) will pick this up.
+    // Apps that hardcode a different port are broken — host QA observation
+    // mode (ADR 0001) catches that before we get here, so in practice this
+    // assumption holds for the apps that graduated past QA.
+    //
+    // `/app/node_modules`는 anonymous volume으로 가립다. 호스트 QA가 이미
+    // macOS용 native bindings(better-sqlite3 등)을 설치해둔 상태로 Linux
+    // 컨테이너에 bind-mount되면 `invalid ELF header`로 죽는다. 빈 볼륨으로
+    // 덮어서 컨테이너가 `npm install`로 올바른 Linux 바이너리를 새로
+    // 세팅하도록 한다.
     const container = await this.docker.createContainer({
       Image: 'node:20-slim',
       name: `project-${projectId}`,
+      Env: ['PORT=3000', 'NODE_ENV=production'],
       ExposedPorts: { '3000/tcp': {} },
+      Volumes: {
+        '/app/node_modules': {},
+      },
       HostConfig: {
         PortBindings: {
           '3000/tcp': [{ HostPort: String(port) }],
@@ -38,7 +53,7 @@ export class DockerService {
         NanoCpus: 500000000, // 0.5 CPU
       },
       WorkingDir: '/app',
-      Cmd: ['sh', '-c', 'npm install && npm start'],
+      Cmd: ['sh', '-c', 'npm install --no-audit --no-fund && npm start'],
     });
 
     return container.id;
@@ -101,4 +116,46 @@ export class DockerService {
     await container.restart();
     this.logger.log(`Container ${containerId} restarted`);
   }
+
+  /**
+   * Fetch combined stdout+stderr logs of a container (as text).
+   * Used by FailureClassifier to figure out why env_qa failed.
+   */
+  async getLogs(
+    containerId: string,
+    tailLines = 500,
+  ): Promise<string> {
+    try {
+      const container = this.docker.getContainer(containerId);
+      const stream = (await container.logs({
+        stdout: true,
+        stderr: true,
+        tail: tailLines,
+        timestamps: false,
+      })) as unknown as Buffer;
+      // When follow=false, dockerode returns the raw multiplexed buffer.
+      // Each frame = 8-byte header + payload. We strip headers; for non-TTY
+      // containers the header's first byte is stream-id (1=stdout, 2=stderr).
+      return demultiplex(Buffer.isBuffer(stream) ? stream : Buffer.from(stream));
+    } catch (err: any) {
+      this.logger.warn(`getLogs failed: ${err?.message ?? err}`);
+      return '';
+    }
+  }
+}
+
+/** Strip the 8-byte per-frame header from Docker's multiplexed log stream. */
+function demultiplex(buf: Buffer): string {
+  const parts: Buffer[] = [];
+  let i = 0;
+  while (i + 8 <= buf.length) {
+    const size = buf.readUInt32BE(i + 4);
+    const start = i + 8;
+    const end = start + size;
+    if (end > buf.length) break;
+    parts.push(buf.subarray(start, end));
+    i = end;
+  }
+  if (parts.length === 0) return buf.toString('utf8');
+  return Buffer.concat(parts).toString('utf8');
 }

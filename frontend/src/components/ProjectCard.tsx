@@ -1,12 +1,20 @@
 import { useNavigate } from 'react-router-dom';
 import client from '../api/client';
 
+// 배포된 앱 접속 URL에 쓸 호스트. `VITE_PROJECT_HOST` 환경변수로 덮어쓰기.
+// 외부 IP(예: 221.150.9.241)나 도메인을 넣으면 그것으로, 없으면 localhost.
+const PROJECT_HOST =
+  (import.meta.env.VITE_PROJECT_HOST as string | undefined)?.trim() ||
+  'localhost';
+
 export type ProjectState =
   | 'draft'
   | 'planning'
   | 'plan_ready'
   | 'building'
   | 'qa'
+  | 'awaiting_env'
+  | 'env_qa'
   | 'deployed'
   | 'failed'
   | 'modifying';
@@ -28,6 +36,8 @@ const stateConfig: Record<ProjectState, { label: string; color: string }> = {
   plan_ready: { label: '빌드 준비', color: 'bg-green-500' },
   building: { label: '빌드 중', color: 'bg-yellow-500' },
   qa: { label: 'QA 중', color: 'bg-yellow-500' },
+  awaiting_env: { label: '설정 필요', color: 'bg-orange-500' },
+  env_qa: { label: '환경 검증 중', color: 'bg-purple-500' },
   deployed: { label: '운영 중', color: 'bg-emerald-500' },
   failed: { label: '실패', color: 'bg-red-500' },
   modifying: { label: '수정 중', color: 'bg-purple-500' },
@@ -49,6 +59,7 @@ export default function ProjectCard({
 
   const goChat = () => navigate(`/projects/${id}/chat`);
   const goBuild = () => navigate(`/projects/${id}/build`);
+  const goEnv = () => navigate(`/projects/${id}/env`);
 
   return (
     <div className="bg-white dark:bg-gray-900 rounded-xl p-5 border border-gray-200 dark:border-gray-800 hover:border-gray-300 dark:hover:border-gray-700 transition-colors shadow-sm dark:shadow-none">
@@ -66,9 +77,9 @@ export default function ProjectCard({
 
       {port && state === 'deployed' && (
         <p className="text-gray-600 dark:text-gray-400 text-sm mb-3">
-          🌐 localhost:{port}
+          🌐 {PROJECT_HOST}:{port}
           <a
-            href={`http://localhost:${port}`}
+            href={`http://${PROJECT_HOST}:${port}`}
             target="_blank"
             rel="noopener noreferrer"
             className="text-green-600 dark:text-green-400 hover:text-green-500 ml-2"
@@ -106,11 +117,49 @@ export default function ProjectCard({
             빌드 상태
           </button>
         )}
-        {/* Deployed → view app + modify */}
-        {state === 'deployed' && canEdit && (
-          <button onClick={goChat} className="text-sm bg-purple-500/10 text-purple-400 px-3 py-1.5 rounded-lg hover:bg-purple-500/20 transition-colors">
-            수정 요청
+        {/* Awaiting env → input screen */}
+        {state === 'awaiting_env' && canEdit && (
+          <button onClick={goEnv} className="text-sm bg-orange-500/10 text-orange-500 px-3 py-1.5 rounded-lg hover:bg-orange-500/20 transition-colors">
+            환경 설정
           </button>
+        )}
+        {/* env_qa → viewing in env page */}
+        {state === 'env_qa' && canEdit && (
+          <button onClick={goEnv} className="text-sm bg-purple-500/10 text-purple-400 px-3 py-1.5 rounded-lg hover:bg-purple-500/20 transition-colors">
+            적용 진행 상태
+          </button>
+        )}
+        {/* Deployed → env maintenance + restart + modify */}
+        {state === 'deployed' && canEdit && (
+          <>
+            <button onClick={goEnv} className="text-sm bg-blue-500/10 text-blue-600 dark:text-blue-400 px-3 py-1.5 rounded-lg hover:bg-blue-500/20 transition-colors">
+              ⚙ 환경 설정
+            </button>
+            {myRole === 'owner' && (
+              <button
+                onClick={async () => {
+                  if (!confirm(`'${title}' 프로젝트를 재시작하시겠습니까?\n약 5~10초 동안 서비스가 잠시 끊깁니다.`)) return;
+                  try {
+                    const res = await client.post(`/projects/${id}/restart`);
+                    if (res.data.accepted) {
+                      alert('재시작을 시작했습니다. 잠시 뒤 상태가 갱신됩니다.');
+                    } else {
+                      alert(res.data.message ?? '재시작 요청됨');
+                    }
+                  } catch (err: unknown) {
+                    const e = err as { response?: { data?: { message?: string } } };
+                    alert(`재시작 실패: ${e.response?.data?.message ?? '알 수 없는 오류'}`);
+                  }
+                }}
+                className="text-sm bg-orange-500/10 text-orange-600 dark:text-orange-400 px-3 py-1.5 rounded-lg hover:bg-orange-500/20 transition-colors"
+              >
+                🔄 재시작
+              </button>
+            )}
+            <button onClick={goChat} className="text-sm bg-purple-500/10 text-purple-400 px-3 py-1.5 rounded-lg hover:bg-purple-500/20 transition-colors">
+              수정 요청
+            </button>
+          </>
         )}
         {/* Failed → retry from planning */}
         {state === 'failed' && canEdit && (

@@ -294,12 +294,31 @@ export default function Chat() {
     if (project?.state !== 'plan_ready' && readiness?.can_build) {
       const autoMsg =
         '기획이 충분히 정리됐습니다. propose_handoff 도구를 호출해서 ' +
-        '다음 단계(Building)로 이관을 제안해주세요.';
+        '다음 단계(Building)로 이관을 제안해주세요. ' +
+        '텍스트로만 "완료"라고 답하지 말고 반드시 도구를 호출하세요.';
       setMessages((prev) => [...prev, { role: 'user', content: autoMsg }]);
       setLoading(true);
       setStatus('핸드오프 요청 중...');
       try {
         await client.post(`/projects/${id}/chat/messages`, { content: autoMsg });
+        // Watchdog: 15s 안에 plan_ready 전이가 안 보이면 AI가 도구 호출 안 한 것.
+        // ARCHITECTURE.md §6.6 참조.
+        const checkAt = Date.now();
+        setTimeout(async () => {
+          try {
+            const r = await client.get(`/projects/${id}`);
+            if (r.data.state !== 'plan_ready') {
+              setHandoffBanner(
+                'AI가 도구를 호출하지 않은 것 같아요. "AI에게 핸드오프 요청"을 한 번 더 눌러주세요.',
+              );
+              setStatus('핸드오프 재시도 필요');
+            }
+          } catch {
+            /* ignore — user may have navigated away */
+          }
+          // keep stale-check hint scoped to this click
+          void checkAt;
+        }, 15_000);
       } catch (err: unknown) {
         const e = err as { response?: { data?: { message?: string } } };
         setStatus(`⚠ ${e.response?.data?.message ?? '요청 실패'}`);

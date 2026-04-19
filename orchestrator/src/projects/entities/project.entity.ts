@@ -30,6 +30,8 @@ export type ProjectState =
   | 'plan_ready'
   | 'building'
   | 'qa'
+  | 'awaiting_env'
+  | 'env_qa'
   | 'deployed'
   | 'failed'
   | 'modifying';
@@ -76,6 +78,13 @@ export class Project {
 
   @Column({ type: 'varchar', length: 50, nullable: true })
   lock_reason!: string | null;
+
+  /**
+   * ADR 0002 — env_qa 실패 누적 카운터. `env_rejected`로 분류된 실패 한정.
+   * 3회 도달 시 schema_bug로 에스컬레이트 → Planning bounce. 성공 시 0 리셋.
+   */
+  @Column({ type: 'int', default: 0 })
+  env_attempts!: number;
 
   @CreateDateColumn()
   created_at!: Date;

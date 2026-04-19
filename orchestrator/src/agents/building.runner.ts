@@ -16,6 +16,8 @@ import { BuildsService } from '../builds/builds.service.js';
 import { DockerService } from '../infra/docker.service.js';
 import { PortAllocatorService } from '../infra/port-allocator.service.js';
 import { BuildGateway } from '../websocket/build.gateway.js';
+import { EnvsService } from '../envs/envs.service.js';
+import { EnvDeployService } from '../envs/env-deploy.service.js';
 import type { AgentEvent } from '../websocket/events.js';
 
 /**
@@ -48,6 +50,8 @@ export class BuildingRunner {
     private readonly docker: DockerService,
     private readonly portAllocator: PortAllocatorService,
     private readonly gateway: BuildGateway,
+    private readonly envs: EnvsService,
+    private readonly envDeploy: EnvDeployService,
   ) {
     this.buildingAgentDir = path.resolve(process.cwd(), '..', 'building-agent');
     this.buildingAgentPython = path.resolve(
@@ -284,16 +288,19 @@ export class BuildingRunner {
       const phaseId = this.phaseIds.get(projectId)?.get(phaseName);
       if (phaseId) {
         const ok = p['ok'] === true;
+        // QA phases emit {detail, gap_list}. Code phases emit {stdout_tail, stderr_tail}.
+        // Both must land in output_log so the build viewer has something to show.
+        const gapList = Array.isArray(p['gap_list']) ? p['gap_list'] : [];
+        const fragments = [
+          p['stdout_tail'] ?? '',
+          p['stderr_tail'] ?? '',
+          p['detail'] ?? '',
+          gapList.length ? `gap_list:\n- ${gapList.join('\n- ')}` : '',
+        ].filter(Boolean);
         this.builds
           .updatePhase(phaseId, {
             status: ok ? 'success' : 'failed',
-            output_log: [
-              p['stdout_tail'] ?? '',
-              p['stderr_tail'] ?? '',
-            ]
-              .filter(Boolean)
-              .join('\n---\n')
-              .slice(0, 10000),
+            output_log: fragments.join('\n---\n').slice(0, 10000),
             finished_at: new Date(),
           })
           .catch((e) => this.logger.warn(`phase_end persist: ${e.message}`));
@@ -322,41 +329,25 @@ export class BuildingRunner {
     this.logger.log(`Building agent exited: code=${code} project=${projectId}`);
 
     if (code === 0) {
-      // Success — deploy via Docker
+      // ADR 0005 mock-first: build success always → deploy with whatever env
+      // is currently resolved. user-required 값이 없어도 mock 상태로 배포.
+      // 실제 값 입력은 배포 후 유지보수 모드에서 언제든.
       await this.builds.closeBuild(buildId, 'success');
       const proj = await this.projectRepo.findOne({ where: { id: projectId } });
       if (!proj) return;
-      const newVersion = (proj.current_version ?? 0) + 1;
 
-      let port: number | null = null;
-      let containerId: string | null = null;
       try {
-        port = await this.portAllocator.allocate();
-        containerId = await this.docker.createContainer(
-          projectId,
-          proj.project_path!,
-          port,
-        );
-        await this.docker.startContainer(containerId);
-        this.logger.log(
-          `Container deployed: project=${projectId} port=${port} container=${containerId}`,
-        );
+        await this.envs.syncFromExample(projectId);
       } catch (err: any) {
-        // Docker failure = build failure. We won't transition to 'deployed'
-        // with a non-accessible project. Better to mark failed and let the
-        // user see the root cause.
-        this.logger.error(
-          `Docker deploy failed: ${err?.message ?? err}`,
+        // provider-key violation 등 — schema 자체가 잘못됐으므로 planning 반송.
+        this.logger.warn(
+          `env sync failed for ${projectId}: ${err?.message ?? err}`,
         );
-        await this.builds.closeBuild(buildId, 'failed', [
-          `Docker 배포 실패: ${err?.message ?? '알 수 없는 오류'}`,
-          'node:20-slim 이미지를 로컬에서 받을 수 있는지, Docker daemon이 동작하는지 확인해주세요.',
-        ]);
         try {
           await this.stateMachine.transition(
             projectId,
-            'failed',
-            `docker deploy failed: ${err?.message ?? 'unknown'}`,
+            'planning',
+            `env sync bounce: ${err?.message ?? 'unknown'}`,
           );
         } catch {
           /* ignore */
@@ -366,37 +357,24 @@ export class BuildingRunner {
           project_id: projectId,
           event_type: 'error',
           payload: {
-            kind: 'docker_deploy_failed',
-            message: err?.message ?? 'Docker container 생성 실패',
+            kind: 'env_schema_violation',
+            message: err?.message ?? 'env 스키마가 잘못됐어요.',
           },
         });
         return;
       }
 
-      await this.projectRepo.update(projectId, {
-        current_version: newVersion,
-        port,
-        container_id: containerId,
-      });
-      await this.builds.createVersion(projectId, newVersion, containerId);
-
+      // Proceed to deploy — mock-first: user-required 유무와 무관.
       try {
-        await this.stateMachine.transition(projectId, 'deployed', 'build succeeded');
+        await this.stateMachine.transition(
+          projectId,
+          'env_qa',
+          'mock-first deploy',
+        );
       } catch {
-        // Already transitioned — ignore.
+        /* ignore — 이미 env_qa였을 수도 있음 */
       }
-      this.gateway.emit({
-        agent: 'building',
-        project_id: projectId,
-        event_type: 'completion',
-        progress_percent: 100,
-        payload: {
-          detail: '빌드 완료',
-          state: 'deployed',
-          port,
-          container_id: containerId,
-        },
-      });
+      await this.envDeploy.applyAndDeploy(projectId);
     } else if (code === 2) {
       // Bounce-back to Planning
       await this.builds.closeBuild(buildId, 'bounced');

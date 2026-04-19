@@ -12,6 +12,7 @@ import { HandoffsModule } from './handoffs/handoffs.module.js';
 import { PermissionsModule } from './permissions/permissions.module.js';
 import { MemoryModule } from './memory/memory.module.js';
 import { BuildsModule } from './builds/builds.module.js';
+import { EnvsModule } from './envs/envs.module.js';
 import { InfraModule } from './infra/infra.module.js';
 import { BuildModule } from './build/build.module.js';
 import { ChatModule } from './chat/chat.module.js';
@@ -45,6 +46,7 @@ import { HealthModule } from './health/health.module.js';
     HandoffsModule,
     MemoryModule,
     BuildsModule,
+    EnvsModule,
 
     // Infrastructure
     InfraModule,

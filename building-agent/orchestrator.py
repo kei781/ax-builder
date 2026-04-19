@@ -169,7 +169,12 @@ def main(raw_args: str) -> int:
             build_id=build_id,
             phase="qa",
             progress_percent=95,
-            payload={"ok": qa.ok, "detail": qa.detail, "gap_list": qa.gaps},
+            payload={
+                "ok": qa.ok,
+                "detail": qa.detail,
+                "gap_list": qa.gaps,
+                "observed_port": qa.observed_port,
+            },
         )
         if not qa.ok:
             events.emit(

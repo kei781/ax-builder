@@ -6,6 +6,7 @@ import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import Chat from './pages/Chat';
 import BuildStatus from './pages/BuildStatus';
+import EnvInput from './pages/EnvInput';
 
 function App() {
   return (
@@ -35,6 +36,14 @@ function App() {
             element={
               <ProtectedRoute>
                 <BuildStatus />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/projects/:id/env"
+            element={
+              <ProtectedRoute>
+                <EnvInput />
               </ProtectedRoute>
             }
           />
