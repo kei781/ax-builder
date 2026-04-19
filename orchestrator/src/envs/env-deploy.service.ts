@@ -159,7 +159,10 @@ export class EnvDeployService {
       return;
     }
 
-    const ok = await this.pollHealth(port, 30_000);
+    // Fresh deploy: container runs `npm install && npm start` inside.
+    // npm install with native modules(better-sqlite3 등)은 수십 초 ~ 2분 소요.
+    // 따라서 fresh 타임아웃은 넉넉히 2분으로 잡는다.
+    const ok = await this.pollHealth(port, 120_000);
     if (!ok) {
       this.logger.warn(`health poll failed for project ${projectId} port ${port}`);
       const logs = await this.docker.getLogs(containerId, 500);

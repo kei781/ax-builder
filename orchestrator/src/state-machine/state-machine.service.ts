@@ -26,13 +26,15 @@ const VALID_TRANSITIONS: Record<ProjectState, ProjectState[]> = {
   draft: ['planning'],
   planning: ['plan_ready', 'failed'],
   plan_ready: ['building', 'planning'],
-  building: ['qa', 'awaiting_env', 'deployed', 'planning', 'failed'],
+  // building → env_qa: mock-first 해피 패스 (ADR 0005). handleExit이
+  // QA 통과 직후 env_qa로 전이하며 컨테이너 기동을 시작함.
+  building: ['qa', 'awaiting_env', 'env_qa', 'deployed', 'planning', 'failed'],
   qa: ['awaiting_env', 'env_qa', 'deployed', 'planning', 'failed'],
   awaiting_env: ['env_qa', 'planning', 'failed'], // legacy (ADR 0005 이후 거의 미사용)
   env_qa: ['deployed', 'awaiting_env', 'modifying', 'planning', 'failed'],
   deployed: ['env_qa', 'modifying', 'failed'],
   modifying: ['planning', 'plan_ready', 'building', 'deployed'],
-  failed: ['planning', 'draft'],
+  failed: ['planning', 'draft', 'plan_ready'],
 };
 
 @Injectable()
