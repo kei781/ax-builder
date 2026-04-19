@@ -102,8 +102,9 @@ export class EnvDeployService {
   }
 
   /**
-   * POST /restart entry — no env change, just bounce the container.
-   * Same maintenance restart path.
+   * POST /restart entry — bounce the container after re-writing .env from
+   * the current DB state. This ensures any DB-side env updates (including
+   * newly-minted AI Gateway tokens) land in the container's env file.
    */
   async restartOnly(projectId: string): Promise<void> {
     const proj = await this.projectRepo.findOne({ where: { id: projectId } });
@@ -122,6 +123,7 @@ export class EnvDeployService {
       phase: 'env_qa',
       payload: { description: '컨테이너 재시작 중...' },
     });
+    await this.envs.writeDotenv(projectId);
     await this.maintenanceRestart(projectId, proj.container_id, proj.port);
   }
 

@@ -13,6 +13,7 @@ import { PermissionsModule } from './permissions/permissions.module.js';
 import { MemoryModule } from './memory/memory.module.js';
 import { BuildsModule } from './builds/builds.module.js';
 import { EnvsModule } from './envs/envs.module.js';
+import { AiGatewayModule } from './ai-gateway/ai-gateway.module.js';
 import { InfraModule } from './infra/infra.module.js';
 import { BuildModule } from './build/build.module.js';
 import { ChatModule } from './chat/chat.module.js';
@@ -47,6 +48,7 @@ import { HealthModule } from './health/health.module.js';
     MemoryModule,
     BuildsModule,
     EnvsModule,
+    AiGatewayModule,
 
     // Infrastructure
     InfraModule,

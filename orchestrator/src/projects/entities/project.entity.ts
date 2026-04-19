@@ -86,6 +86,16 @@ export class Project {
   @Column({ type: 'int', default: 0 })
   env_attempts!: number;
 
+  /**
+   * Phase 6 / ADR 0003 — AI Gateway 프로젝트 토큰의 SHA-256 hex 해시.
+   * 평문 토큰은 project_env_vars에 AX_AI_TOKEN(system-injected)로 암호화 저장.
+   * 이 해시는 Gateway HTTP 인증(Authorization: Bearer ...) 역조회용.
+   * revoke하려면 NULL로 비우면 됨.
+   */
+  @Column({ type: 'varchar', length: 64, nullable: true })
+  @Index()
+  ai_token_hash!: string | null;
+
   @CreateDateColumn()
   created_at!: Date;
 

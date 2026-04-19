@@ -50,19 +50,31 @@
 
 ## 연관 구현
 
-**현재 상태 (PR #4)**
+**현재 상태 (Phase 6 MVP, PR #5 `feat/ai-gateway-mvp`)**
 
-- `orchestrator/src/envs/envs.service.ts` `resolveSystemInjected` — `AX_AI_BASE_URL`(플랫폼 env `AI_GATEWAY_BASE_URL`), `AX_AI_TOKEN`(**현재 `axt_stub_*` 더미**), `AX_STORAGE_PATH` 매핑.
-- `orchestrator/src/envs/env-parser.ts` `findProviderKeyViolations` — `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `AZURE_OPENAI_*` 등 8종 provider 키가 user-tier로 노출되면 빌드 반송.
-- `phase_runner.py` PHASE 프롬프트 — AI Gateway 사용 규칙 + `.env.example` 메타라인 + provider 키 금지 문구 주입.
+Gateway를 **orchestrator 내장 모듈**로 구현 — 별도 `agent-model-mcp` 프로세스 대신 NestJS의 `/api/ai/v1/*` 엔드포인트로 직접 노출. `agent-model-mcp`(slot-routing MCP stdio)는 향후 Gateway의 내부 backend로 붙일 수 있지만 MVP에선 직접 Gemini OpenAI-compat으로 forward.
+
+- `orchestrator/src/ai-gateway/ai-gateway.service.ts`
+  - `mintToken()` / `ensureToken(projectId)` / `revokeToken(projectId)` — `axt_<48hex>` 토큰 생성, SHA-256 해시만 `projects.ai_token_hash`에 저장 (평문은 `project_env_vars`에 암호화 저장).
+  - `resolveToken(bearer)` — 받은 Bearer를 해시화해 역조회.
+  - `forwardChatCompletion(body)` — OpenAI-compat body를 upstream(`AI_GATEWAY_UPSTREAM_BASE_URL`, 기본 Gemini)으로 전달. 스트리밍 바디 통과.
+  - `normalizeModel()` — `default|cheap|reasoning|fast` 논리 이름 → Gemini 실제 모델.
+- `orchestrator/src/ai-gateway/ai-gateway.controller.ts` — `POST /chat/completions` (SSE 스트리밍 포함), `POST /models` (토큰 유효성만 확인하는 placeholder). JwtAuthGuard 없음 — Bearer 토큰 자체 인증.
+- `orchestrator/src/envs/envs.service.ts` `syncFromExample` — `AX_AI_TOKEN` 처리 분기 교체. `aiGateway.ensureToken()`으로 idempotent 발급, 기존 해시 있으면 기존 값 유지.
+- `projects.ai_token_hash` 컬럼 신설 (SHA-256 hex, indexed).
+- `AI_GATEWAY_BASE_URL` 플랫폼 env 기본값 `http://host.docker.internal:4000/api/ai/v1` — Docker Desktop(mac)에서 container → host 자동 해소.
+- `orchestrator/src/envs/env-deploy.service.ts` `restartOnly` — 재시작 직전에 `writeDotenv`를 호출하도록 수정. DB에 새 토큰이 들어와 있어도 `/restart` 만으로 .env 파일이 갱신되어 컨테이너가 새 값으로 기동.
+
+**검증된 E2E** (라이어 게임 프로젝트로)
+- orchestrator가 `AX_AI_TOKEN` 발급 + `ai_token_hash` 저장 + .env 기록
+- 컨테이너 → `host.docker.internal:4000/api/ai/v1/chat/completions` Bearer 인증 → upstream Gemini → 200 응답
+- 잘못된 토큰 → 401
 
 **아직 안 한 것**
 
-- `agent-model-mcp` 실체 구현 — OpenAI 호환 + MCP + 토큰 admin API. **없음.**
-- Planning/Hermes/Claude Code의 Gateway 경유 전환 — 아직 Gemini/Anthropic 직접 호출.
-- `AX_AI_TOKEN` 실발급 경로 (orchestrator → Gateway admin API).
-- 프로젝트 단위 사용량 대시보드.
-
-**영향**
-
-MVP 단계에서 LLM을 필요로 하는 생성 앱은 **실제로 작동하지 않음.** provider-key 가드는 유저가 `ANTHROPIC_API_KEY`를 직접 넣는 길을 막지만, `AX_AI_TOKEN`은 스텁이라 게이트웨이에 실제 요청해도 실패. 의도된 트레이드오프 — 계약을 먼저 확정하고, Gateway 구현은 별도 마일스톤으로 분리한다.
+- Planning/Hermes/Claude Code의 Gateway 경유 전환 — 내부 에이전트는 아직 Gemini 직접 호출.
+- 프로젝트별 사용량·비용 로깅 + 일일/월 예산 cap.
+- `agent-model-mcp` slot-routing을 Gateway backend로 통합 (원래 예정).
+- 모델 라우팅 매트릭스 확장 (지금은 default/cheap/reasoning/fast 4개만, 전부 Gemini).
+- 관리자 대시보드 — 프로젝트별 토큰 사용량 카드(DESIGN §5.2).
+- Anthropic / OpenAI passthrough 엔드포인트 — 현재는 OpenAI-compat 포맷만.
