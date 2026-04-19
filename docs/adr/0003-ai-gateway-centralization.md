@@ -1,9 +1,9 @@
-# ADR 0003: AI Gateway 단일 경유 (agent-model-mcp)
+# ADR 0003: AI Gateway 단일 경유
 
-- **상태**: Accepted
+- **상태**: Accepted — MVP 구현 완료 (Phase 6, PR #5)
 - **일시**: 2026-04-19
-- **관련**: PRD §9.0, §18
-- **리포**: `github.com/kei781/agent-model-mcp`
+- **관련**: PRD §9.0, §18, ARCHITECTURE §20
+- **후속 ADR**: 0007 (Gateway 구현 위치 — orchestrator 내장 결정)
 
 ## 배경
 

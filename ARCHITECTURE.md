@@ -37,9 +37,9 @@
        ▼                  ▼                  ▼
 ┌───────────────┐ ┌───────────────┐ ┌──────────────────────────┐
 │ Planning      │ │ Building      │ │ AI Gateway               │
-│ Agent (Py)    │ │ Agent (Py)    │ │ (agent-model-mcp)        │
-│ 대화/PRD/DSN  │ │ PHASES/Claude │ │ OpenAI-호환 HTTP + MCP    │
-│ 스트리밍       │ │ Code/QA 감독  │ │ 토큰 auth / 예산 / 감사   │
+│ Agent (Py)    │ │ Agent (Py)    │ │ orchestrator 내장 (MVP)   │
+│ 대화/PRD/DSN  │ │ PHASES/Claude │ │ /api/ai/v1/* OpenAI호환   │
+│ 스트리밍       │ │ Code/QA 감독  │ │ Bearer auth / Gemini↑     │
 └──────┬────────┘ └──────┬────────┘ └─────────▲────────────────┘
        │  LLM            │  LLM              │  LLM (생성 앱)
        └─────────────────┴───────────────────┤
@@ -755,7 +755,7 @@ PUT /env { apply:true }  또는  POST /restart
 | 변수 | 소스 |
 |---|---|
 | `AX_AI_BASE_URL` | `AI_GATEWAY_BASE_URL` 플랫폼 env |
-| `AX_AI_TOKEN` | **현재 MVP: `axt_stub_*` 스텁** (§20 Gateway 실구현 전까지) |
+| `AX_AI_TOKEN` | `aiGateway.ensureToken(projectId)` — idempotent `axt_<48hex>` 발급, SHA-256 해시는 `projects.ai_token_hash`에 저장 (§20) |
 | `AX_STORAGE_PATH` | 고정 `/app/data` |
 | 그 외 | null (유저에게 노출되지 않음, 앱이 직접 처리) |
 
@@ -777,33 +777,42 @@ PUT /env { apply:true }  또는  POST /restart
 
 ---
 
-## 20. AI Gateway (agent-model-mcp)
+## 20. AI Gateway
 
-PRD §9.0 / §18 / ADR 0003의 구조 계약. 리포: `github.com/kei781/agent-model-mcp`.
+PRD §9.0 / §18 / ADR 0003의 구조 계약. 현재 **orchestrator 내장** 구현(Phase 6 MVP). `github.com/kei781/agent-model-mcp`는 Phase 6.1에서 backend로 통합 예정.
 
 ### 20.1 위치
-플랫폼·에이전트·생성 앱의 **모든 LLM 호출** 단일 경유 레이어. 원본 provider 키(Anthropic/OpenAI/Gemini)는 게이트웨이 서버에만 존재한다.
+플랫폼·에이전트·생성 앱의 **모든 LLM 호출** 단일 경유 레이어. 원본 provider 키(Anthropic/OpenAI/Gemini)는 게이트웨이 서버(= orchestrator host)에만 존재한다. 생성 앱 컨테이너는 `AX_AI_TOKEN`(프로젝트별 Bearer)만 보유.
 
-### 20.2 인터페이스
-- **OpenAI 호환 HTTP** (`/v1/chat/completions`, SSE 스트리밍, `/v1/embeddings`, `/v1/models`) — 생성 앱이 `openai` SDK `baseURL`만 바꿔 호출
-- **MCP** (Streamable HTTP) — `generate` / `complete_stream` / `embed` / `list_models` / `usage_today` 툴. Planning/Hermes/Claude Code 에이전트가 사용
-- **passthrough** (`/v1/anthropic/messages`, `/v1/gemini/...`) — OpenAI 포맷으로 담기 어려운 기능(tool use, thinking, caching) 원본 그대로 중계
-- **admin API** (`/admin/tokens`, `/admin/usage`, `/admin/models`) — 프로젝트 토큰 발급·폐기, 모델 매핑 관리
+### 20.2 MVP 인터페이스 (현재)
+- **OpenAI 호환 HTTP** — `POST /api/ai/v1/chat/completions` (SSE 통과), `POST /api/ai/v1/models`. 생성 앱은 `openai` SDK `baseURL` 한 줄 바꿔 호출.
+- **upstream**: Gemini OpenAI-compat (`generativelanguage.googleapis.com/v1beta/openai`). 모델 정규화:
+  - `default` / `cheap` / `fast` → `gemini-2.5-flash`
+  - `reasoning` → `gemini-2.5-pro`
+  - 모르는 이름은 pass-through
+- **토큰**: `axt_<48hex>` 평문은 `project_env_vars.AX_AI_TOKEN`(AES-GCM 암호화), SHA-256 해시는 `projects.ai_token_hash`(indexed). Bearer 검증은 O(1) 역조회.
 
-### 20.3 인증·통제
-- 프로젝트당 1개 `AX_AI_TOKEN` (orchestrator가 빌드 완료 시 admin API로 발급, 컨테이너 env로 자동 주입)
-- 토큰별 일일/월 cap, RPS 제한, 모델 화이트리스트
-- 초과 → 429 (`retry_after_seconds`) 또는 저렴 모델 자동 폴백(opt-in)
-- 모든 호출 감사 로그 — 대시보드에서 프로젝트 단위 사용량·비용 조회
+### 20.3 Phase 6.1 확장 인터페이스 (예정)
+- **OpenAI 호환 추가** — `POST /embeddings`
+- **passthrough** — `POST /api/ai/v1/anthropic/messages` (tool use/thinking/caching), `POST /api/ai/v1/gemini/{model}:generateContent`
+- **MCP** (Streamable HTTP 또는 stdio) — `generate` / `complete_stream` / `embed` / `list_models` / `usage_today` 툴. Planning/Hermes가 직접 소비 (개별 HTTP 대신 MCP).
+- **admin API** (`/admin/tokens`, `/admin/usage`, `/admin/models`) — 프로젝트 토큰 수동 발급·폐기, 사용량 조회, 모델 매핑 관리.
 
-### 20.4 내부 에이전트 통일
-Planning Agent의 `openai_compat` 백엔드(§3.1), Hermes(§4.1), Claude Code CLI(`ANTHROPIC_BASE_URL`)도 기본값을 Gateway로 설정. 플랫폼 전체 AI 비용을 단일 대시보드에서 본다.
+### 20.4 인증·통제
+- **MVP**: 해시 기반 Bearer 인증만. 모든 유효 토큰 = 전 모델 허용, 한도 없음.
+- **Phase 6.1**: 토큰별 일일/월 cap, RPS 제한, 모델 화이트리스트. 초과 → 429 (`retry_after_seconds`) 또는 저렴 모델 자동 폴백(opt-in). 감사 로그 `ai_usage_logs` 테이블.
 
-### 20.5 장애·레이턴시
-- Gateway `/healthz` 주기 ping을 orchestrator가 수행. 실패 시 "AI 기능 일시 중단" 배너 활성화.
-- 생성 앱 SDK 래퍼에 타임아웃·재시도·graceful degradation 힌트를 Claude Code 프롬프트에 예시 포함.
-- 같은 LAN (N100 로컬)에서 수 ms. LLM 호출 자체가 외부 의존이라 추가 단일 장애점의 체감 증가는 제한적.
+### 20.5 내부 에이전트 통일 (Phase 6.1)
+Planning Agent의 `openai_compat` 백엔드(§3.1), Hermes(§4.1), Claude Code CLI(`ANTHROPIC_BASE_URL`)도 기본값을 Gateway로 설정. 플랫폼 전체 AI 비용을 단일 대시보드에서 본다. 현재(Phase 6 MVP)는 내부 에이전트가 Gemini 직접 호출 중.
 
-### 20.6 구현 상태
-- MVP 시점: **Gateway 실체 없음**. `AX_AI_TOKEN`은 `axt_stub_*` 더미 (§19.2). 생성 앱이 실제 LLM 호출을 하려면 현재는 직접 provider 키를 env에 넣어야 하지만, provider-key 가드(§19.1)가 이를 차단하므로 **MVP 단계에선 LLM 기반 앱이 실제로 작동하지 않는다**. 의도된 트레이드오프: 플랫폼 계약을 먼저 확정하고, Gateway 구현은 별도 마일스톤으로 분리.
-- 다음 마일스톤: OpenAI 호환 + 토큰 발급 + 사용량 로깅 MVP → orchestrator admin API 연동 → stub 제거.
+### 20.6 `agent-model-mcp` backend 통합 (Phase 6.1)
+리포의 slot 개념(`fast`/`orchestrator`/`deep`/`code`/`longtext`)을 Gateway 논리 이름과 매핑. Gateway 요청의 `model` 필드를 slot으로 해석해 `model_ask` MCP 툴로 디스패치. 로컬 Mac Studio(Ollama) 도입 시 `LOCAL=true` 한 줄로 전체 전환.
+
+### 20.7 장애·레이턴시
+- Gateway `/healthz` 주기 ping (Phase 6.1). 실패 시 "AI 기능 일시 중단" 배너.
+- 생성 앱 SDK 래퍼에 mock-first fallback(ADR 0005) 포함 — Gateway 5xx 시 mock 응답으로 graceful degradation.
+- 같은 호스트(Docker Desktop mac)에서 `host.docker.internal:4000` 통신 — 수 ms. LLM upstream이 외부 의존이라 추가 단일 장애점의 체감 증가는 제한적.
+
+### 20.8 구현 상태
+- ✅ Phase 6 MVP 완료 (PR #5 `feat/ai-gateway-mvp`) — orchestrator 내장 `/api/ai/v1/*`, 토큰 발급·해시 인증·Gemini forward 작동, 라이어 게임 E2E 검증.
+- ⏳ Phase 6.1 — 내부 에이전트 통합, 사용량 로깅, 예산 cap, passthrough, agent-model-mcp backend, 대시보드 카드.

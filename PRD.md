@@ -38,7 +38,7 @@
 | Planning Agent | Python FastAPI + 자체 LLM 추상화 레이어 | 스트리밍 대화, OpenAI 호환 API, 로컬 모델 전환성 확보 |
 | LLM (Planning) | Gemini 3 Flash (gemini-3-flash-preview) | 빠른 응답, 저비용; `.env` slot 매핑으로 로컬 모델 전환 가능 |
 | Building Agent | Python subprocess + Hermes(Gemini) + Claude Code CLI | PHASES.md 동적 생성, phase별 격리 실행, 최고 품질의 코드 생성 |
-| **AI Gateway** | **agent-model-mcp (OpenAI-호환 HTTP + MCP)** | **플랫폼·생성 앱·에이전트의 모든 LLM 호출 단일 경유. 비용·사용 통제, 키 일원화, 모델 교체 투명성 (§9.0)** |
+| **AI Gateway** | **orchestrator 내장 `/api/ai/v1/*` (MVP) / Phase 6.1에서 agent-model-mcp backend 통합** | **플랫폼·생성 앱·에이전트의 모든 LLM 호출 단일 경유. 비용·사용 통제, 키 일원화, 모델 교체 투명성 (§9.0·§18)** |
 | 컨테이너 격리 | Docker | 프로젝트별 격리, 포트 관리 |
 | 리버스 프록시 | Nginx | 포트 라우팅, 도메인 매핑 |
 
@@ -62,10 +62,10 @@
        ▼                  ▼                  ▼
 ┌───────────────┐ ┌───────────────┐ ┌──────────────────────────┐
 │ Planning Agent│ │ Building Agent│ │ AI Gateway               │
-│  (FastAPI)    │ │  (Python)     │ │ (agent-model-mcp)        │
-│ - 대화 스트림 │ │ - PHASES 생성 │ │ - OpenAI-호환 HTTP + MCP │
-│ - PRD/DESIGN  │ │ - Claude Code │ │ - 프로젝트 토큰 auth     │
-│ - handoff     │ │ - QA·bounce   │ │ - 예산·rate·모델 라우팅  │
+│  (FastAPI)    │ │  (Python)     │ │ orchestrator 내장 (MVP)   │
+│ - 대화 스트림 │ │ - PHASES 생성 │ │ /api/ai/v1/* (OpenAI호환) │
+│ - PRD/DESIGN  │ │ - Claude Code │ │ - 프로젝트 토큰 Bearer    │
+│ - handoff     │ │ - QA·bounce   │ │ - Gemini upstream forward │
 └──────┬────────┘ └──────┬────────┘ └─────────▲────────────────┘
        │                 │                    │
        │ LLM 호출        │ LLM 호출           │ LLM 호출 (배포 앱)
@@ -160,6 +160,10 @@ CREATE TABLE projects (
   -- 3회 도달 시 schema_bug로 에스컬레이트 → Planning bounce.
   -- 성공 배포 시 0 리셋.
   env_attempts INTEGER DEFAULT 0,
+  -- ADR 0003 / Phase 6: AI Gateway 프로젝트 토큰의 SHA-256 hex 해시.
+  -- 평문 토큰은 project_env_vars.AX_AI_TOKEN(system-injected)에 AES-GCM
+  -- 암호화 저장. 이 해시는 Gateway Bearer 인증 O(1) 역조회용. NULL=토큰 없음.
+  ai_token_hash TEXT DEFAULT NULL,
   locked_until TEXT DEFAULT NULL,
   lock_reason TEXT DEFAULT NULL,
   created_at TEXT DEFAULT (datetime('now')),
@@ -509,6 +513,17 @@ POST   /api/projects/:id/env/rollback  → (미구현, 501)
 ```
 
 owner/editor만 호출 가능. 재시작은 owner만(§5.2). 실제 값은 AES-256-GCM 암호화 저장 (§4.13).
+
+### 5.8 AI Gateway (§18 참조)
+
+생성된 앱 컨테이너에서 LLM 호출에 사용하는 엔드포인트. JWT 인증이 아닌 **프로젝트 토큰 Bearer 인증**을 사용한다.
+
+```
+POST /api/ai/v1/chat/completions   → OpenAI-호환, SSE 스트리밍 지원 (§18.1)
+POST /api/ai/v1/models             → 토큰 유효성 + 가용 논리 모델 목록
+```
+
+`Authorization: Bearer axt_*` 헤더 필수. 토큰이 유효하지 않으면 401 `{"message":"토큰이 존재하지 않거나 폐기됨"}`.
 
 ---
 
@@ -1331,17 +1346,21 @@ PLANNING_AGENT_PORT=8000
 PROJECT_PORT_RANGE_START=3000
 PROJECT_PORT_RANGE_END=3999
 
-# AI Gateway (agent-model-mcp, §9.0)
-# 플랫폼 내부 / 생성 앱들이 모든 LLM 호출을 경유하는 단일 엔드포인트.
-# 원본 provider 키(Anthropic/OpenAI/Gemini)는 Gateway 서버에만 보관.
-AI_GATEWAY_BASE_URL=http://localhost:4200/v1
-AI_GATEWAY_ADMIN_TOKEN=axg_admin_...           # 프로젝트 토큰 발급용 관리자 토큰
-AI_GATEWAY_MCP_URL=http://localhost:4200/mcp   # MCP 엔드포인트 (에이전트용)
+# AI Gateway (§9.0 / §18 / ADR 0003 — Phase 6 MVP)
+# MVP는 orchestrator 내장 (별도 프로세스 없음).
+# 생성 앱 컨테이너의 AX_AI_BASE_URL에 주입될 값.
+AI_GATEWAY_BASE_URL=http://host.docker.internal:4000/api/ai/v1
+# Gateway가 upstream으로 호출할 OpenAI-호환 엔드포인트. 기본 Gemini.
+AI_GATEWAY_UPSTREAM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+# 업스트림에 전달할 API 키. 미설정 시 GEMINI_API_KEY로 폴백.
+# AI_GATEWAY_UPSTREAM_API_KEY=
 
-# AI Gateway가 뒷단에서 사용할 provider 키 (운영자 전용, 생성 앱에 유출되지 않음)
-GATEWAY_ANTHROPIC_API_KEY=
-GATEWAY_OPENAI_API_KEY=
-GATEWAY_GEMINI_API_KEY=
+# provider 키 (운영자 전용, 생성 앱에는 주입되지 않음)
+GEMINI_API_KEY=
+# Phase 6.1 추가 예정:
+# ANTHROPIC_API_KEY=
+# OPENAI_API_KEY=
+# AI_GATEWAY_ADMIN_TOKEN=axg_admin_...   # 관리자 API용
 ```
 
 ---
@@ -1350,14 +1369,16 @@ GATEWAY_GEMINI_API_KEY=
 
 > **현재 구현 상태 스냅샷 (2026-04-19)**
 >
-> Phase 1~4 일차 완료 상태에서 다음 네 갈래가 추가 반영됐다(브랜치 `docs/ai-gateway-and-failure-handling`, PR #4):
+> Phase 1~4 + Phase 5(PR #4 머지) + Phase 6 MVP(PR #5 `feat/ai-gateway-mvp`)까지 반영:
 >
 > - ✅ **ADR 0001** 관찰 기반 QA — `qa_supervisor.py` 실제 구현 + 검증됨
-> - ✅ **ADR 0004** env 3-tier 분류 — 파서/암호화/CRUD/컨테이너 주입, `/api/projects/:id/env` 엔드포인트, 프론트 EnvInput 페이지까지
-> - ✅ **ADR 0002** FailureClassifier — regex 룰 기반 1차 분류, env_qa 실패 라우팅, env_attempts 카운터, 프론트 FailureBanner. LLM judge 2차는 TODO.
-> - ⏳ **ADR 0003** AI Gateway — 계약만 확정. `AX_AI_TOKEN`은 `axt_stub_*` 더미. 실체(`agent-model-mcp`) 구현은 별도 마일스톤.
+> - ✅ **ADR 0002** FailureClassifier — regex 룰 1차 분류, env_qa 실패 라우팅, env_attempts 카운터, 프론트 FailureBanner. LLM judge 2차는 Phase 6.1 예정.
+> - ✅ **ADR 0003** AI Gateway **MVP** — orchestrator 내장 `/api/ai/v1/*` (OpenAI-호환 chat/completions + SSE). 실제 토큰 발급·해시 인증·upstream Gemini forwarding 작동. E2E 검증(라이어 게임) 완료. `agent-model-mcp` slot-routing 통합은 Phase 6.1.
+> - ✅ **ADR 0004** env 3-tier 분류 — 파서/암호화/CRUD/컨테이너 주입, `/api/projects/:id/env` 엔드포인트, 프론트 EnvInput
+> - ✅ **ADR 0005** mock-first env 전략 — env 의존 모듈 mock/real 분기 의무화, 빌드 완료 시 env 유무와 무관하게 deployed
+> - ✅ **ADR 0006** env 유지보수 UI + 재시작 + 밸리데이션 — 2-모드 EnvInput, `POST /restart`, `.env.example` 메타라인 기반 검증
 >
-> → MVP 시점에 LLM을 요구하는 생성 앱은 실제 작동하지 않음 (provider-key 가드가 유저 직접 입력을 막고, Gateway도 아직 없음). 플랫폼 계약을 먼저 확정하려는 의도된 트레이드오프.
+> → LLM을 요구하는 생성 앱이 **실제로 작동**. Phase 6 이전까지는 provider-key 가드 + stub 토큰 조합으로 LLM 호출 불가였지만 이제는 orchestrator Gateway가 실제 응답을 내려준다.
 
 ### Phase 1: 코어 (1주)
 1. NestJS orchestrator 프로젝트 생성 + SQLite(better-sqlite3) 연결 + 스키마 정의
@@ -1393,13 +1414,29 @@ GATEWAY_GEMINI_API_KEY=
 23. FailureClassifier regex 1차 + env_attempts 카운터 + 프론트 FailureBanner — ADR 0002
 24. AI Gateway 계약 확정 (PRD §18·ADR 0003) + system-injected 스텁 — **실체 구현은 Phase 6**
 
-### Phase 6: AI Gateway 실체 + QA 심화 (예정)
-25. `agent-model-mcp` MVP — OpenAI 호환 `/v1/chat/completions` SSE + 토큰 admin API
-26. orchestrator가 빌드 완료 시 실제 `AX_AI_TOKEN` 발급 (stub 제거)
-27. Planning / Hermes / Claude Code를 Gateway 경유로 전환
-28. 프로젝트별 사용량 대시보드 카드 (DESIGN.md §5.2)
-29. FailureClassifier LLM judge 2차 (`qa_judge` 슬롯)
-30. 기능 단위 QA — `npm install + health`를 넘어 주요 엔드포인트 curl 검증
+### Phase 6 MVP: AI Gateway 실체 (PR #5 `feat/ai-gateway-mvp`) ✅
+25. orchestrator 내장 `/api/ai/v1/*` — OpenAI 호환 chat/completions + SSE 스트리밍
+26. `POST /models` 논리 이름(default/cheap/reasoning/fast) 응답 + 토큰 검증
+27. `projects.ai_token_hash` 컬럼 + SHA-256 해시 기반 Bearer 인증
+28. `envs.service` `syncFromExample`에서 `aiGateway.ensureToken()` idempotent 호출로 stub 제거
+29. `env-deploy.restartOnly`가 `.env` 재기록 후 재시작 — DB→파일 동기 보장
+30. `AI_GATEWAY_BASE_URL` 기본값 `http://host.docker.internal:4000/api/ai/v1` (Docker Desktop)
+31. Gemini OpenAI-compat upstream (`generativelanguage.googleapis.com/v1beta/openai`)
+32. E2E 검증: 컨테이너 → Gateway → Gemini → 200 + 실제 응답
+
+### Phase 6.1: 내부 에이전트 통합 + 운영성 (예정)
+33. **Planning / Hermes / Claude Code CLI의 Gateway 경유 전환**
+    - Planning Agent `openai_compat` 백엔드 기본값을 Gateway로 (`/api/ai/v1`)
+    - Hermes `building-agent/llm.py`도 동일 경유
+    - Claude Code CLI는 `ANTHROPIC_BASE_URL`로 Gateway(Anthropic passthrough 포함)
+    - 플랫폼 전체 LLM 트래픽을 단일 감사 라인으로 통합
+34. **사용량·비용 로깅** — 호출마다 `ai_usage_logs` 행 기록 (project_id, model, tokens, cost_est, timestamp)
+35. **프로젝트 단위 예산 cap** — 일일/월 한도 초과 시 429 + 저렴 모델 자동 폴백(opt-in)
+36. **관리자 대시보드 카드** (DESIGN.md §5.2) — 이번 달 요청수·토큰·예상 비용
+37. **Anthropic / OpenAI passthrough 엔드포인트** — `/api/ai/v1/anthropic/messages` 등, tool use/thinking/caching 원본 포맷 중계
+38. **`agent-model-mcp` slot-routing backend 통합** — Gateway의 `model: "fast|deep|code|..."` 논리 이름을 MCP stdio의 slot dispatch로 매핑 (로컬 Mac Studio 도입 시 모델 전환 투명화)
+39. **FailureClassifier LLM judge 2차** (`qa_judge` 슬롯) — regex 미매칭 로그를 LLM이 분류
+40. **기능 단위 QA** — `npm install + health`를 넘어 생성 앱의 주요 엔드포인트 curl 검증 (PRD에 정의한 핵심 유저 플로우별)
 
 ---
 
@@ -1449,61 +1486,72 @@ python building-agent/orchestrator.py --health-check
 
 ---
 
-## 18. AI Gateway API 스펙 (agent-model-mcp)
+## 18. AI Gateway API 스펙
 
-§9.0에 정의한 게이트웨이의 인터페이스 계약. 리포: `github.com/kei781/agent-model-mcp`.
+§9.0에 정의한 게이트웨이의 인터페이스 계약. **MVP는 orchestrator 내장**(`orchestrator/src/ai-gateway/`) — 별도 `agent-model-mcp` 프로세스는 Phase 6.1에서 backend 통합 고려.
 
-### 18.1 OpenAI-호환 HTTP
+### 18.1 MVP — OpenAI 호환 HTTP (현재 구현)
 
-**베이스 URL**: `{AI_GATEWAY_BASE_URL}` (기본 `/v1`)  
-**인증**: `Authorization: Bearer {AX_AI_TOKEN}`
+**베이스 URL**: `{AI_GATEWAY_BASE_URL}` (기본 `http://host.docker.internal:4000/api/ai/v1`)
+**인증**: `Authorization: Bearer {AX_AI_TOKEN}` — 프로젝트당 1개, `axt_<48hex>` 형태
+
+| 메소드 | 경로 | 상태 |
+|---|---|---|
+| POST | `/chat/completions` | ✅ OpenAI-호환 body 통과. `stream: true` 시 SSE pass-through. |
+| POST | `/models` | ✅ 토큰 유효성 + 논리 모델 이름 리스트 (현재 `default`/`cheap`/`reasoning`/`fast`) |
+| POST | `/embeddings` | ⏳ Phase 6.1 |
+| POST | `/anthropic/messages` (passthrough) | ⏳ Phase 6.1 |
+| POST | `/gemini/{model}:generateContent` (passthrough) | ⏳ Phase 6.1 |
+
+**모델 이름 매핑** (MVP, 전부 Gemini OpenAI-compat)
+| 논리 이름 | 실제 모델 |
+|---|---|
+| `default` / `cheap` / `fast` | `gemini-2.5-flash` |
+| `reasoning` | `gemini-2.5-pro` |
+
+모르는 이름은 그대로 upstream으로 전달 (실제 모델명 직접 지정도 허용).
+
+**인증 실패 응답**
+```json
+{"message": "토큰이 존재하지 않거나 폐기됨", "error": "Unauthorized", "statusCode": 401}
+```
+
+**구현 위치**
+- `orchestrator/src/ai-gateway/ai-gateway.controller.ts`
+- `orchestrator/src/ai-gateway/ai-gateway.service.ts` — `mintToken` / `resolveToken` / `forwardChatCompletion` / `normalizeModel`
+- 토큰 저장: 평문은 `project_env_vars.AX_AI_TOKEN`(AES-256-GCM), 해시는 `projects.ai_token_hash`(SHA-256)
+
+### 18.2 Phase 6.1 확장 (예정)
+
+#### 18.2.1 추가 엔드포인트
 
 | 메소드 | 경로 | 용도 |
 |---|---|---|
-| POST | `/v1/chat/completions` | 표준 chat completion. `stream: true` 시 SSE. |
-| POST | `/v1/embeddings` | 임베딩 |
-| GET  | `/v1/models` | 이 토큰이 접근 가능한 논리 모델 이름 목록 |
+| POST | `/embeddings` | OpenAI-compat 임베딩 |
+| POST | `/anthropic/messages` | Anthropic Messages API 원본 (tool use, thinking, caching) |
+| POST | `/gemini/{model}:generateContent` | Gemini 원본 |
 
-**모델 지정**: 논리 이름(`default`, `cheap`, `reasoning`, `vision`) 또는 공급자 직접 지정(`anthropic:claude-haiku-4-5`). 토큰 스코프를 벗어난 모델 지정은 403.
-
-**passthrough** (뒷단 원본 포맷):
-- POST `/v1/anthropic/messages` — Anthropic Messages API 원본 (tool use, thinking, caching 지원)
-- POST `/v1/gemini/{model}:generateContent` — Gemini 원본
-
-### 18.2 MCP 인터페이스
-
-**URL**: `{AI_GATEWAY_MCP_URL}` (Streamable HTTP)  
-**인증**: MCP 초기화 시 bearer header.
-
-**노출 툴**
-
-| 툴 | 인자 | 반환 |
-|---|---|---|
-| `generate` | `model, prompt, max_tokens, temperature` | text |
-| `complete_stream` | `model, messages, tools` | streaming chunks (assistant + tool calls) |
-| `embed` | `model, texts[]` | float[][] |
-| `list_models` | — | 토큰 가용 모델 리스트 |
-| `usage_today` | — | 이 토큰의 오늘 호출 수·토큰·예상 비용 |
-
-### 18.3 관리 API (admin 전용)
-
-`Authorization: Bearer {AI_GATEWAY_ADMIN_TOKEN}`.
+#### 18.2.2 관리 API (admin 토큰)
 
 | 메소드 | 경로 | 용도 |
 |---|---|---|
-| POST | `/admin/tokens` | 프로젝트 토큰 발급 `{project_id, daily_limit, monthly_limit, allowed_models[]}` |
-| DELETE | `/admin/tokens/:token_id` | 토큰 폐기 |
-| GET | `/admin/usage?project_id=` | 프로젝트 사용량 조회 |
-| POST | `/admin/models` | 논리 이름 ↔ 실제 모델 매핑 추가/변경 |
+| POST | `/admin/tokens` | `{project_id, daily_limit, monthly_limit, allowed_models[]}`로 토큰 수동 발급 |
+| DELETE | `/admin/tokens/:project_id` | 토큰 revoke (`ai_token_hash`를 NULL로) |
+| GET | `/admin/usage?project_id=&from=&to=` | 프로젝트 사용량 조회 |
+| POST | `/admin/models` | 논리 이름 ↔ 실제 모델 매핑 갱신 |
 
-### 18.4 요금·속도 제한
+#### 18.2.3 요금·속도 제한
 
 - 403: 모델이 토큰 스코프 밖
 - 429: `daily_limit` / `monthly_limit` / RPS 초과. 응답 본문에 `retry_after_seconds` 포함.
-- 토큰별 RPS 기본 20, 설정 변경 가능.
+- 토큰별 RPS 기본 20.
 
-### 18.5 장애 대응
+#### 18.2.4 `agent-model-mcp` backend 통합
 
-- 게이트웨이 `/healthz` 주기 ping을 orchestrator가 수행. 실패 시 "AI 기능 일시 중단" 배너 활성화.
-- 생성 앱 SDK 래퍼 예시 스니펫을 Claude Code 프롬프트에 포함 — 타임아웃·재시도·graceful degradation 패턴.
+Gateway의 `model: "fast|orchestrator|deep|code|longtext"` 논리 이름을 MCP stdio의 `model_ask` 도구로 디스패치. `agent-model-mcp` 리포의 slot 라우팅(OpenRouter ↔ Ollama 전환)을 그대로 활용. 로컬 Mac Studio 도입 시 클라우드→로컬 전환 투명화.
+
+### 18.3 장애 대응
+
+- 게이트웨이 `/healthz` 주기 ping (Phase 6.1 추가 예정). 실패 시 프론트 "AI 기능 일시 중단" 배너.
+- 생성 앱 SDK 래퍼 예시 스니펫(mock-first fallback 포함)을 Claude Code 프롬프트에 주입 — ADR 0005 참조.
 
