@@ -34,9 +34,8 @@ class PhaseResult:
     error: str | None = None
 
 
-PHASE_PROMPT_TEMPLATE = """당신은 이 프로젝트의 "{name}" phase를 구현해야 합니다.
-
-## 작업 디렉토리
+# Static section (no format placeholders — contains JS/regex braces freely).
+PHASE_STATIC_RULES = """## 작업 디렉토리
 현재 cwd가 프로젝트 루트입니다. 모든 파일 경로는 cwd 기준 상대 경로로.
 
 ## 기술 스택 (절대 고정)
@@ -76,7 +75,7 @@ async function chat(prompt) {
     return res.choices[0].message.content;
   }
   // mock: 결정적 더미 응답
-  return `⚠ mock 응답입니다. 환경 설정 후 실제 LLM 호출로 전환됩니다.\n\n입력: "${prompt.slice(0, 80)}"\n응답: (여기에 실제 답변이 들어옵니다)`;
+  return `⚠ mock 응답입니다. 환경 설정 후 실제 LLM 호출로 전환됩니다.\\n\\n입력: "${prompt.slice(0, 80)}"`;
 }
 
 module.exports = { chat };
@@ -123,7 +122,15 @@ module.exports = { createCharge };
 # 길이: 32-128
 STRIPE_SECRET_KEY=
 ```
+"""
 
+# Dynamic header/footer with format placeholders. Joined with PHASE_STATIC_RULES
+# at compose time so JS/regex braces in the rules don't clash with `.format()`.
+PHASE_HEADER_TEMPLATE = """당신은 이 프로젝트의 "{name}" phase를 구현해야 합니다.
+
+"""
+
+PHASE_FOOTER_TEMPLATE = """
 ## PRD.md (이 프로젝트의 SSoT)
 ```
 {prd}
@@ -174,7 +181,10 @@ def _compose_prompt(
     else:
         previous_summary = "(첫 phase입니다)"
 
-    return PHASE_PROMPT_TEMPLATE.format(
+    # Header/footer use .format() for dynamic substitution; the static rules
+    # block is inserted verbatim so JS/regex braces don't trip the formatter.
+    header = PHASE_HEADER_TEMPLATE.format(name=phase.name)
+    footer = PHASE_FOOTER_TEMPLATE.format(
         name=phase.name,
         description=phase.description,
         deliverables=", ".join(phase.deliverables) or "(명시되지 않음)",
@@ -183,6 +193,7 @@ def _compose_prompt(
         phases_summary=phases_summary,
         previous_summary=previous_summary,
     )
+    return header + PHASE_STATIC_RULES + footer
 
 
 def run_phase(
