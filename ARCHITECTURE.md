@@ -219,6 +219,54 @@ NestJS ──spawn──> orchestrator.py (Hermes, Python)
 
 유저는 비개발자를 기본 가정한다.
 
+### 6.5 핸드오프 실행 프로세스 (planning → plan_ready)
+
+```
+[유저: 채팅 중 또는 "AI에게 핸드오프 요청" 버튼 클릭]
+        │
+        ▼
+[프론트(Chat.tsx)]
+  · 조건: project.state !== 'plan_ready' && readiness.can_build === true
+  · 자동 메시지 전송: "기획이 충분히 정리됐습니다. propose_handoff
+    도구를 호출해서 다음 단계(Building)로 이관을 제안해주세요."
+        │
+        ▼
+[Orchestrator → Planning Agent WS]
+        │
+        ▼
+[Planning Agent (Gemini tool-calling loop)]
+  ├── (가드) write_prd 호출돼서 PRD.md 최신인지 확인
+  ├── (선택) evaluate_readiness로 스코어 검증
+  └── propose_handoff 호출 ← **이게 진짜 전이 트리거**
+        │
+        ▼
+[propose_handoff.py]
+  1. 검증: completeness 5개 모두 ≥ 0.6, unresolved_questions 비어있음
+  2. INSERT handoffs 행 (handoff_id 발급)
+  3. accepted && current_state == 'planning' 일 때:
+     UPDATE projects SET state='plan_ready' WHERE id=? AND state='planning'
+  4. 반환: { ok, accepted, transitioned_to_plan_ready, handoff_id, ... }
+        │
+        ▼
+[Orchestrator (ChatService.handleAgentEvent)]
+  · tool_result 수신 → transitioned_to_plan_ready===true면
+    WS 이벤트 `progress(phase='plan_ready', detail='빌드 준비 완료')` 방출
+        │
+        ▼
+[프론트(Chat.tsx)]
+  · handoffBanner 표시 + project refetch → state='plan_ready'
+  · "AI에게 핸드오프 요청" 버튼이 "빌드 시작"으로 바뀜
+```
+
+### 6.6 잘 알려진 실패 모드와 대응
+
+| 증상 | 원인 | 대응 |
+|---|---|---|
+| UI 배너 사라지지 않음 / "이관 완료" 텍스트 후에도 state=planning 유지 | **AI가 propose_handoff를 실제로 호출하지 않고 텍스트로만 "완료"라고 환각** (evaluate_readiness 스코어와 이전 handoff 기억을 섞어버림) | ① 시스템 프롬프트에 "텍스트로 '이관 완료' 선언 금지, 반드시 propose_handoff 호출 후 결과만 보고" 명시 (§3 system_prompt.py). ② 프론트: tool_result에서 propose_handoff `transitioned_to_plan_ready` 플래그가 10초 내 도착하지 않으면 "AI가 도구를 호출하지 않은 것 같아요. 다시 요청해주세요" 토스트. |
+| bounce-back 후 handoff 배너가 그대로 있음 | 이전 handoff 행은 DB에 남아있고 `can_build`는 그 행을 그대로 읽기 때문 | 기대 동작. state=`planning`이 되돌아갔으므로 유저가 다시 "핸드오프 요청" → Planning Agent가 **새 propose_handoff 호출** → 새 handoff 행 삽입 + state 전이. (기존 행을 invalidate하지는 않음 — 이력 보존) |
+| propose_handoff가 `accepted=false`로 반환 | completeness 중 하나가 0.6 미만, 또는 `unresolved_questions`가 비어있지 않음 | Planning Agent가 계속 대화로 보강. 반환값의 `reason` 필드를 프론트에 "핸드오프 보류" 배너로 노출. |
+| UPDATE rowcount=0 (state가 이미 plan_ready) | 동시 두 번 호출 등의 레이스 | tool은 무해하게 `transitioned_to_plan_ready: false` 반환. 프론트는 state API refetch로 정합. |
+
 ---
 
 ## 7. 프로젝트 상태 머신
