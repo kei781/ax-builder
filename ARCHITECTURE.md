@@ -269,24 +269,32 @@ NestJS ──spawn──> orchestrator.py (Hermes, Python)
 
 ---
 
-## 7. 프로젝트 상태 머신
+## 7. 프로젝트 상태 머신 (ADR 0005 mock-first)
 
 ### 7.1 상태 목록
 ```
-draft → planning → plan_ready → building → qa ──┬→ awaiting_env → env_qa ─┬→ deployed
-   ↑                   ↑            │           │                          │
-   │                   │            │           └─── (env 없음, 바로) ─────┘
-   │                   │            │                                      │
-   │                   │            │   ┌── env_rejected (유저 재입력, 최대 3회) ─┐
-   │                   │            │   │                                        │
-   │                   │            │   └→ awaiting_env ←──────────────────────── ┘
-   │                   │            │
-   │                   └─── bounce-back (phase 실패 / code_bug / schema_bug)
-   │
-   └─── (deployed → modifying: 수정 요청, 새 세션)
+draft → planning → plan_ready → building → qa → deployed ←──────┐
+          ↑                                      ↕ self-loop     │
+          │                                   (저장만, 재시작 無)  │
+          │                                      ▼                │
+          │                                   env_qa              │
+          │                                      │                │
+          │                               ┌──────┼──────────┐     │
+          │                             success / transient /     │
+          │                             env_rejected               │
+          │                                      │ (모두 deployed 유지)│
+          │                                      ▼                 │
+          │                                 code_bug / schema_bug  │
+          │                                      │                 │
+          │                                      ▼                 │
+          │                               modifying / planning     │
+          │                                                        │
+          └──── phase 실행 실패(구조 버그) ──────── planning bounce ┘
 ```
 
-실패 분기는 전부 FailureClassifier(§11.2, ADR 0002)가 판정한다. `transient`은 재시도, 그 외는 classifier kind에 따라 전이.
+**핵심(ADR 0005)**: 빌드는 **env 없이도 mock 상태로 `deployed`까지 직행**한다. env 입력/수정/재시작은 전부 **배포 후 유지보수 액션**이며, 실패해도 현 배포를 유지하는 방향으로 안전하게 롤백된다.
+
+실패 분기는 전부 FailureClassifier(§11.2, ADR 0002)가 판정한다.
 
 | 상태 | 의미 |
 |---|---|
@@ -294,27 +302,29 @@ draft → planning → plan_ready → building → qa ──┬→ awaiting_env 
 | `planning` | Planning Agent와 대화 중 (신규 또는 bounce-back 수신) |
 | `plan_ready` | Planning 완료 제안, 유저의 "빌드 시작" 대기 |
 | `building` | Building Agent 실행 중 (phase 진행) |
-| `qa` | 관찰 기반 QA 진행 중 (ADR 0001) |
-| `awaiting_env` | QA 통과, `.env.example`에 user-required 변수 존재 → 유저 입력 대기 |
-| `env_qa` | 유저가 env 입력 후 컨테이너 재기동·health 검증 중 |
-| `deployed` | 컨테이너 기동 완료, 접속 가능 |
-| `failed` | 해결 불가 (H1 lock / 반복 실패 후 에스컬레이션) |
-| `modifying` | deployed 이후 수정 요청으로 새 세션 진입 |
+| `qa` | 관찰 기반 QA 진행 중 (ADR 0001) — **mock 상태로 구조 검증** |
+| `awaiting_env` | (레거시) 초기 ADR 0004 플로우의 블로킹 입력 대기. ADR 0005 적용 후엔 기본 흐름에서 나타나지 않음. |
+| `env_qa` | "저장 후 재시작" 또는 `/restart` 직후 헬스체크 진행 |
+| `deployed` | 컨테이너 기동 완료, 접속 가능. env 유무와 무관 — mock 또는 real |
+| `modifying` | deployed 이후 수정 요청(새 세션) — env_qa의 code_bug 결과도 여기로 |
+| `failed` | 해결 불가 (H1 lock / 극단 케이스) |
 
 ### 7.2 전환 트리거
 | 전환 | 트리거 |
 |---|---|
 | `draft → planning` | 유저 첫 메시지 입력 |
-| `planning → plan_ready` | Planning Agent의 completeness 자체 평가 + 유저 UI 확인 |
+| `planning → plan_ready` | Planning Agent `propose_handoff` + 유저 UI 확인 |
 | `plan_ready → building` | **유저가 "빌드 시작" 버튼 클릭** |
 | `building → qa` | 모든 phase 성공 |
-| `qa → awaiting_env` | 관찰 QA 통과 + `.env.example`에 user-required 있음 |
-| `qa → env_qa` | 관찰 QA 통과 + user-required 없음 (system-injected만으로 바로 배포) |
-| `awaiting_env → env_qa` | 유저가 env 값 제출 |
-| `env_qa → deployed` | 컨테이너 health 검증 통과 |
-| `env_qa → awaiting_env` | classifier = `env_rejected` + env_attempts < 3, 또는 `transient` |
-| `env_qa → planning` | classifier = `code_bug` / `schema_bug` / `unknown`, 또는 env_attempts ≥ 3 |
+| `qa → deployed` | 관찰 QA 통과 (mock-first — env 유무 무관) |
+| `deployed → deployed` | env 저장(재시작 없음) — DB만 업데이트 |
+| `deployed → env_qa` | "저장 후 재시작" 또는 `POST /restart` |
+| `env_qa → deployed` | 헬스체크 통과, 또는 `transient`/`env_rejected` 판정 (**현 배포 유지**하는 방향) |
+| `env_qa → modifying` | classifier = `code_bug` — 통합 로직 버그, 채팅 수정 |
+| `env_qa → planning` | classifier = `schema_bug` (극단) |
 | `deployed → modifying` | 유저 수정 요청 (새 세션 생성) |
+| `qa / building → planning` | phase 실행 실패 (구조 bounce-back) |
+| `awaiting_env → env_qa` | (레거시) 초기 설정 모드에서 유저 제출 시 |
 
 ### 7.3 되감기
 - `plan_ready` 상태는 중간 경유지. `building`에서 실패하면 `plan_ready`가 아니라 **`planning`으로 되돌린다** — "제작 가능"이라는 판단이 틀렸다는 의미이므로.
@@ -426,15 +436,17 @@ draft → planning → plan_ready → building → qa ──┬→ awaiting_env 
 - 부분 성공도 "문서 부족"으로 간주. 동일 정책.
 - 구조화된 gap 리스트를 Planning에 전달.
 
-**QA / env_qa 단계 실패 → classifier 4분류**
+**QA / env_qa 단계 실패 → classifier 4분류 (ADR 0005 반영)**
 
-| kind | 시그니처 예 | 전이 | 카운터 |
+| kind | 시그니처 예 | 전이 (env_qa 시점) | 카운터 |
 |---|---|---|---|
-| `env_rejected` | 401/403, Unauthorized, Invalid API key | `awaiting_env` (재입력) | `env_attempts++`; ≥3이면 `schema_bug`로 에스컬레이트 → Planning |
-| `transient` | ECONNREFUSED/ETIMEDOUT/ENOTFOUND, 502/503 | `awaiting_env` + "다시 시도" 버튼 | 비카운트 |
-| `code_bug` | SyntaxError/TypeError/MODULE_NOT_FOUND | Planning 반송 | — |
-| `schema_bug` | env 반복 거부 3회 | Planning 반송 (변수 이력 첨부) | env_attempts 리셋 |
-| `unknown` | 위 규칙 미매칭 | `code_bug`로 폴백 (Planning 반송) | — |
+| `env_rejected` | 401/403, Unauthorized, Invalid API key | **`deployed` 유지 + 에러 토스트** (롤백 = 이전 컨테이너 살아있음) | `env_attempts++`; ≥3이면 `schema_bug`로 에스컬레이트 |
+| `transient` | ECONNREFUSED/ETIMEDOUT/ENOTFOUND, 502/503 | **`deployed` 유지 + "잠시 뒤 다시 시도"** 토스트 | 비카운트 |
+| `code_bug` | SyntaxError/TypeError/MODULE_NOT_FOUND | `modifying` (대화로 수정) | — |
+| `schema_bug` | env 반복 거부 3회 | `planning` (기획 재검토, 극단 케이스) | env_attempts 리셋 |
+| `unknown` | 위 규칙 미매칭 | `code_bug`로 폴백 → `modifying` | — |
+
+**중요한 차이**: ADR 0005 이전엔 실패 시 `awaiting_env`로 **되돌아가는 블로킹** 동작이었지만, mock-first에선 이전 배포가 이미 돌고 있으므로 **`deployed` 유지가 기본**. 유저는 토스트로 원인을 보고 값을 다시 입력하거나 대화로 수정한다.
 
 구현은 1차 regex 룰 + (TODO) 2차 `qa_judge` LLM. 상세 규칙은 `orchestrator/src/envs/failure-classifier.service.ts` 및 ADR 0002 참조.
 
@@ -678,11 +690,11 @@ draft → planning → plan_ready → building → qa ──┬→ awaiting_env 
 
 ---
 
-## 19. 환경 변수 lifecycle
+## 19. 환경 변수 lifecycle (mock-first, ADR 0005 + 0006)
 
-PRD §9 / ADR 0004의 런타임 계약.
+PRD §9 / ADR 0004 / 0005 / 0006 의 런타임 계약.
 
-### 19.1 흐름 요약
+### 19.1 배포 플로우 (env를 선행 조건이 아닌 점진적 향상으로)
 
 ```
 [빌드 완료 (code 0)]
@@ -691,28 +703,53 @@ PRD §9 / ADR 0004의 런타임 계약.
 [orchestrator: EnvsService.syncFromExample(projectId)]
       │  ├── .env.example 파싱 (env-parser.ts)
       │  ├── provider-key 가드 (ANTHROPIC/OPENAI/GEMINI 등 user-tier 노출 금지)
-      │  └── project_env_vars upsert, 기존값 보존
+      │  ├── mock/real 분기문 존재 여부 grep (ADR 0005) — 없으면 bounce-back
+      │  └── project_env_vars upsert (기존 값 보존) +
+      │      system-injected 값 주입 (AX_AI_* 등)
       │
       ▼
-[EnvsService.hasUserRequired?]
-      ├── 있음 → 상태 `awaiting_env`로 전이, 프론트 EnvInput 화면 진입
-      │            │
-      │            ▼
-      │      [유저 PUT /env → AES-256-GCM 암호화 저장 →
-      │       상태 `env_qa` → EnvDeployService.applyAndDeploy]
-      │
-      └── 없음 → 곧바로 env_qa (system-injected만으로 배포)
-                   │
-                   ▼
-             [EnvDeployService.applyAndDeploy]
-                   ├── writeDotenv — 복호화해 프로젝트 디렉토리에 `.env` 기록
-                   ├── Docker 기존 컨테이너 제거 → 재생성 (PORT=3000 주입)
-                   ├── 호스트 HEAD 폴링 30초
-                   └── 성공 → deployed (env_attempts=0 리셋)
-                      실패 → getLogs → FailureClassifier → kind 기반 전이 (§11.2)
+[EnvDeployService.applyAndDeploy]
+      ├── writeDotenv — 현재까지 주입된 값(system만이어도 무방)으로 `.env` 기록
+      ├── Docker 컨테이너 제거·재생성 (PORT=3000)
+      ├── 호스트 HEAD 폴링 30초 — mock 상태로 정상 응답 확인
+      └── 성공 → deployed (mock 상태 배너 UI)
 ```
 
-### 19.2 system-injected 값 해석
+ADR 0005 이전엔 `hasUserRequired()`가 true면 `awaiting_env`로 블로킹했지만, 이제 **user-required 변수와 무관하게 `deployed`로 직행**한다. 유저가 실제 값을 언제 넣을지는 선택.
+
+### 19.2 유지보수 플로우 (ADR 0006 — deployed 이후 언제든)
+
+```
+[deployed 상태, 유저가 대시보드 "⚙ 환경 설정" 또는 "🔄 재시작" 클릭]
+      │
+      ├── "⚙ 환경 설정" → EnvInput 유지보수 모드
+      │     ├── 필드별 편집 + 인라인 밸리데이션 (pattern/length)
+      │     └── [💾 저장] → PUT /env { apply:false } → DB만 갱신
+      │     └── [💾 저장 후 재시작] → PUT /env { apply:true } → 19.3
+      │
+      └── "🔄 재시작" → POST /restart → 19.3
+```
+
+### 19.3 재시작 경로 (env_qa)
+
+```
+PUT /env { apply:true }  또는  POST /restart
+      │
+      ▼
+[env_qa 진입]
+      ├── writeDotenv (유지보수 모드에서만 — restart는 skip)
+      ├── docker.restartContainer(container_id)  ← **재생성 X, 재기동만**
+      ├── 호스트 HEAD 폴링 10초
+      └── ┌── 성공 → deployed
+          ├── transient → deployed 유지 + 토스트 "잠시 뒤 다시"
+          ├── env_rejected → deployed 유지 + 토스트 "값 확인 필요" (env_attempts++)
+          ├── code_bug → modifying (대화 수정 세션 생성)
+          └── schema_bug (극단) → planning bounce
+```
+
+**핵심 불변식**: 재시작 실패 시 **컨테이너는 제거하지 않는다**. 이전 바이너리·코드·env 파일이 디스크에 그대로 있어 `docker start <old_id>`로 복구 가능. 유저는 "배포됐는데 새 값이 안 먹었다" 정도의 체감만 갖고 본질적 서비스 중단은 없음.
+
+### 19.4 system-injected 값 해석
 `EnvsService.resolveSystemInjected`가 변수 이름 → 실제 값 매핑:
 
 | 변수 | 소스 |
@@ -722,16 +759,21 @@ PRD §9 / ADR 0004의 런타임 계약.
 | `AX_STORAGE_PATH` | 고정 `/app/data` |
 | 그 외 | null (유저에게 노출되지 않음, 앱이 직접 처리) |
 
-### 19.3 암호화
+### 19.5 밸리데이션 (ADR 0006)
+
+`.env.example`의 `# 패턴:` / `# 길이:` 메타라인을 파서가 추출 → `project_env_vars.validation_pattern` / `min_length` / `max_length` 컬럼에 저장. PUT `/env` 시 서버가 각 value에 대해 재검증, 실패 시 400 + `errors: [{key, reason, hint}]`. 프론트는 같은 로직으로 인라인 검증(blur/change).
+
+### 19.6 암호화
 - AES-256-GCM. 페이로드 = `IV(12) || AUTH_TAG(16) || CIPHERTEXT`, base64.
 - 키 유도: `AX_ENV_ENCRYPTION_KEY`를 SHA-256으로 32바이트 파생.
 - 미설정 시 `JWT_SECRET` 파생 dev 폴백 (기동 시 경고 로그). 운영 배포 전 전용 키 지정 권장.
 - API 응답에서 원문은 **절대 반환하지 않음** — 마스킹 preview(`••••••5432`)만.
 
-### 19.4 프론트엔드 제어
-- `/projects/:id/env` 라우트 (`EnvInput.tsx`) — DESIGN.md §4 구현.
-- BuildStatus가 `awaiting_env` 상태 감지 시 자동 replace 이동.
-- WS `agent_event` 구독으로 `env_qa_failure` payload(classifier/matched_rule/…) 수신 → `FailureBanner` 분기 노출.
+### 19.7 프론트엔드 제어
+- `/projects/:id/env` 라우트 (`EnvInput.tsx`) — DESIGN.md §4, 2-모드 지원.
+- 대시보드 카드: deployed 상태면 "⚙ 환경 설정" + "🔄 재시작"(owner만) 버튼 노출.
+- mock 상태(user-required 중 값이 없는 행 존재) 배너: "⚠ mock 응답 중 — 실제 기능은 환경 설정 후 활성화".
+- WS `agent_event`: env_qa 실패 시 `env_qa_failure` payload(classifier/matched_rule/…)로 `FailureBanner` 노출.
 
 ---
 

@@ -10,6 +10,8 @@
 | [0002](./0002-failure-classifier.md) | FailureClassifier — QA 실패를 책임 주체로 분기 | Accepted |
 | [0003](./0003-ai-gateway-centralization.md) | AI Gateway 단일 경유 (agent-model-mcp) | Accepted |
 | [0004](./0004-env-tier-classification.md) | env 3-tier 분류 | Accepted |
+| [0005](./0005-mock-first-env-strategy.md) | Mock-first env 전략 — 점진적 향상 | Accepted |
+| [0006](./0006-env-maintenance-ui.md) | Env 유지보수 UI + 재시작 + 밸리데이션 | Accepted |
 
 ## 새 ADR 추가 규칙
 
