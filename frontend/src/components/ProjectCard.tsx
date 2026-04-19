@@ -123,11 +123,37 @@ export default function ProjectCard({
             적용 진행 상태
           </button>
         )}
-        {/* Deployed → view app + modify */}
+        {/* Deployed → env maintenance + restart + modify */}
         {state === 'deployed' && canEdit && (
-          <button onClick={goChat} className="text-sm bg-purple-500/10 text-purple-400 px-3 py-1.5 rounded-lg hover:bg-purple-500/20 transition-colors">
-            수정 요청
-          </button>
+          <>
+            <button onClick={goEnv} className="text-sm bg-blue-500/10 text-blue-600 dark:text-blue-400 px-3 py-1.5 rounded-lg hover:bg-blue-500/20 transition-colors">
+              ⚙ 환경 설정
+            </button>
+            {myRole === 'owner' && (
+              <button
+                onClick={async () => {
+                  if (!confirm(`'${title}' 프로젝트를 재시작하시겠습니까?\n약 5~10초 동안 서비스가 잠시 끊깁니다.`)) return;
+                  try {
+                    const res = await client.post(`/projects/${id}/restart`);
+                    if (res.data.accepted) {
+                      alert('재시작을 시작했습니다. 잠시 뒤 상태가 갱신됩니다.');
+                    } else {
+                      alert(res.data.message ?? '재시작 요청됨');
+                    }
+                  } catch (err: unknown) {
+                    const e = err as { response?: { data?: { message?: string } } };
+                    alert(`재시작 실패: ${e.response?.data?.message ?? '알 수 없는 오류'}`);
+                  }
+                }}
+                className="text-sm bg-orange-500/10 text-orange-600 dark:text-orange-400 px-3 py-1.5 rounded-lg hover:bg-orange-500/20 transition-colors"
+              >
+                🔄 재시작
+              </button>
+            )}
+            <button onClick={goChat} className="text-sm bg-purple-500/10 text-purple-400 px-3 py-1.5 rounded-lg hover:bg-purple-500/20 transition-colors">
+              수정 요청
+            </button>
+          </>
         )}
         {/* Failed → retry from planning */}
         {state === 'failed' && canEdit && (

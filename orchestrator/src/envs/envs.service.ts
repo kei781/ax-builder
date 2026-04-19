@@ -18,7 +18,8 @@ import {
 import {
   parseEnvExample,
   findProviderKeyViolations,
-  ParsedEnvVar,
+  validateValue,
+  ValidationError,
 } from './env-parser.js';
 import { EnvCryptoService } from './env-crypto.service.js';
 import { Project } from '../projects/entities/project.entity.js';
@@ -34,6 +35,10 @@ export interface EnvVarView {
   has_value: boolean;
   /** Masked preview (last 4 chars). Null when no value. Never includes the raw value. */
   masked_preview: string | null;
+  /** ADR 0006 validation rules — surfaced to frontend for inline checks. */
+  validation_pattern: string | null;
+  min_length: number | null;
+  max_length: number | null;
 }
 
 export interface SyncResult {
@@ -121,6 +126,9 @@ export class EnvsService {
       row.description = v.description ?? null;
       row.issuance_guide = v.issuance_guide ?? null;
       row.example = v.example ?? null;
+      row.validation_pattern = v.validation_pattern ?? null;
+      row.min_length = v.min_length ?? null;
+      row.max_length = v.max_length ?? null;
 
       if (v.tier === 'system-injected') {
         const injected = this.resolveSystemInjected(v.key);
@@ -200,6 +208,9 @@ export class EnvsService {
       example: r.example,
       has_value: !!r.value_ciphertext,
       masked_preview: maskedPreview,
+      validation_pattern: r.validation_pattern ?? null,
+      min_length: r.min_length ?? null,
+      max_length: r.max_length ?? null,
     };
   }
 
@@ -209,23 +220,54 @@ export class EnvsService {
   }
 
   /**
-   * Apply a batch of user-submitted env values. Only user-required and
-   * user-optional tiers are writable; attempts to overwrite
-   * system-injected are silently ignored (defensive).
+   * Apply a batch of user-submitted env values (ADR 0006).
+   *
+   * - Only `user-required` / `user-optional` tiers are writable.
+   * - Each value runs through `validateValue()` — pattern / length / required.
+   * - If any validation fails, throws BadRequestException with `errors[]` payload,
+   *   and **no** partial writes are persisted (transactional best-effort:
+   *   validate all first, write all second).
+   * - `value === ''` means "clear this value" (sets ciphertext to null).
    */
   async submit(
     projectId: string,
     vars: Array<{ key: string; value: string }>,
   ): Promise<void> {
+    // 1) load all target rows first
+    const targets: Array<{
+      value: string;
+      row: ProjectEnvVar;
+    }> = [];
     for (const { key, value } of vars) {
       const row = await this.envRepo.findOne({
         where: { project_id: projectId, key },
       });
-      if (!row) continue; // key not in example — ignore
+      if (!row) continue; // key not in example — silently ignore
       if (row.tier === 'system-injected') continue; // protected
-      if (!value && row.required && row.tier === 'user-required') {
-        throw new BadRequestException(`${key}는 필수값입니다.`);
-      }
+      targets.push({ value: value ?? '', row });
+    }
+
+    // 2) validate
+    const errors: ValidationError[] = [];
+    for (const { value, row } of targets) {
+      const err = validateValue(row.key, value, {
+        required: row.required && row.tier === 'user-required',
+        validation_pattern: row.validation_pattern,
+        min_length: row.min_length,
+        max_length: row.max_length,
+        example: row.example,
+      });
+      if (err) errors.push(err);
+    }
+    if (errors.length) {
+      throw new BadRequestException({
+        message: '환경변수 검증 실패',
+        errors,
+      });
+    }
+
+    // 3) persist
+    for (const { value, row } of targets) {
       row.value_ciphertext = value ? this.crypto.encrypt(value) : null;
       await this.envRepo.save(row);
     }

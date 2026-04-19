@@ -55,6 +55,16 @@ export class ProjectEnvVar {
   @Column({ type: 'boolean', default: true })
   required!: boolean;
 
+  /** ADR 0006 — regex pattern from `.env.example` `# 패턴:` metaline. NULL = skip. */
+  @Column({ type: 'text', nullable: true })
+  validation_pattern!: string | null;
+
+  @Column({ type: 'int', nullable: true })
+  min_length!: number | null;
+
+  @Column({ type: 'int', nullable: true })
+  max_length!: number | null;
+
   @CreateDateColumn()
   created_at!: Date;
 

@@ -20,20 +20,26 @@ const MAX_ENV_ATTEMPTS = 3;
 type FailureKindEffective = FailureKind | 'schema_bug';
 
 /**
- * Turns a filled-in set of env values into a running container.
+ * Env-driven deploy/restart orchestration (ADR 0005 + 0006).
  *
- * Called:
- *   - By EnvsController.submit after the user fills user-required vars
- *   - By BuildingRunner on initial build when there's nothing pending
+ * Two entry modes:
  *
- * Flow:
- *   1. State → env_qa (or directly deploy when awaiting_env skipped)
- *   2. Write .env to project_path (including system-injected values)
- *   3. Destroy previous container if any
- *   4. Allocate host port + create new container (binds 3000 internal)
- *   5. Start + health-poll for 30s
- *   6. Success → deployed (store port, container_id, bump version)
- *   7. Fail → back to awaiting_env (or failed for first-time deploy without env)
+ * 1. **First-time deploy** (container_id == null): called from BuildingRunner
+ *    post-build. Creates a fresh container with whatever env is currently
+ *    set (mock-first: system-injected only is fine).
+ *
+ * 2. **Maintenance restart** (container_id != null, state == 'deployed'):
+ *    called from `POST /env apply=true` or `POST /restart`. Uses
+ *    `docker restart` on the existing container — no recreate, keeps
+ *    rollback-for-free (ADR 0006 §D3).
+ *
+ * Failure routing (ADR 0005 override):
+ *   - env_rejected / transient / unknown (non-code) → **stay deployed**,
+ *     emit WS toast. Container already running with previous state if
+ *     this was a maintenance restart; first-time deploy is rare to hit
+ *     these kinds.
+ *   - code_bug → `modifying` (dialog fix), not planning.
+ *   - schema_bug (env_rejected ≥ 3 streak) → planning (극단).
  */
 @Injectable()
 export class EnvDeployService {
@@ -51,36 +57,78 @@ export class EnvDeployService {
     private readonly classifier: FailureClassifierService,
   ) {}
 
-  /**
-   * Primary entry: take a project sitting in `awaiting_env` (or a fresh
-   * post-build deploy with 0 user-required), write .env, and deploy.
-   */
   async applyAndDeploy(projectId: string): Promise<void> {
     const proj = await this.projectRepo.findOne({ where: { id: projectId } });
-    if (!proj) return;
+    if (!proj?.project_path) return;
 
-    // awaiting_env → env_qa (noop if we came from the building.runner
-    // happy path where env was already clean and state is `qa`)
-    if (proj.state === 'awaiting_env') {
-      try {
-        await this.stateMachine.transition(projectId, 'env_qa', 'user submitted env');
-      } catch (err: any) {
-        this.logger.warn(
-          `state transition awaiting_env → env_qa failed: ${err?.message ?? err}`,
+    const mode: 'maintenance' | 'fresh' =
+      proj.state === 'deployed' && proj.container_id ? 'maintenance' : 'fresh';
+
+    // Transition into env_qa (or stay if already there)
+    try {
+      if (proj.state !== 'env_qa') {
+        await this.stateMachine.transition(
+          projectId,
+          'env_qa',
+          mode === 'maintenance' ? 'maintenance restart' : 'fresh deploy',
         );
       }
-      this.gateway.emit({
-        agent: 'building',
-        project_id: projectId,
-        event_type: 'phase_start',
-        phase: 'env_qa',
-        payload: { description: '환경변수를 적용하고 컨테이너를 다시 기동합니다.' },
-      });
+    } catch (err: any) {
+      this.logger.warn(
+        `transition → env_qa failed (${proj.state}): ${err?.message ?? err}`,
+      );
     }
+
+    this.gateway.emit({
+      agent: 'building',
+      project_id: projectId,
+      event_type: 'phase_start',
+      phase: 'env_qa',
+      payload: {
+        description:
+          mode === 'maintenance'
+            ? '환경변수 적용 후 컨테이너를 재시작합니다.'
+            : '컨테이너를 새로 기동합니다.',
+      },
+    });
 
     await this.envs.writeDotenv(projectId);
 
-    // Clean up previous container (if any) — we're replacing it
+    if (mode === 'maintenance') {
+      await this.maintenanceRestart(projectId, proj.container_id!, proj.port!);
+    } else {
+      await this.freshDeploy(projectId, proj);
+    }
+  }
+
+  /**
+   * POST /restart entry — no env change, just bounce the container.
+   * Same maintenance restart path.
+   */
+  async restartOnly(projectId: string): Promise<void> {
+    const proj = await this.projectRepo.findOne({ where: { id: projectId } });
+    if (!proj?.container_id || !proj.port) {
+      throw new Error('컨테이너가 없어 재시작할 수 없습니다.');
+    }
+    try {
+      await this.stateMachine.transition(projectId, 'env_qa', 'manual restart');
+    } catch {
+      /* already in env_qa or transition denied — proceed anyway */
+    }
+    this.gateway.emit({
+      agent: 'building',
+      project_id: projectId,
+      event_type: 'phase_start',
+      phase: 'env_qa',
+      payload: { description: '컨테이너 재시작 중...' },
+    });
+    await this.maintenanceRestart(projectId, proj.container_id, proj.port);
+  }
+
+  // -------- mode implementations --------
+
+  private async freshDeploy(projectId: string, proj: Project): Promise<void> {
+    // Clean up previous container (if any, e.g. retry after a freshDeploy failure)
     if (proj.container_id) {
       try {
         await this.docker.removeContainer(proj.container_id);
@@ -103,26 +151,24 @@ export class EnvDeployService {
       await this.docker.startContainer(containerId);
     } catch (err: any) {
       this.logger.error(`container create/start failed: ${err?.message ?? err}`);
-      // No container to fetch logs from — hand the error text directly.
       await this.handleFailure(
         projectId,
         `container start failed: ${err?.message ?? 'unknown'}`,
+        'fresh',
       );
       return;
     }
 
-    // Poll health for 30s
     const ok = await this.pollHealth(port, 30_000);
     if (!ok) {
       this.logger.warn(`health poll failed for project ${projectId} port ${port}`);
-      // Grab logs BEFORE removing the container — classifier needs them.
       const logs = await this.docker.getLogs(containerId, 500);
       try {
         await this.docker.removeContainer(containerId);
       } catch {
         /* ignore */
       }
-      await this.handleFailure(projectId, logs);
+      await this.handleFailure(projectId, logs, 'fresh');
       return;
     }
 
@@ -131,16 +177,60 @@ export class EnvDeployService {
       current_version: newVersion,
       port,
       container_id: containerId,
-      env_attempts: 0, // reset on successful deploy
+      env_attempts: 0,
     });
     await this.builds.createVersion(projectId, newVersion, containerId);
 
     try {
-      await this.stateMachine.transition(projectId, 'deployed', 'env applied');
+      await this.stateMachine.transition(projectId, 'deployed', 'fresh deploy ok');
     } catch {
       /* ignore */
     }
 
+    this.emitCompletion(projectId, port, containerId);
+  }
+
+  private async maintenanceRestart(
+    projectId: string,
+    containerId: string,
+    port: number,
+  ): Promise<void> {
+    try {
+      await this.docker.restartContainer(containerId);
+    } catch (err: any) {
+      this.logger.error(`container restart failed: ${err?.message ?? err}`);
+      await this.handleFailure(
+        projectId,
+        `container restart failed: ${err?.message ?? 'unknown'}`,
+        'maintenance',
+      );
+      return;
+    }
+
+    const ok = await this.pollHealth(port, 10_000);
+    if (!ok) {
+      this.logger.warn(
+        `maintenance restart health poll failed for ${projectId} port ${port}`,
+      );
+      const logs = await this.docker.getLogs(containerId, 500);
+      await this.handleFailure(projectId, logs, 'maintenance');
+      return;
+    }
+
+    await this.projectRepo.update(projectId, { env_attempts: 0 });
+    try {
+      await this.stateMachine.transition(projectId, 'deployed', 'maintenance restart ok');
+    } catch {
+      /* ignore */
+    }
+    this.emitCompletion(projectId, port, containerId);
+  }
+
+  private emitCompletion(
+    projectId: string,
+    port: number,
+    containerId: string,
+  ): void {
     this.gateway.emit({
       agent: 'building',
       project_id: projectId,
@@ -156,25 +246,27 @@ export class EnvDeployService {
   }
 
   /**
-   * ADR 0002 — run classifier, then route:
-   *   env_rejected + attempts < 3 → awaiting_env (retry)
-   *   env_rejected + attempts >= 3 → schema_bug → planning
-   *   transient  → awaiting_env (user can hit "다시 시도")
-   *   code_bug / unknown → planning (bounce-back, gap에 분류 근거 첨부)
+   * ADR 0005 routing:
+   *   env_rejected + attempts < 3 → stay deployed, toast
+   *   env_rejected + attempts ≥ 3 → schema_bug → planning
+   *   transient   → stay deployed, toast "다시 시도"
+   *   code_bug    → modifying (대화 수정 세션)
+   *   unknown     → code_bug 폴백 → modifying
    */
   private async handleFailure(
     projectId: string,
     containerLogs: string,
+    mode: 'fresh' | 'maintenance',
   ): Promise<void> {
     const proj = await this.projectRepo.findOne({ where: { id: projectId } });
     if (!proj) return;
 
     const verdict = this.classifier.classify(containerLogs);
     this.logger.log(
-      `env_qa classifier verdict for ${projectId}: ${verdict.kind} (${verdict.matched_rule ?? 'default'})`,
+      `env_qa classifier verdict for ${projectId}: ${verdict.kind} (${verdict.matched_rule ?? 'default'}) mode=${mode}`,
     );
 
-    let nextState: 'awaiting_env' | 'planning' = 'awaiting_env';
+    let nextState: 'deployed' | 'modifying' | 'planning' | 'failed' = 'deployed';
     let effectiveKind: FailureKindEffective = verdict.kind;
     let userMessage: string;
 
@@ -186,18 +278,23 @@ export class EnvDeployService {
         nextState = 'planning';
         userMessage = `같은 항목에서 ${MAX_ENV_ATTEMPTS}회 연속 거부됐어요. 기획부터 다시 점검합니다.`;
       } else {
+        nextState = mode === 'fresh' ? 'failed' : 'deployed';
         userMessage = '입력하신 값이 거부됐어요. 확인 후 다시 입력해주세요.';
       }
     } else if (verdict.kind === 'transient') {
+      nextState = mode === 'fresh' ? 'failed' : 'deployed';
       userMessage =
-        '연결한 외부 서비스에서 응답이 없어요. 잠시 뒤 [다시 시도]를 눌러주세요.';
+        '연결한 외부 서비스에서 응답이 없어요. 잠시 뒤 다시 시도해주세요.';
     } else if (verdict.kind === 'code_bug') {
-      nextState = 'planning';
-      userMessage = '앱 코드에 문제가 있어 기획을 다시 다듬어야 해요.';
+      nextState = mode === 'fresh' ? 'planning' : 'modifying';
+      userMessage =
+        mode === 'fresh'
+          ? '앱 코드에 문제가 있어 기획을 다시 다듬어야 해요.'
+          : '앱 코드에 문제가 있어요. 대화로 수정해보세요.';
     } else {
-      // unknown → 안전하게 planning (ADR 0002 폴백)
-      nextState = 'planning';
-      userMessage = '원인을 특정하지 못했어요. 기획부터 점검합니다.';
+      // unknown → 안전하게 code_bug로 폴백
+      nextState = mode === 'fresh' ? 'planning' : 'modifying';
+      userMessage = '원인을 특정하지 못했어요. 세부 내용을 확인해주세요.';
     }
 
     try {
@@ -205,7 +302,7 @@ export class EnvDeployService {
         await this.stateMachine.transition(
           projectId,
           nextState,
-          `classifier=${effectiveKind}`,
+          `classifier=${effectiveKind} mode=${mode}`,
         );
       }
     } catch (err: any) {
@@ -223,6 +320,7 @@ export class EnvDeployService {
         message: userMessage,
         reason_snippet: verdict.reason,
         next_state: nextState,
+        mode,
       },
     });
   }

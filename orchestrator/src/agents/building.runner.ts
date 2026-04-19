@@ -329,16 +329,17 @@ export class BuildingRunner {
     this.logger.log(`Building agent exited: code=${code} project=${projectId}`);
 
     if (code === 0) {
-      // Success — sync env, then branch: awaiting_env or deploy inline.
+      // ADR 0005 mock-first: build success always → deploy with whatever env
+      // is currently resolved. user-required 값이 없어도 mock 상태로 배포.
+      // 실제 값 입력은 배포 후 유지보수 모드에서 언제든.
       await this.builds.closeBuild(buildId, 'success');
       const proj = await this.projectRepo.findOne({ where: { id: projectId } });
       if (!proj) return;
 
-      // Parse .env.example and upsert project_env_vars rows.
       try {
         await this.envs.syncFromExample(projectId);
       } catch (err: any) {
-        // e.g. provider-key violation — treat as bounce-back per ADR 0004.
+        // provider-key violation 등 — schema 자체가 잘못됐으므로 planning 반송.
         this.logger.warn(
           `env sync failed for ${projectId}: ${err?.message ?? err}`,
         );
@@ -363,39 +364,15 @@ export class BuildingRunner {
         return;
       }
 
-      // If user-required vars exist, stop here and wait for user input.
-      if (await this.envs.hasUserRequired(projectId)) {
-        try {
-          await this.stateMachine.transition(
-            projectId,
-            'awaiting_env',
-            'user-required env pending',
-          );
-        } catch {
-          /* ignore */
-        }
-        this.gateway.emit({
-          agent: 'building',
-          project_id: projectId,
-          event_type: 'phase_start',
-          phase: 'awaiting_env',
-          payload: {
-            description: '환경설정이 필요합니다. 필요한 값을 입력해주세요.',
-          },
-        });
-        return;
-      }
-
-      // No user input needed — deploy straight away using the env deploy
-      // path (writes system-injected .env, creates container, polls
-      // health). Reuses the same logic as the env submit flow.
+      // Proceed to deploy — mock-first: user-required 유무와 무관.
       try {
-        // Project is in `qa` state at this point (from building agent's
-        // qa phase_start). Skip awaiting_env; env_qa state implies a
-        // container deploy check.
-        await this.stateMachine.transition(projectId, 'env_qa', 'deploying with system env only');
+        await this.stateMachine.transition(
+          projectId,
+          'env_qa',
+          'mock-first deploy',
+        );
       } catch {
-        /* ignore */
+        /* ignore — 이미 env_qa였을 수도 있음 */
       }
       await this.envDeploy.applyAndDeploy(projectId);
     } else if (code === 2) {

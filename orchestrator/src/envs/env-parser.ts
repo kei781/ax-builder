@@ -28,6 +28,11 @@ export interface ParsedEnvVar {
   description?: string;
   issuance_guide?: string;
   example?: string;
+  /** ADR 0006 — `# 패턴:` regex metaline. Undefined = no pattern check. */
+  validation_pattern?: string;
+  /** ADR 0006 — `# 길이:` metaline, numeric bounds. */
+  min_length?: number;
+  max_length?: number;
 }
 
 export class EnvParseError extends Error {
@@ -61,7 +66,29 @@ function normalizeMetaKey(raw: string): string {
   if (['필수 여부', '필수', 'required'].includes(lower)) return 'required';
   if (['주입', '주입 방식', 'source', 'tier', 'kind', 'injection'].includes(lower))
     return 'tier';
+  if (['패턴', '형식', 'pattern', 'regex', 'format'].includes(lower)) return 'pattern';
+  if (['길이', 'length', 'len'].includes(lower)) return 'length';
   return lower;
+}
+
+/**
+ * Parse a `# 길이:` value like "10-500" / "10~500" / ">=10" / "<=500" / "32".
+ * Returns [min|undefined, max|undefined].
+ */
+function parseLength(raw: string): [number | undefined, number | undefined] {
+  const s = raw.trim();
+  // Range form: "10-500" or "10~500"
+  const range = s.match(/^\s*(\d+)\s*[-~]\s*(\d+)\s*$/);
+  if (range) return [Number(range[1]), Number(range[2])];
+  // Bounds form
+  const ge = s.match(/^>=?\s*(\d+)$/);
+  if (ge) return [Number(ge[1]), undefined];
+  const le = s.match(/^<=?\s*(\d+)$/);
+  if (le) return [undefined, Number(le[1])];
+  // Single number = exact length on both sides
+  const n = s.match(/^(\d+)$/);
+  if (n) return [Number(n[1]), Number(n[1])];
+  return [undefined, undefined];
 }
 
 function parseTier(raw: string): EnvTier | null {
@@ -113,6 +140,10 @@ export function parseEnvExample(content: string): ParsedEnvVar[] {
         ? false
         : tier !== 'user-optional';
 
+    const [minLen, maxLen] = currentMeta['length']
+      ? parseLength(currentMeta['length'])
+      : [undefined, undefined];
+
     vars.push({
       key: varKey,
       tier,
@@ -120,6 +151,9 @@ export function parseEnvExample(content: string): ParsedEnvVar[] {
       description: currentMeta['description'],
       issuance_guide: currentMeta['issuance'],
       example: currentMeta['example'],
+      validation_pattern: currentMeta['pattern']?.trim() || undefined,
+      min_length: minLen,
+      max_length: maxLen,
     });
     currentMeta = {};
   }
@@ -141,4 +175,60 @@ export function findProviderKeyViolations(vars: ParsedEnvVar[]): string[] {
     }
   }
   return offending;
+}
+
+/** ADR 0006 — runtime validation of a single submitted value. */
+export interface ValidationError {
+  key: string;
+  reason: 'pattern_mismatch' | 'too_short' | 'too_long' | 'required_empty';
+  hint?: string;
+}
+
+export function validateValue(
+  key: string,
+  value: string,
+  rules: {
+    required?: boolean;
+    validation_pattern?: string | null;
+    min_length?: number | null;
+    max_length?: number | null;
+    example?: string | null;
+  },
+): ValidationError | null {
+  const v = value ?? '';
+  if (rules.required && v.trim().length === 0) {
+    return { key, reason: 'required_empty', hint: '빈 값은 허용되지 않습니다.' };
+  }
+  // Empty optional — skip further checks
+  if (v.length === 0) return null;
+
+  if (rules.min_length != null && v.length < rules.min_length) {
+    return {
+      key,
+      reason: 'too_short',
+      hint: `최소 ${rules.min_length}자 이상이어야 합니다.`,
+    };
+  }
+  if (rules.max_length != null && v.length > rules.max_length) {
+    return {
+      key,
+      reason: 'too_long',
+      hint: `최대 ${rules.max_length}자까지 허용됩니다.`,
+    };
+  }
+  if (rules.validation_pattern) {
+    try {
+      const re = new RegExp(rules.validation_pattern);
+      if (!re.test(v)) {
+        return {
+          key,
+          reason: 'pattern_mismatch',
+          hint: rules.example ? `예: ${rules.example}` : '형식이 올바르지 않습니다.',
+        };
+      }
+    } catch {
+      // Malformed pattern — ignore (Claude Code bug, don't block user)
+    }
+  }
+  return null;
 }

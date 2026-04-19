@@ -13,16 +13,25 @@ import {
  * is not listed here throws, preventing accidental skips (e.g. jumping
  * draft → building without a Planning session).
  */
+/**
+ * ADR 0005 mock-first + ADR 0006 maintenance.
+ *
+ * Key: `deployed` is the default terminal state after build — env handling
+ * happens as side-transitions. `deployed → deployed` self-loop exists
+ * implicitly (DB-only env saves don't transition); `deployed → env_qa`
+ * covers maintenance restart. `env_qa` can return to `deployed` on any
+ * non-code failure (rollback-for-free).
+ */
 const VALID_TRANSITIONS: Record<ProjectState, ProjectState[]> = {
   draft: ['planning'],
   planning: ['plan_ready', 'failed'],
   plan_ready: ['building', 'planning'],
   building: ['qa', 'awaiting_env', 'deployed', 'planning', 'failed'],
   qa: ['awaiting_env', 'env_qa', 'deployed', 'planning', 'failed'],
-  awaiting_env: ['env_qa', 'planning', 'failed'],
-  env_qa: ['deployed', 'awaiting_env', 'planning', 'failed'],
-  deployed: ['modifying'],
-  modifying: ['planning', 'plan_ready'],
+  awaiting_env: ['env_qa', 'planning', 'failed'], // legacy (ADR 0005 이후 거의 미사용)
+  env_qa: ['deployed', 'awaiting_env', 'modifying', 'planning', 'failed'],
+  deployed: ['env_qa', 'modifying', 'failed'],
+  modifying: ['planning', 'plan_ready', 'building', 'deployed'],
   failed: ['planning', 'draft'],
 };
 

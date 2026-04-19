@@ -15,6 +15,7 @@ import {
 } from '../permissions/permissions.guard.js';
 import { ProjectsService } from './projects.service.js';
 import { DockerService } from '../infra/docker.service.js';
+import { EnvDeployService } from '../envs/env-deploy.service.js';
 
 interface JwtUser {
   id: string;
@@ -27,6 +28,7 @@ export class ProjectsController {
   constructor(
     private readonly projectsService: ProjectsService,
     private readonly docker: DockerService,
+    private readonly envDeploy: EnvDeployService,
   ) {}
 
   @Get()
@@ -116,14 +118,24 @@ export class ProjectsController {
     return { message: '서비스가 중지되었습니다.' };
   }
 
+  /**
+   * ADR 0006 — 재시작은 owner만. env_qa로 상태 전이 + 헬스체크 +
+   * 실패 시 classifier를 통해 deployed 유지/modifying으로 라우팅.
+   */
   @Post(':id/restart')
   @UseGuards(ProjectPermissionsGuard)
-  @RequireRoles('owner', 'editor')
+  @RequireRoles('owner')
   async restart(@Param('id') id: string) {
     const project = await this.projectsService.findOne(id);
-    if (project.container_id) {
-      await this.docker.restartContainer(project.container_id);
+    if (!project.container_id) {
+      return { accepted: false, message: '아직 배포된 컨테이너가 없습니다.' };
     }
-    return { message: '서비스가 재시작되었습니다.' };
+    // Fire-and-forget — WS로 결과 전달
+    this.envDeploy
+      .restartOnly(id)
+      .catch((err) =>
+        console.error(`[restart] project ${id} failed:`, err?.message ?? err),
+      );
+    return { accepted: true, message: '재시작을 시작했습니다. 잠시만 기다려주세요.' };
   }
 }

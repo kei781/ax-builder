@@ -1,14 +1,17 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { io, Socket } from 'socket.io-client';
 import client from '../api/client';
 
 /**
- * DESIGN.md §4 — env input for `awaiting_env` state.
+ * DESIGN.md §4 — env input for ax-builder projects.
  *
- * Loads /env/guide, renders required + optional sections, posts to PUT /env.
- * After submit, server goes env_qa → polls health → deployed or back.
- * FailureClassifier(ADR 0002) verdict is surfaced via WS `error` event.
+ * 2-mode (ADR 0006):
+ *   - setup (project.state === 'awaiting_env'): 레거시, 원샷 입력.
+ *   - maintenance (project.state === 'deployed' or 'env_qa'): 필드별 독립
+ *     편집, [저장] / [저장 후 재시작] 2버튼.
+ *
+ * FailureClassifier(ADR 0002) verdict는 WS `error` 이벤트로 수신 → Banner 노출.
  */
 
 interface EnvVarView {
@@ -20,6 +23,9 @@ interface EnvVarView {
   example: string | null;
   has_value: boolean;
   masked_preview: string | null;
+  validation_pattern: string | null;
+  min_length: number | null;
+  max_length: number | null;
 }
 
 type FailureKind =
@@ -37,6 +43,14 @@ interface FailureVerdict {
   next_state: string;
 }
 
+type Mode = 'setup' | 'maintenance';
+
+interface ServerValidationError {
+  key: string;
+  reason: string;
+  hint?: string;
+}
+
 const FAILURE_COPY: Record<FailureKind, { title: string; tone: 'warn' | 'info' | 'error' }> = {
   env_rejected: { title: '입력하신 값이 거부됐어요', tone: 'warn' },
   transient:    { title: '외부 서비스 응답이 없어요', tone: 'info' },
@@ -44,6 +58,42 @@ const FAILURE_COPY: Record<FailureKind, { title: string; tone: 'warn' | 'info' |
   schema_bug:   { title: '환경변수 정의 자체에 문제가 있어요', tone: 'error' },
   unknown:      { title: '원인을 특정하지 못했어요', tone: 'error' },
 };
+
+function modeFromState(state: string): Mode {
+  return state === 'awaiting_env' ? 'setup' : 'maintenance';
+}
+
+/** Local validation — mirrors orchestrator/src/envs/env-parser.ts `validateValue`. */
+function validateLocal(
+  v: EnvVarView,
+  value: string,
+): { ok: true } | { ok: false; hint: string } {
+  const x = value ?? '';
+  if (v.tier === 'user-required' && v.required && x.trim().length === 0) {
+    return { ok: false, hint: '필수값입니다.' };
+  }
+  if (x.length === 0) return { ok: true };
+  if (v.min_length != null && x.length < v.min_length) {
+    return { ok: false, hint: `최소 ${v.min_length}자 이상이어야 해요.` };
+  }
+  if (v.max_length != null && x.length > v.max_length) {
+    return { ok: false, hint: `최대 ${v.max_length}자까지 허용돼요.` };
+  }
+  if (v.validation_pattern) {
+    try {
+      const re = new RegExp(v.validation_pattern);
+      if (!re.test(x)) {
+        return {
+          ok: false,
+          hint: v.example ? `예: ${v.example}` : '형식이 올바르지 않아요.',
+        };
+      }
+    } catch {
+      // 서버가 잘못된 regex를 내려줘도 유저 입력 막지 않음
+    }
+  }
+  return { ok: true };
+}
 
 export default function EnvInput() {
   const { id } = useParams<{ id: string }>();
@@ -57,27 +107,34 @@ export default function EnvInput() {
   const [showOptional, setShowOptional] = useState(false);
   const [verdict, setVerdict] = useState<FailureVerdict | null>(null);
   const [showReason, setShowReason] = useState(false);
+  const [serverErrors, setServerErrors] = useState<Record<string, string>>({});
+  const [toast, setToast] = useState<string | null>(null);
   const socketRef = useRef<Socket | null>(null);
 
-  useEffect(() => {
+  const mode = modeFromState(state);
+
+  const loadAll = async () => {
     if (!id) return;
-    (async () => {
-      try {
-        const [g, p] = await Promise.all([
-          client.get(`/projects/${id}/env/guide`),
-          client.get(`/projects/${id}`),
-        ]);
-        setVars(g.data.vars);
-        setState(p.data.state);
-      } catch (e: any) {
-        setError(e?.response?.data?.message ?? '환경변수 목록을 불러오지 못했어요.');
-      } finally {
-        setLoading(false);
-      }
-    })();
+    try {
+      const [g, p] = await Promise.all([
+        client.get(`/projects/${id}/env/guide`),
+        client.get(`/projects/${id}`),
+      ]);
+      setVars(g.data.vars);
+      setState(p.data.state);
+    } catch (e: any) {
+      setError(e?.response?.data?.message ?? '환경변수 목록을 불러오지 못했어요.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
-  // Subscribe to WS for classifier verdicts + live state changes.
+  // WS subscription
   useEffect(() => {
     if (!id) return;
     const socket = io('/ws', { transports: ['polling', 'websocket'] });
@@ -94,74 +151,101 @@ export default function EnvInput() {
           message: (p.message as string) ?? '실패했어요.',
           matched_rule: (p.matched_rule as string | null) ?? null,
           reason_snippet: (p.reason_snippet as string | null) ?? null,
-          next_state: (p.next_state as string) ?? 'awaiting_env',
+          next_state: (p.next_state as string) ?? 'deployed',
         });
         setSubmitting(false);
-        // If server sent us to planning, it's over — navigate.
+        await loadAll();
         if (p.next_state === 'planning') {
           setTimeout(() => navigate(`/projects/${id}/chat`), 2500);
-        } else {
-          // Came back to awaiting_env — refresh guide to see masked previews.
-          try {
-            const g = await client.get(`/projects/${id}/env/guide`);
-            setVars(g.data.vars);
-            setState('awaiting_env');
-          } catch {
-            /* ignore */
-          }
+        } else if (p.next_state === 'modifying') {
+          setTimeout(() => navigate(`/projects/${id}/chat`), 2500);
         }
       } else if (event.event_type === 'completion') {
-        setState('deployed');
-        setTimeout(() => navigate(`/`), 800);
+        setToast('적용 완료');
+        setSubmitting(false);
+        setVerdict(null);
+        await loadAll();
+        setTimeout(() => setToast(null), 2500);
       }
     });
     return () => {
       socket.disconnect();
       socketRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, navigate]);
 
-  // Safety fallback poll — in case WS missed.
+  // Safety fallback state poll during env_qa
   useEffect(() => {
     if (state !== 'env_qa') return;
     const iv = setInterval(async () => {
       if (!id) return;
       try {
         const r = await client.get(`/projects/${id}`);
-        if (r.data.state !== state) setState(r.data.state);
-        if (r.data.state === 'deployed') {
-          clearInterval(iv);
-          setTimeout(() => navigate(`/`), 800);
+        if (r.data.state !== state) {
+          setState(r.data.state);
+          if (r.data.state === 'deployed') setSubmitting(false);
         }
       } catch {
         /* ignore */
       }
     }, 3000);
     return () => clearInterval(iv);
-  }, [state, id, navigate]);
+  }, [state, id]);
 
-  const required = vars.filter((v) => v.tier === 'user-required');
-  const optional = vars.filter((v) => v.tier === 'user-optional');
+  const required = useMemo(() => vars.filter((v) => v.tier === 'user-required'), [vars]);
+  const optional = useMemo(() => vars.filter((v) => v.tier === 'user-optional'), [vars]);
 
+  // For setup mode: required fields must all be filled
   const missingRequired = required.filter(
     (v) => v.required && !v.has_value && !values[v.key]?.trim(),
   );
-  const canSubmit = missingRequired.length === 0 && !submitting;
+  const hasLocalErrors = [...required, ...optional].some((v) => {
+    const val = values[v.key];
+    if (val == null) return false; // not touched — skip
+    return !validateLocal(v, val).ok;
+  });
 
-  const onSubmit = async () => {
+  const canSubmit = (() => {
+    if (submitting || state === 'env_qa') return false;
+    if (hasLocalErrors) return false;
+    if (mode === 'setup') return missingRequired.length === 0;
+    return true; // maintenance: any state is fine (optional values may be blank)
+  })();
+
+  const submit = async (apply: boolean) => {
     if (!id) return;
     setSubmitting(true);
     setError(null);
     setVerdict(null);
+    setServerErrors({});
     const payload = Object.entries(values)
-      .filter(([, v]) => v != null && v !== '')
+      .filter(([, v]) => v != null) // include empty strings intentionally (clear)
       .map(([key, value]) => ({ key, value }));
     try {
-      await client.put(`/projects/${id}/env`, { vars: payload });
-      setState('env_qa'); // triggers polling
+      const res = await client.put(`/projects/${id}/env`, { vars: payload, apply });
+      if (res.data?.restarting) {
+        setState('env_qa');
+        setToast('재시작 중...');
+      } else {
+        setToast('저장됐어요');
+        setSubmitting(false);
+        setValues({});
+        await loadAll();
+        setTimeout(() => setToast(null), 2000);
+      }
     } catch (e: any) {
       setSubmitting(false);
-      setError(e?.response?.data?.message ?? '저장 실패');
+      const data = e?.response?.data;
+      const errs = (data?.errors ?? data?.message?.errors) as ServerValidationError[] | undefined;
+      if (Array.isArray(errs)) {
+        const m: Record<string, string> = {};
+        for (const err of errs) m[err.key] = err.hint ?? err.reason;
+        setServerErrors(m);
+        setError('입력 형식을 확인해주세요.');
+      } else {
+        setError(typeof data?.message === 'string' ? data.message : '저장 실패');
+      }
     }
   };
 
@@ -172,6 +256,8 @@ export default function EnvInput() {
       </div>
     );
   }
+
+  const mockBanner = mode === 'maintenance' && required.some((v) => !v.has_value);
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950">
@@ -185,12 +271,31 @@ export default function EnvInput() {
             적용 중...
           </span>
         )}
+        {mode === 'maintenance' && state === 'deployed' && (
+          <span className="text-xs px-2 py-1 rounded-full bg-green-500/10 text-green-600 dark:text-green-400">
+            🟢 운영 중
+          </span>
+        )}
       </header>
 
       <main className="max-w-2xl mx-auto px-6 py-10">
-        <p className="text-gray-700 dark:text-gray-300 mb-8">
-          이 앱을 실행하려면 아래 값이 필요해요.
+        <p className="text-gray-700 dark:text-gray-300 mb-6">
+          {mode === 'setup'
+            ? '이 앱을 실행하려면 아래 값이 필요해요.'
+            : '필요할 때 값을 넣으면 실제 기능이 활성화돼요.'}
         </p>
+
+        {mockBanner && (
+          <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl p-4 mb-6 text-sm text-orange-700 dark:text-orange-300">
+            ⚠ 일부 기능이 mock 응답으로 동작 중이에요. 아래 필수 값을 입력하고 재시작하면 실제 기능으로 전환돼요.
+          </div>
+        )}
+
+        {toast && (
+          <div className="bg-green-500/10 border border-green-500/30 rounded-xl p-3 mb-6 text-sm text-green-700 dark:text-green-400">
+            ✓ {toast}
+          </div>
+        )}
 
         {error && !verdict && (
           <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-6 text-sm text-red-500">
@@ -203,7 +308,7 @@ export default function EnvInput() {
             verdict={verdict}
             showReason={showReason}
             onToggleReason={() => setShowReason((s) => !s)}
-            onRetry={onSubmit}
+            onRetry={() => submit(true)}
             onGoPlanning={() => id && navigate(`/projects/${id}/chat`)}
           />
         )}
@@ -220,6 +325,7 @@ export default function EnvInput() {
                   v={v}
                   value={values[v.key] ?? ''}
                   onChange={(val) => setValues((prev) => ({ ...prev, [v.key]: val }))}
+                  serverError={serverErrors[v.key]}
                   disabled={submitting || state === 'env_qa'}
                 />
               ))}
@@ -247,6 +353,7 @@ export default function EnvInput() {
                     onChange={(val) =>
                       setValues((prev) => ({ ...prev, [v.key]: val }))
                     }
+                    serverError={serverErrors[v.key]}
                     disabled={submitting || state === 'env_qa'}
                   />
                 ))}
@@ -257,19 +364,40 @@ export default function EnvInput() {
 
         {required.length === 0 && optional.length === 0 && (
           <p className="text-gray-500 text-sm">
-            입력이 필요한 값이 없습니다. 잠시 기다려주세요.
+            입력이 필요한 값이 없습니다.
           </p>
         )}
 
-        <div className="flex justify-end pt-4 border-t border-gray-200 dark:border-gray-800">
-          <button
-            type="button"
-            onClick={onSubmit}
-            disabled={!canSubmit}
-            className="bg-green-600 hover:bg-green-500 disabled:bg-gray-200 dark:disabled:bg-gray-800 disabled:text-gray-500 text-white px-5 py-2 rounded-xl text-sm transition-colors"
-          >
-            {submitting || state === 'env_qa' ? '적용 중...' : '적용하기'}
-          </button>
+        <div className="flex justify-end gap-2 pt-4 border-t border-gray-200 dark:border-gray-800">
+          {mode === 'setup' ? (
+            <button
+              type="button"
+              onClick={() => submit(true)}
+              disabled={!canSubmit}
+              className="bg-green-600 hover:bg-green-500 disabled:bg-gray-200 dark:disabled:bg-gray-800 disabled:text-gray-500 text-white px-5 py-2 rounded-xl text-sm transition-colors"
+            >
+              {submitting || state === 'env_qa' ? '적용 중...' : '적용하기'}
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => submit(false)}
+                disabled={!canSubmit}
+                className="bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50 text-gray-700 dark:text-gray-200 px-5 py-2 rounded-xl text-sm transition-colors"
+              >
+                💾 저장
+              </button>
+              <button
+                type="button"
+                onClick={() => submit(true)}
+                disabled={!canSubmit}
+                className="bg-green-600 hover:bg-green-500 disabled:bg-gray-200 dark:disabled:bg-gray-800 disabled:text-gray-500 text-white px-5 py-2 rounded-xl text-sm transition-colors"
+              >
+                {submitting || state === 'env_qa' ? '재시작 중...' : '💾 저장 후 재시작'}
+              </button>
+            </>
+          )}
         </div>
       </main>
     </div>
@@ -280,15 +408,26 @@ function EnvField({
   v,
   value,
   onChange,
+  serverError,
   disabled,
 }: {
   v: EnvVarView;
   value: string;
   onChange: (v: string) => void;
+  serverError?: string;
   disabled?: boolean;
 }) {
   const [show, setShow] = useState(false);
+  const [touched, setTouched] = useState(false);
   const placeholder = v.example ?? '';
+  const local = validateLocal(v, value);
+  const showError = serverError || (touched && !local.ok);
+  const errorHint =
+    serverError ?? (!local.ok ? (local as { hint: string }).hint : undefined);
+
+  const valueIsEmpty = value.length === 0;
+  const showOk = touched && !valueIsEmpty && local.ok && !serverError;
+
   return (
     <div>
       <label className="block mb-1">
@@ -313,10 +452,15 @@ function EnvField({
           type={show ? 'text' : 'password'}
           value={value}
           onChange={(e) => onChange(e.target.value)}
+          onBlur={() => setTouched(true)}
           placeholder={placeholder}
           disabled={disabled}
           autoComplete="off"
-          className="flex-1 bg-white dark:bg-gray-900 border border-gray-300 dark:border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:border-gray-500 disabled:opacity-50"
+          className={`flex-1 bg-white dark:bg-gray-900 border rounded-lg px-3 py-2 text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none disabled:opacity-50 ${
+            showError
+              ? 'border-red-500 focus:border-red-500'
+              : 'border-gray-300 dark:border-gray-700 focus:border-gray-500'
+          }`}
         />
         <button
           type="button"
@@ -326,6 +470,12 @@ function EnvField({
           {show ? '숨기기' : '보기'}
         </button>
       </div>
+      {showError && errorHint && (
+        <p className="text-xs text-red-500 mt-1">⚠ {errorHint}</p>
+      )}
+      {showOk && (
+        <p className="text-xs text-green-600 dark:text-green-400 mt-1">✓ 형식 OK</p>
+      )}
     </div>
   );
 }
@@ -350,7 +500,8 @@ function FailureBanner({
       : copy.tone === 'info'
         ? 'bg-blue-500/10 border-blue-500/30 text-blue-600 dark:text-blue-400'
         : 'bg-red-500/10 border-red-500/30 text-red-600 dark:text-red-400';
-  const willBounce = verdict.next_state === 'planning';
+  const willBounce =
+    verdict.next_state === 'planning' || verdict.next_state === 'modifying';
 
   return (
     <div className={`border rounded-xl p-4 mb-6 ${bg}`}>
@@ -373,7 +524,7 @@ function FailureBanner({
             onClick={onGoPlanning}
             className="text-sm bg-white/60 dark:bg-gray-900 border border-current px-3 py-1.5 rounded-lg hover:opacity-80"
           >
-            기획 대화로
+            {verdict.next_state === 'planning' ? '기획 대화로' : '수정 요청으로'}
           </button>
         )}
         <button
