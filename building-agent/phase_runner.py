@@ -108,8 +108,43 @@ module.exports = { createCharge };
 
 **체크포인트**: env 의존 모듈 파일마다 `process.env.<AX_* 또는 외부 키>` 참조와 `if (REAL)` 또는 `if (!REAL)` 분기문이 **반드시 함께** 있어야 합니다. 하나라도 빠지면 QA가 반송합니다.
 
-## 밸리데이션 메타라인 (ADR 0006, 선택)
-`.env.example`의 user-tier 변수에 다음 메타라인을 추가하면 유저 입력 UI에서 자동으로 인라인 검증됩니다. 형식을 확실히 아는 키에만 추가하고, 모르면 생략하세요.
+## `.env.example` 작성 규칙 (매우 중요 — 유저 UI 영향 있음)
+
+**한 변수당 한 메타블록**. 여러 변수를 하나의 `# 주입: ...` 아래에 묶어서 쓰지 마세요. 파서는 빈 줄 또는 `KEY=` 한 번마다 메타를 초기화합니다.
+
+각 변수 블록의 표준 형태:
+
+```
+# VAR_NAME
+# 설명: 비개발자가 이해할 수 있는 한 줄 설명
+# 발급 방법: 단계별 안내 (user-tier에만, 필요 시)
+# 예시: 포맷 예시 (user-tier에만, 필요 시)
+# 필수 여부: required | optional
+# 주입: system-injected | user-required | user-optional
+# 패턴: <regex>   (선택, 인라인 검증)
+# 길이: <min-max> (선택)
+VAR_NAME=
+```
+
+### `AX_AI_BASE_URL` / `AX_AI_TOKEN` 필수 포함
+
+LLM을 호출하는 앱이든 아니든, AI Gateway 계약상 **반드시** 아래 2개를 `.env.example` 최상단에 포함시킵니다. 두 변수 모두 `system-injected` — 유저는 보지도 만지지도 않습니다. (참고: `AX_*` 네임스페이스는 파서가 메타 무관하게 system-injected로 강제하지만, 문서성을 위해 명시적으로 적으세요.)
+
+```
+# AX_AI_BASE_URL
+# 설명: ax-builder AI Gateway 엔드포인트 (빌드 시 자동 주입)
+# 필수 여부: required
+# 주입: system-injected
+AX_AI_BASE_URL=
+
+# AX_AI_TOKEN
+# 설명: AI Gateway 프로젝트 토큰 (빌드 시 자동 발급)
+# 필수 여부: required
+# 주입: system-injected
+AX_AI_TOKEN=
+```
+
+### user-tier 예시 (유저가 직접 입력하는 키)
 
 ```
 # STRIPE_SECRET_KEY
@@ -121,7 +156,20 @@ module.exports = { createCharge };
 # 패턴: ^sk_(test|live)_[a-zA-Z0-9]{24,}$
 # 길이: 32-128
 STRIPE_SECRET_KEY=
+
+# ADMIN_PASSWORD
+# 설명: 관리자 페이지 접근 비밀번호
+# 필수 여부: required
+# 주입: user-required
+# 길이: >=4
+ADMIN_PASSWORD=
 ```
+
+**체크리스트** (생성 전 자가 검증)
+- 모든 변수에 `# 주입:` 메타라인이 있는가?
+- user-required / user-optional 변수엔 `# 설명:` 필수? (유저가 뭔지 알아야 함)
+- 민감 키(Stripe·Slack·OAuth 등)엔 `# 패턴:` 있으면 좋음
+- provider 키(ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY 등)는 절대 user-tier로 올리지 말 것 (빌드 반송 대상)
 """
 
 # Dynamic header/footer with format placeholders. Joined with PHASE_STATIC_RULES
