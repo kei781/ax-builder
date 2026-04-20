@@ -39,6 +39,15 @@ export class ProjectVersion {
   @Column({ type: 'varchar', length: 100, nullable: true })
   container_id!: string | null;
 
+  /**
+   * ADR 0008 §D7 — QA가 빌드 시점에 응답 확인한 primary endpoint 리스트 (JSON).
+   * 이후 업데이트 QA에서 regression 기준으로 사용 — 이 리스트의 엔드포인트가
+   * 업데이트 후에도 여전히 응답해야 deployment 승인.
+   * null이면 regression 검사 건너뜀(레거시 버전).
+   */
+  @Column({ type: 'simple-json', nullable: true })
+  primary_endpoints!: string[] | null;
+
   @CreateDateColumn()
   deployed_at!: Date;
 

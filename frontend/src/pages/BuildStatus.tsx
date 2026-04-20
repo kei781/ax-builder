@@ -150,12 +150,16 @@ export default function BuildStatus() {
   const isComplete = projectState === 'deployed';
   const isFailed = projectState === 'failed';
   const isBounced = phase === 'bounce_back';
+  const isUpdateLine =
+    projectState === 'updating' || projectState === 'update_qa';
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950">
       <header className="border-b border-gray-200 dark:border-gray-800 px-6 py-4 flex items-center gap-4">
         <a href="/" className="text-gray-500 hover:text-gray-900 dark:hover:text-white">← 대시보드</a>
-        <h1 className="text-gray-900 dark:text-white font-medium">빌드 진행 상태</h1>
+        <h1 className="text-gray-900 dark:text-white font-medium">
+          {isUpdateLine ? '업데이트 진행 상태' : '빌드 진행 상태'}
+        </h1>
         <span className={`text-xs px-2 py-1 rounded-full ${connected ? 'bg-green-500/10 text-green-400' : 'bg-gray-200 dark:bg-gray-800 text-gray-500'}`}>
           {connected ? '실시간' : '연결 중'}
         </span>
@@ -165,10 +169,20 @@ export default function BuildStatus() {
       </header>
 
       <main className="max-w-4xl mx-auto px-6 py-8">
+        {/* 업데이트 중 배너 — 기존 앱 접속 가능 */}
+        {isUpdateLine && (
+          <div className="bg-cyan-500/10 border border-cyan-500/30 rounded-xl p-4 mb-6">
+            <p className="text-cyan-700 dark:text-cyan-300 text-sm">
+              ↺ 업데이트 진행 중 — 기존 앱은 계속 접속 가능합니다. 변경 적용이 실패해도 이전 버전이 유지됩니다.
+            </p>
+          </div>
+        )}
         {/* Banner */}
         {isComplete && (
           <div className="bg-green-500/10 border border-green-500/30 rounded-xl p-4 mb-6 flex items-center justify-between">
-            <p className="text-green-400 font-medium">빌드 완료!</p>
+            <p className="text-green-400 font-medium">
+              {isUpdateLine ? '업데이트 완료!' : '빌드 완료!'}
+            </p>
             <button onClick={() => navigate('/')} className="bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded-xl text-sm">대시보드로</button>
           </div>
         )}

@@ -206,6 +206,21 @@ PHASE_FOOTER_TEMPLATE = """
 - 이전 phase에서 만든 파일 구조를 존중하고 확장하세요
 - 이번 phase만 구현하세요. 다음 phase 일은 하지 마세요.
 - 완료되면 간단히 "PHASE {name} 완료: <3줄 요약>"을 출력하세요.
+{update_mode_rules}"""
+
+
+# ADR 0008 §D6 — 업데이트 모드에서만 추가되는 규칙.
+# 기존 파일 구조 보존이 최우선. Claude Code가 "전부 새로 작성"으로 빠지지 않도록.
+UPDATE_MODE_RULES_SUFFIX = """
+## ⚠️ 업데이트 모드 추가 규칙 (ADR 0008)
+- 이 프로젝트는 **이미 배포된 앱의 수정**입니다. 기존 파일 구조를 **그대로 유지**하세요.
+- **기존 파일을 먼저 읽고**, 필요한 부분만 편집. 전체 덮어쓰기 금지.
+- PRD에 명시되지 않은 리팩터/스타일 변경 금지. "이 기회에 정리" 같은 판단도 금지.
+- 기존 DB 스키마(CREATE TABLE 문)를 깨는 변경 금지. 새 컬럼은 IF NOT EXISTS 패턴으로 추가.
+- 기존에 있던 파일을 삭제하려면 phase description에 명시적으로 "삭제: <파일경로>" 이유와 함께 있어야 함.
+- 기존 엔드포인트 URL·파라미터 계약은 깨지 마세요. 필요하면 새 엔드포인트 추가.
+- package.json의 기존 의존성은 유지. 새 의존성만 추가.
+- 변경 후 `npm start`가 여전히 성공해야 하고, 기존 주요 엔드포인트들이 여전히 응답해야 함 (regression).
 """
 
 
@@ -216,6 +231,7 @@ def _compose_prompt(
     prd: str,
     design: str,
     previous_results: list[tuple[Phase, PhaseResult]],
+    mode: str = "build",
 ) -> str:
     phases_summary = "\n".join(
         f"{i + 1}. {p.name} — {p.description}" for i, p in enumerate(phases)
@@ -240,6 +256,7 @@ def _compose_prompt(
         design=design or "(DESIGN.md 없음)",
         phases_summary=phases_summary,
         previous_summary=previous_summary,
+        update_mode_rules=UPDATE_MODE_RULES_SUFFIX if mode == "update" else "",
     )
     return header + PHASE_STATIC_RULES + footer
 
@@ -252,8 +269,11 @@ def run_phase(
     prd: str,
     design: str,
     previous_results: list[tuple[Phase, PhaseResult]],
+    mode: str = "build",
 ) -> PhaseResult:
-    prompt = _compose_prompt(phase, phases, phase_idx, prd, design, previous_results)
+    prompt = _compose_prompt(
+        phase, phases, phase_idx, prd, design, previous_results, mode=mode
+    )
 
     # Ensure Claude's Node path is in PATH (NVM installs under ~/.nvm/...).
     nvm_bin = os.path.expanduser("~/.nvm/versions/node")

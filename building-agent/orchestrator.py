@@ -41,6 +41,11 @@ def main(raw_args: str) -> int:
     project_path = Path(args["project_path"])
     session_id: str | None = args.get("session_id")
     build_id: str | None = args.get("build_id")
+    # ADR 0008 — 'build' (첫 빌드) vs 'update' (업데이트). 기본값은 build로,
+    # 이전 계약과 호환. update 모드면 phase_planner/phase_runner가 다르게 동작.
+    mode: str = args.get("mode", "build")
+    if mode not in ("build", "update"):
+        mode = "build"
 
     def progress(phase: str, detail: str, pct: int) -> None:
         events.emit(
@@ -53,7 +58,11 @@ def main(raw_args: str) -> int:
             payload={"detail": detail},
         )
 
-    events.log(f"Build started for project {project_id}", path=str(project_path))
+    events.log(
+        f"{'Update' if mode == 'update' else 'Build'} started for project {project_id}",
+        path=str(project_path),
+        mode=mode,
+    )
 
     try:
         # -------- 1. Load PRD/DESIGN --------
@@ -72,7 +81,7 @@ def main(raw_args: str) -> int:
 
         # -------- 2. Generate PHASES.md --------
         progress("planning", "PHASES.md 생성 중", 5)
-        phases = generate_phases(prd, design)
+        phases = generate_phases(prd, design, mode=mode)
         write_phases_md(project_path, phases)
         events.emit(
             "progress",
@@ -105,7 +114,7 @@ def main(raw_args: str) -> int:
             )
 
             result = run_phase(
-                phase, phases, idx, project_path, prd, design, previous
+                phase, phases, idx, project_path, prd, design, previous, mode=mode
             )
 
             events.emit(
@@ -161,7 +170,7 @@ def main(raw_args: str) -> int:
             progress_percent=88,
             payload={"description": "npm install + 서버 기동 검증"},
         )
-        qa = run_qa(project_path)
+        qa = run_qa(project_path, project_id=project_id, mode=mode)
         events.emit(
             "phase_end",
             project_id=project_id,
@@ -174,6 +183,7 @@ def main(raw_args: str) -> int:
                 "detail": qa.detail,
                 "gap_list": qa.gaps,
                 "observed_port": qa.observed_port,
+                "primary_endpoints": qa.primary_endpoints,
             },
         )
         if not qa.ok:
@@ -199,9 +209,11 @@ def main(raw_args: str) -> int:
             build_id=build_id,
             progress_percent=100,
             payload={
-                "detail": "빌드 완료",
+                "detail": "업데이트 완료" if mode == "update" else "빌드 완료",
                 "phases": [p.name for p in phases],
                 "port": settings.QA_TEST_PORT,
+                "primary_endpoints": qa.primary_endpoints,
+                "mode": mode,
             },
         )
         return 0

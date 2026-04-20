@@ -93,6 +93,7 @@ export class BuildsService {
     projectId: string,
     version: number,
     containerId?: string | null,
+    primaryEndpoints?: string[] | null,
   ): Promise<ProjectVersion> {
     return this.versionRepo.save(
       this.versionRepo.create({
@@ -100,6 +101,7 @@ export class BuildsService {
         project_id: projectId,
         version,
         container_id: containerId ?? null,
+        primary_endpoints: primaryEndpoints ?? null,
       }),
     );
   }

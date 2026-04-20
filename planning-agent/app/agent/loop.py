@@ -13,15 +13,41 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from app.agent.llm import lifecycle
-from app.agent.system_prompt import PLANNING_SYSTEM_PROMPT
+from app.agent.system_prompt import build_system_prompt
 from app.agent.tools import registry
 from app.config import settings
+from app.storage.db import connection
 from app.transport.events import AgentEvent, make_event
 
 log = logging.getLogger(__name__)
 
 
+# ADR 0008 — 업데이트 모드로 동작해야 하는 state.
+# 이 값들 중 하나면 planning_update 프롬프트 사용.
+_UPDATE_STATES = frozenset({"planning_update", "update_ready"})
+
+
+def _is_update_mode(project_id: str) -> bool:
+    """Read the project's current state to decide which system prompt to use.
+
+    업데이트 라인(`planning_update`, `update_ready`)에서는 diff 기반 수정 가이드가
+    붙은 프롬프트를 쓴다. state가 바뀌어있지 않거나 프로젝트가 없으면 기본(첫 빌드).
+    """
+    try:
+        with connection() as conn:
+            row = conn.execute(
+                "SELECT state FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+    except Exception:
+        log.exception("failed to read project state for %s; falling back to first-build prompt", project_id)
+        return False
+    if not row:
+        return False
+    return row["state"] in _UPDATE_STATES
+
+
 def _build_initial_messages(
+    project_id: str,
     history: Sequence[dict[str, Any]],
     new_user_message: str,
 ) -> list[dict[str, Any]]:
@@ -32,7 +58,7 @@ def _build_initial_messages(
     sees consecutive user messages without an assistant turn between).
     """
     msgs: list[dict[str, Any]] = [
-        {"role": "system", "content": PLANNING_SYSTEM_PROMPT}
+        {"role": "system", "content": build_system_prompt(_is_update_mode(project_id))}
     ]
     # Defensive truncation — orchestrator enforces the limit too.
     recent = list(history)[-settings.MAX_HISTORY_MESSAGES :]
@@ -119,7 +145,7 @@ async def run_turn(
 
     Errors yield a single `error` event and stop.
     """
-    messages = _build_initial_messages(history, new_user_message)
+    messages = _build_initial_messages(project_id, history, new_user_message)
     tool_schemas = registry.get_schemas()
 
     yield make_event(

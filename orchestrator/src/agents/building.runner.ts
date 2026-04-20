@@ -26,10 +26,16 @@ import type { AgentEvent } from '../websocket/events.js';
  *
  * Spawns `building-agent/orchestrator.py`, pipes stderr JSON-line events
  * into BuildGateway, persists Build/BuildPhase rows, and handles exit:
- *   code 0 → deployed
- *   code 2 → bounce-back (planning)
+ *   code 0 → deployed (또는 update 라인은 update_qa 경유)
+ *   code 2 → bounce-back (첫 빌드: planning / 업데이트: planning_update)
  *   else   → failed
+ *
+ * ADR 0008 — 두 라인 지원:
+ *   plan_ready → building  (mode='build', 첫 빌드)
+ *   update_ready → updating (mode='update', 업데이트)
  */
+export type BuildMode = 'build' | 'update';
+
 @Injectable()
 export class BuildingRunner {
   private readonly logger = new Logger(BuildingRunner.name);
@@ -48,6 +54,16 @@ export class BuildingRunner {
    * `builds.bounce_reason_gap_list`로 영속. 프론트 chat 배너에서 읽어 표시.
    */
   private readonly bounceGaps = new Map<string, string[]>();
+
+  /** project_id → 이번 실행의 모드. handleExit에서 분기용. */
+  private readonly modes = new Map<string, BuildMode>();
+
+  /**
+   * project_id → QA가 관찰한 primary endpoint 목록.
+   * QA phase_end에서 수집해 env-deploy.applyAndDeploy에 넘긴다.
+   * env-deploy는 project_versions.primary_endpoints로 영속.
+   */
+  private readonly primaryEndpoints = new Map<string, string[]>();
 
   constructor(
     @InjectRepository(Project)
@@ -73,15 +89,22 @@ export class BuildingRunner {
 
   async start(
     projectId: string,
-  ): Promise<{ message: string; state: string; build_id: string }> {
+  ): Promise<{ message: string; state: string; build_id: string; mode: BuildMode }> {
     const project = await this.projectRepo.findOne({ where: { id: projectId } });
     if (!project) throw new NotFoundException('프로젝트를 찾을 수 없습니다.');
 
-    if (project.state !== 'plan_ready') {
+    // ADR 0008 — 두 진입 상태 중 하나만 허용.
+    let mode: BuildMode;
+    if (project.state === 'plan_ready') {
+      mode = 'build';
+    } else if (project.state === 'update_ready') {
+      mode = 'update';
+    } else {
       throw new BadRequestException(
-        `plan_ready 상태에서만 빌드를 시작할 수 있습니다. (현재: ${project.state})`,
+        `plan_ready 또는 update_ready 상태에서만 빌드를 시작할 수 있습니다. (현재: ${project.state})`,
       );
     }
+
     if (!project.current_session_id) {
       throw new BadRequestException('세션이 없습니다.');
     }
@@ -104,11 +127,13 @@ export class BuildingRunner {
         '시스템 전체 동시 빌드 한도(3개)에 도달했습니다. 잠시 후 다시 시도해주세요.',
       );
     }
-    // Per-user check: count builds owned by same owner
+    // Per-user check: count builds/updates owned by same owner
     const ownerBuilds = await this.projectRepo
       .createQueryBuilder('p')
       .where('p.owner_id = :ownerId', { ownerId: project.owner_id })
-      .andWhere('p.state IN (:...states)', { states: ['building', 'qa'] })
+      .andWhere('p.state IN (:...states)', {
+        states: ['building', 'qa', 'updating', 'update_qa'],
+      })
       .getCount();
     if (ownerBuilds >= 1) {
       throw new BadRequestException(
@@ -116,8 +141,18 @@ export class BuildingRunner {
       );
     }
 
-    // Transition to building
-    await this.stateMachine.transition(projectId, 'building', 'build started');
+    // ADR 0008 §D4 — update 모드: 롤백용 previous_* 백업 먼저.
+    // updating 전이 이후 실패해도 env-deploy.handleFailure가 이 값으로 복구.
+    if (mode === 'update') {
+      await this.projectRepo.update(projectId, {
+        previous_container_id: project.container_id,
+        previous_version: project.current_version,
+      });
+    }
+
+    // Transition: build→building, update→updating.
+    const nextState = mode === 'build' ? 'building' : 'updating';
+    await this.stateMachine.transition(projectId, nextState, `${mode} started`);
 
     // Create build record
     const nextVersion = project.current_version + 1;
@@ -133,6 +168,7 @@ export class BuildingRunner {
       project_path: project.project_path,
       session_id: project.current_session_id,
       build_id: build.id,
+      mode, // 'build' | 'update' — phase_planner/phase_runner가 프롬프트 분기
     });
 
     const nvmBin = `${process.env['HOME']}/.nvm/versions/node/${process.version}/bin`;
@@ -150,6 +186,7 @@ export class BuildingRunner {
     this.processes.set(projectId, proc);
     this.phaseIds.set(projectId, new Map());
     this.bounceGaps.set(projectId, []);
+    this.modes.set(projectId, mode);
 
     proc.stdout?.on('data', (data: Buffer) => {
       // Building agent writes nothing important on stdout; capture for logs.
@@ -193,13 +230,17 @@ export class BuildingRunner {
       this.processes.delete(projectId);
       this.phaseIds.delete(projectId);
       this.logger.error(`Building agent spawn error: ${err.message}`);
+      // spawn error는 운영자 문제 — 롤백 경로가 필요하면 handleExit이 결정.
       void this.handleExit(projectId, build.id, project.current_session_id!, 1);
     });
 
+    // modes 정리는 handleExit 내부에서 — close 이전에 지우면 exit 핸들러가 모드 정보 없이 동작.
+
     return {
-      message: '빌드를 시작했습니다.',
-      state: 'building',
+      message: mode === 'update' ? '업데이트를 시작했습니다.' : '빌드를 시작했습니다.',
+      state: nextState,
       build_id: build.id,
+      mode,
     };
   }
 
@@ -212,22 +253,50 @@ export class BuildingRunner {
 
     const project = await this.projectRepo.findOne({ where: { id: projectId } });
     if (!project) throw new NotFoundException('프로젝트를 찾을 수 없습니다.');
-    if (project.state !== 'building' && project.state !== 'qa') {
+    const active =
+      project.state === 'building' ||
+      project.state === 'qa' ||
+      project.state === 'updating' ||
+      project.state === 'update_qa';
+    if (!active) {
       throw new BadRequestException(`빌드 중이 아닙니다. (현재: ${project.state})`);
+    }
+
+    // update 라인에서 취소한 경우: 이전 컨테이너/버전이 있으면 deployed로 롤백.
+    // 첫 빌드 라인은 배포된 적이 없으므로 failed로 종결.
+    const isUpdate = project.state === 'updating' || project.state === 'update_qa';
+    const canRollback =
+      isUpdate && project.previous_container_id && project.previous_version !== null;
+    const nextState = canRollback ? 'deployed' : 'failed';
+
+    if (canRollback) {
+      await this.projectRepo.update(projectId, {
+        container_id: project.previous_container_id,
+        current_version: project.previous_version!,
+        previous_container_id: null,
+        previous_version: null,
+      });
     }
 
     const updated = await this.stateMachine.transition(
       projectId,
-      'failed',
+      nextState,
       'user cancelled',
     );
     this.gateway.emit({
       agent: 'building',
       project_id: projectId,
       event_type: 'error',
-      payload: { message: 'cancelled by user' },
+      payload: {
+        message: canRollback
+          ? '업데이트를 중단하고 이전 버전을 유지했어요.'
+          : 'cancelled by user',
+      },
     });
-    return { message: '빌드를 중단했습니다.', state: updated.state };
+    return {
+      message: canRollback ? '업데이트를 중단했습니다.' : '빌드를 중단했습니다.',
+      state: updated.state,
+    };
   }
 
   async status(projectId: string): Promise<Record<string, unknown>> {
@@ -315,6 +384,15 @@ export class BuildingRunner {
           })
           .catch((e) => this.logger.warn(`phase_end persist: ${e.message}`));
       }
+      // QA phase success면 primary_endpoints 수집 (env-deploy가 version 저장 시 사용).
+      if (phaseName === 'qa' && p['ok'] === true) {
+        const endpoints = Array.isArray(p['primary_endpoints'])
+          ? (p['primary_endpoints'] as unknown[])
+              .filter((x) => typeof x === 'string')
+              .map((x) => x as string)
+          : [];
+        this.primaryEndpoints.set(projectId, endpoints);
+      }
     }
 
     if (et === 'error' || et === 'completion') {
@@ -351,6 +429,8 @@ export class BuildingRunner {
     code: number | null,
   ): Promise<void> {
     this.logger.log(`Building agent exited: code=${code} project=${projectId}`);
+    const mode = this.modes.get(projectId) ?? 'build';
+    this.modes.delete(projectId);
 
     if (code === 0) {
       // ADR 0005 mock-first: build success always → deploy with whatever env
@@ -364,19 +444,23 @@ export class BuildingRunner {
       try {
         await this.envs.syncFromExample(projectId);
       } catch (err: any) {
-        // provider-key violation 등 — schema 자체가 잘못됐으므로 planning 반송.
+        // provider-key violation 등 — schema 자체가 잘못됐으므로 반송.
+        // 첫 빌드 라인은 planning, 업데이트 라인은 planning_update로.
         this.logger.warn(
           `env sync failed for ${projectId}: ${err?.message ?? err}`,
         );
+        const bounceTo = mode === 'update' ? 'planning_update' : 'planning';
         try {
           await this.stateMachine.transition(
             projectId,
-            'planning',
+            bounceTo,
             `env sync bounce: ${err?.message ?? 'unknown'}`,
           );
         } catch {
           /* ignore */
         }
+        // update 라인: schema 레벨 실패는 previous로 복구 시도.
+        // (컨테이너는 살아있으므로 별도 재기동 불필요)
         this.gateway.emit({
           agent: 'building',
           project_id: projectId,
@@ -384,6 +468,7 @@ export class BuildingRunner {
           payload: {
             kind: 'env_schema_violation',
             message: err?.message ?? 'env 스키마가 잘못됐어요.',
+            mode,
           },
         });
         return;
@@ -394,12 +479,14 @@ export class BuildingRunner {
         await this.stateMachine.transition(
           projectId,
           'env_qa',
-          'mock-first deploy',
+          mode === 'update' ? 'update deploy' : 'mock-first deploy',
         );
       } catch {
         /* ignore — 이미 env_qa였을 수도 있음 */
       }
-      await this.envDeploy.applyAndDeploy(projectId);
+      const endpoints = this.primaryEndpoints.get(projectId);
+      this.primaryEndpoints.delete(projectId);
+      await this.envDeploy.applyAndDeploy(projectId, endpoints ?? null);
     } else if (code === 2) {
       // Phase 실패 exit. 수집한 gap_list + build_phases의 output_log를 합쳐
       // classifier로 원인 분류 → 분류에 따라 라우팅.
@@ -422,27 +509,49 @@ export class BuildingRunner {
         .join('\n');
       const verdict = this.classifier.classify(classificationInput);
       this.logger.log(
-        `bounce classifier for ${projectId}: ${verdict.kind} (${verdict.matched_rule ?? 'default'})`,
+        `bounce classifier for ${projectId}: ${verdict.kind} (${verdict.matched_rule ?? 'default'}) mode=${mode}`,
       );
 
-      // infra_error = 운영자 문제. 유저·AI로는 복구 불가. `failed` 상태로
-      // 못박고 운영자에게 보일 메시지를 남긴다. planning 반송 X.
+      // 라우팅 규칙 (ADR 0008 §D2):
+      //   첫 빌드 라인:
+      //     infra_error / transient → failed (운영자 or 재시도 안내)
+      //     code_bug / unknown       → planning 반송
+      //   업데이트 라인:
+      //     infra_error / transient → previous 복구 + deployed 유지
+      //     code_bug / schema_bug / unknown → planning_update 반송 + previous 복구
+      const isUpdate = mode === 'update';
+
       if (verdict.kind === 'infra_error') {
         const operatorMsg = [
-          '시스템 인프라 문제로 빌드가 중단됐어요. 기획을 바꿔도 해결되지 않습니다.',
+          isUpdate
+            ? '시스템 인프라 문제로 업데이트가 중단됐어요. 이전 버전은 그대로 유지됩니다.'
+            : '시스템 인프라 문제로 빌드가 중단됐어요. 기획을 바꿔도 해결되지 않습니다.',
           `분류: ${verdict.matched_rule ?? 'infra_error'}`,
           ...(gaps.length ? gaps : []),
           '관리자에게 문의해주세요.',
         ];
         await this.builds.closeBuild(buildId, 'failed', operatorMsg);
-        try {
-          await this.stateMachine.transition(
-            projectId,
-            'failed',
-            `infra_error: ${verdict.matched_rule ?? 'unknown'}`,
-          );
-        } catch {
-          /* ignore */
+        if (isUpdate) {
+          await this.rollbackToPrevious(projectId);
+          try {
+            await this.stateMachine.transition(
+              projectId,
+              'deployed',
+              `infra_error (update kept previous): ${verdict.matched_rule ?? 'unknown'}`,
+            );
+          } catch {
+            /* ignore */
+          }
+        } else {
+          try {
+            await this.stateMachine.transition(
+              projectId,
+              'failed',
+              `infra_error: ${verdict.matched_rule ?? 'unknown'}`,
+            );
+          } catch {
+            /* ignore */
+          }
         }
         this.gateway.emit({
           agent: 'building',
@@ -454,27 +563,41 @@ export class BuildingRunner {
             matched_rule: verdict.matched_rule,
             message: operatorMsg[0],
             gap_list: operatorMsg,
+            mode,
           },
         });
         return;
       }
 
-      // transient = 재시도 가능하지만 자동 retry는 Phase 6.1에 — 지금은
-      // failed로 표시 + "잠시 뒤 재시도" 안내. planning 반송 X.
       if (verdict.kind === 'transient') {
         const msg = [
-          '외부 서비스 일시 장애로 빌드가 중단됐어요. 잠시 뒤 다시 시도해주세요.',
+          isUpdate
+            ? '외부 서비스 일시 장애로 업데이트가 중단됐어요. 이전 버전은 유지됩니다. 잠시 뒤 다시 시도해주세요.'
+            : '외부 서비스 일시 장애로 빌드가 중단됐어요. 잠시 뒤 다시 시도해주세요.',
           ...(gaps.length ? gaps : []),
         ];
         await this.builds.closeBuild(buildId, 'failed', msg);
-        try {
-          await this.stateMachine.transition(
-            projectId,
-            'failed',
-            `transient: ${verdict.matched_rule ?? 'unknown'}`,
-          );
-        } catch {
-          /* ignore */
+        if (isUpdate) {
+          await this.rollbackToPrevious(projectId);
+          try {
+            await this.stateMachine.transition(
+              projectId,
+              'deployed',
+              `transient (update kept previous): ${verdict.matched_rule ?? 'unknown'}`,
+            );
+          } catch {
+            /* ignore */
+          }
+        } else {
+          try {
+            await this.stateMachine.transition(
+              projectId,
+              'failed',
+              `transient: ${verdict.matched_rule ?? 'unknown'}`,
+            );
+          } catch {
+            /* ignore */
+          }
         }
         this.gateway.emit({
           agent: 'building',
@@ -486,14 +609,15 @@ export class BuildingRunner {
             matched_rule: verdict.matched_rule,
             message: msg[0],
             gap_list: msg,
+            mode,
           },
         });
         return;
       }
 
-      // code_bug / unknown / (env_rejected는 빌드 단계엔 올 일 없음) →
-      // 기존 planning 반송. PRD가 진짜 부실했거나 AI가 고칠 수 있는 로직
-      // 문제인 경우.
+      // code_bug / unknown → 대화로 고칠 수 있는 실패.
+      //   첫 빌드 라인: planning 반송
+      //   업데이트 라인: planning_update 반송 + previous 복구 (컨테이너는 살아있음)
       await this.builds.closeBuild(
         buildId,
         'bounced',
@@ -501,11 +625,15 @@ export class BuildingRunner {
           ? gaps
           : ['빌드가 반송됐습니다. 상세 사유가 기록되지 않았습니다.'],
       );
+      const bounceTo = isUpdate ? 'planning_update' : 'planning';
+      if (isUpdate) {
+        await this.rollbackToPrevious(projectId);
+      }
       try {
         await this.stateMachine.transition(
           projectId,
-          'planning',
-          `bounce-back: ${verdict.kind}`,
+          bounceTo,
+          `bounce-back: ${verdict.kind} mode=${mode}`,
         );
       } catch {
         // State might have been transitioned already by a cancel.
@@ -516,24 +644,71 @@ export class BuildingRunner {
         event_type: 'progress',
         phase: 'bounce_back',
         payload: {
-          detail: '빌드 실패 — 기획 대화로 돌아갑니다.',
+          detail: isUpdate
+            ? '업데이트 실패 — 대화로 돌아가 보강해주세요. 이전 버전은 유지됩니다.'
+            : '빌드 실패 — 기획 대화로 돌아갑니다.',
           classifier: verdict.kind,
           matched_rule: verdict.matched_rule,
           gap_list: gaps,
+          mode,
         },
       });
     } else {
-      // Unrecoverable failure
+      // Unrecoverable failure. 업데이트 라인이면 previous 복구 시도.
       this.bounceGaps.delete(projectId);
+      const isUpdate = mode === 'update';
       await this.builds.closeBuild(buildId, 'failed', [
-        `Building Agent가 비정상 종료했습니다 (exit code ${code})`,
+        isUpdate
+          ? `업데이트 에이전트가 비정상 종료했습니다 (exit code ${code}). 이전 버전은 유지됩니다.`
+          : `Building Agent가 비정상 종료했습니다 (exit code ${code})`,
         '빌드 로그를 확인하고, 기획 문서에 누락된 정보가 있다면 보완해주세요.',
       ]);
-      try {
-        await this.stateMachine.transition(projectId, 'failed', `exit code ${code}`);
-      } catch {
-        // ignore
+      if (isUpdate) {
+        await this.rollbackToPrevious(projectId);
+        try {
+          await this.stateMachine.transition(
+            projectId,
+            'deployed',
+            `exit code ${code} (update kept previous)`,
+          );
+        } catch {
+          /* ignore */
+        }
+      } else {
+        try {
+          await this.stateMachine.transition(projectId, 'failed', `exit code ${code}`);
+        } catch {
+          // ignore
+        }
       }
     }
+  }
+
+  /**
+   * ADR 0008 §D4 — update 실패 시 previous_container_id/previous_version으로
+   * 프로젝트 행을 복구하고 백업 필드를 clear. 컨테이너 자체는 이미 살아있으므로
+   * (update 경로는 새 컨테이너를 만들기 전에 phase 단계에서 실패) DB만 되돌리면 충분.
+   *
+   * env-deploy에서 이미 컨테이너를 recreate한 뒤 실패한 경우는 env-deploy 내부에서
+   * 별도로 복구하므로 여기선 DB만 건드린다.
+   */
+  private async rollbackToPrevious(projectId: string): Promise<void> {
+    const proj = await this.projectRepo.findOne({ where: { id: projectId } });
+    if (!proj) return;
+    if (!proj.previous_container_id || proj.previous_version === null) {
+      this.logger.warn(
+        `rollbackToPrevious: previous_* not set for ${projectId}; skipping DB rollback`,
+      );
+      return;
+    }
+    await this.projectRepo.update(projectId, {
+      container_id: proj.previous_container_id,
+      current_version: proj.previous_version,
+      previous_container_id: null,
+      previous_version: null,
+    });
+    this.logger.log(
+      `rolled back project ${projectId} to version ${proj.previous_version}`,
+    );
   }
 }

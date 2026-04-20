@@ -245,19 +245,18 @@ export class ChatService {
         'resuming after failure',
       );
     } else if (project.state === 'deployed') {
-      // 배포된 프로젝트에 유저가 채팅으로 수정 요청 — modifying 진입.
-      // propose_handoff이 modifying → plan_ready 전이를 처리하므로 여기선
-      // 상태만 옮겨준다. (이 분기가 없으면 유저는 deployed 상태에서
-      // 무한정 대화하고 AI는 tool을 호출해도 transitioned=false 받음.)
+      // ADR 0008 — 배포된 프로젝트에 유저가 채팅으로 수정 요청.
+      // 업데이트 라인으로 진입: deployed → planning_update. propose_handoff가
+      // planning_update → update_ready 전이를 담당.
       try {
         await this.stateMachine.transition(
           projectId,
-          'modifying',
+          'planning_update',
           'user started modify via chat',
         );
       } catch (err) {
         this.logger.warn(
-          `deployed → modifying transition failed: ${(err as Error).message}`,
+          `deployed → planning_update transition failed: ${(err as Error).message}`,
         );
       }
     }
@@ -482,6 +481,10 @@ export class ChatService {
     // propose_handoff notification — the Python tool writes the handoff row
     // and transitions projects.state directly via SQL; here we surface the
     // transition to the frontend so UI can flip to "빌드 시작" mode.
+    // ADR 0008: propose_handoff는 두 라인의 전이를 모두 담당:
+    //   planning → plan_ready  (첫 빌드)
+    //   planning_update → update_ready  (업데이트)
+    // 이벤트에 `phase`로 어느 전이인지 구분 — 프론트가 카피/버튼을 나눔.
     if (event.event_type === 'tool_result') {
       const payload = (event.payload ?? {}) as {
         name?: string;
@@ -489,33 +492,36 @@ export class ChatService {
           ok?: boolean;
           accepted?: boolean;
           transitioned_to_plan_ready?: boolean;
+          transitioned_to_update_ready?: boolean;
           handoff_id?: string;
           min_completeness?: number;
           is_sufficient?: boolean;
         };
       };
       const r = payload.result;
-      if (
-        payload.name === 'propose_handoff' &&
-        r?.ok === true &&
-        r?.transitioned_to_plan_ready === true
-      ) {
-        this.gateway.emit({
-          agent: 'planning',
-          project_id: event.project_id,
-          session_id: sessionId,
-          event_type: 'progress',
-          phase: 'plan_ready',
-          progress_percent: 100,
-          payload: {
-            detail: r.is_sufficient
-              ? '충분 조건 충족 — 빌드 준비 완료'
-              : '최소 조건 충족 — 빌드 준비 완료',
-            handoff_id: r.handoff_id,
-            min_completeness: r.min_completeness,
-            is_sufficient: !!r.is_sufficient,
-          },
-        });
+      if (payload.name === 'propose_handoff' && r?.ok === true) {
+        const toPlanReady = r.transitioned_to_plan_ready === true;
+        const toUpdateReady = r.transitioned_to_update_ready === true;
+        if (toPlanReady || toUpdateReady) {
+          const phase = toUpdateReady ? 'update_ready' : 'plan_ready';
+          const detailPrefix = toUpdateReady ? '업데이트 준비 완료' : '빌드 준비 완료';
+          this.gateway.emit({
+            agent: 'planning',
+            project_id: event.project_id,
+            session_id: sessionId,
+            event_type: 'progress',
+            phase,
+            progress_percent: 100,
+            payload: {
+              detail: r.is_sufficient
+                ? `충분 조건 충족 — ${detailPrefix}`
+                : `최소 조건 충족 — ${detailPrefix}`,
+              handoff_id: r.handoff_id,
+              min_completeness: r.min_completeness,
+              is_sufficient: !!r.is_sufficient,
+            },
+          });
+        }
       }
     }
 

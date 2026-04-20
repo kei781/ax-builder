@@ -155,9 +155,7 @@ export default function EnvInput() {
         });
         setSubmitting(false);
         await loadAll();
-        if (p.next_state === 'planning') {
-          setTimeout(() => navigate(`/projects/${id}/chat`), 2500);
-        } else if (p.next_state === 'modifying') {
+        if (p.next_state === 'planning' || p.next_state === 'planning_update') {
           setTimeout(() => navigate(`/projects/${id}/chat`), 2500);
         }
       } else if (event.event_type === 'completion') {
@@ -501,7 +499,7 @@ function FailureBanner({
         ? 'bg-blue-500/10 border-blue-500/30 text-blue-600 dark:text-blue-400'
         : 'bg-red-500/10 border-red-500/30 text-red-600 dark:text-red-400';
   const willBounce =
-    verdict.next_state === 'planning' || verdict.next_state === 'modifying';
+    verdict.next_state === 'planning' || verdict.next_state === 'planning_update';
 
   return (
     <div className={`border rounded-xl p-4 mb-6 ${bg}`}>

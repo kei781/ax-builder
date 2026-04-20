@@ -134,6 +134,14 @@ const RULES: Rule[] = [
   },
 
   // --- code_bug: 앱 코드 문제 ---
+  // ADR 0008 — 업데이트 라인에서 qa_supervisor가 regression 발생 시 gap_list에
+  // "업데이트 후 기존 기능이 깨졌어요" 또는 "regression detected" 문구를 남긴다.
+  // 이를 명시적으로 code_bug로 분류해 telemetry에서 "update regression"을 구분.
+  {
+    label: 'update-regression',
+    pattern: /업데이트 후 기존 기능이 깨졌|regression detected on \d+ endpoint/i,
+    kind: 'code_bug',
+  },
   {
     label: 'syntax-error',
     pattern: /SyntaxError/,

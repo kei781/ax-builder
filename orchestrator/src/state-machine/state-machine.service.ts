@@ -9,20 +9,16 @@ import {
 /**
  * Valid state transitions for a Project.
  *
- * The flow is intentionally restrictive — requesting a transition that
- * is not listed here throws, preventing accidental skips (e.g. jumping
- * draft → building without a Planning session).
- */
-/**
- * ADR 0005 mock-first + ADR 0006 maintenance.
+ * 두 라인 분리(ADR 0008):
+ *   첫 빌드 라인: draft → planning → plan_ready → building → qa → env_qa → deployed
+ *   업데이트 라인: deployed → planning_update → update_ready → updating → update_qa → deployed
  *
- * Key: `deployed` is the default terminal state after build — env handling
- * happens as side-transitions. `deployed → deployed` self-loop exists
- * implicitly (DB-only env saves don't transition); `deployed → env_qa`
- * covers maintenance restart. `env_qa` can return to `deployed` on any
- * non-code failure (rollback-for-free).
+ * `deployed`는 양 라인의 수렴 지점이자 터미널. env 유지보수는 deployed↔env_qa 사이드 트립.
+ * update 라인 실패는 대부분 `planning_update`로 반송(bounce) — 기존 컨테이너 유지가 핵심 불변식.
+ * code_bug 분류에 따라 첫 빌드 라인은 `planning`, 업데이트 라인은 `planning_update`로 라우팅.
  */
 const VALID_TRANSITIONS: Record<ProjectState, ProjectState[]> = {
+  // 첫 빌드 라인
   draft: ['planning'],
   planning: ['plan_ready', 'failed'],
   plan_ready: ['building', 'planning'],
@@ -30,11 +26,39 @@ const VALID_TRANSITIONS: Record<ProjectState, ProjectState[]> = {
   // QA 통과 직후 env_qa로 전이하며 컨테이너 기동을 시작함.
   building: ['qa', 'awaiting_env', 'env_qa', 'deployed', 'planning', 'failed'],
   qa: ['awaiting_env', 'env_qa', 'deployed', 'planning', 'failed'],
+
+  // env 사이드 (양 라인 공유)
   awaiting_env: ['env_qa', 'planning', 'failed'], // legacy (ADR 0005 이후 거의 미사용)
-  env_qa: ['deployed', 'awaiting_env', 'modifying', 'planning', 'failed'],
-  deployed: ['env_qa', 'modifying', 'failed'],
-  modifying: ['planning', 'plan_ready', 'building', 'deployed'],
+  // env_qa에서 update 라인으로 되돌리는 경로: planning_update (업데이트 맥락 보존).
+  env_qa: [
+    'deployed',
+    'awaiting_env',
+    'planning',
+    'planning_update',
+    'failed',
+  ],
+
+  // 터미널 & 합류점
+  // deployed → planning_update: 업데이트 라인 진입. env_qa 사이드 트립은 유지.
+  deployed: ['env_qa', 'planning_update', 'failed'],
   failed: ['planning', 'draft', 'plan_ready'],
+
+  // 업데이트 라인
+  planning_update: ['update_ready', 'deployed', 'failed'],
+  // plan_ready 유사: 수정 사양 확정. 롤백(대화 보류) 시 deployed로 즉시 복귀.
+  update_ready: ['updating', 'planning_update', 'deployed'],
+  // updating 실패 라우팅:
+  //   code_bug / schema_bug → planning_update (이전 컨테이너 복구)
+  //   infra_error / transient → deployed (실패 없던 것처럼 유지)
+  updating: [
+    'update_qa',
+    'env_qa',
+    'deployed',
+    'planning_update',
+    'failed',
+  ],
+  // update_qa: regression 실패 시 planning_update로 반송. 성공 시 deployed.
+  update_qa: ['deployed', 'planning_update', 'failed'],
 };
 
 @Injectable()

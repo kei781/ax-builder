@@ -38,7 +38,10 @@ type ProjectState =
   | 'qa'
   | 'deployed'
   | 'failed'
-  | 'modifying';
+  | 'planning_update'
+  | 'update_ready'
+  | 'updating'
+  | 'update_qa';
 
 interface ProjectInfo {
   id: string;
@@ -66,18 +69,26 @@ const STATE_LABELS: Record<ProjectState, string> = {
   qa: 'QA 검증 중',
   deployed: '배포됨',
   failed: '실패',
-  modifying: '수정 중',
+  // ADR 0008 업데이트 라인
+  planning_update: '수정 기획 중',
+  update_ready: '업데이트 준비 완료',
+  updating: '업데이트 중',
+  update_qa: '회귀 검증 중',
 };
 
 const STATE_COLORS: Record<ProjectState, string> = {
   draft: 'bg-gray-200 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
-  planning: 'bg-blue-500/10 text-blue-500 dark:text-blue-400',
-  plan_ready: 'bg-green-500/10 text-green-600 dark:text-green-400',
-  building: 'bg-yellow-500/10 text-yellow-600 dark:text-yellow-400',
-  qa: 'bg-yellow-500/10 text-yellow-600 dark:text-yellow-400',
+  planning: 'bg-sky-500/10 text-sky-600 dark:text-sky-400',
+  plan_ready: 'bg-blue-500/10 text-blue-600 dark:text-blue-400',
+  building: 'bg-blue-600/10 text-blue-700 dark:text-blue-300',
+  qa: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
   deployed: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
   failed: 'bg-red-500/10 text-red-500 dark:text-red-400',
-  modifying: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
+  // 업데이트 라인 색 체계 (DESIGN §5.1)
+  planning_update: 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-400',
+  update_ready: 'bg-teal-500/10 text-teal-600 dark:text-teal-400',
+  updating: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
+  update_qa: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
 };
 
 export default function Chat() {
@@ -199,9 +210,16 @@ export default function Chat() {
               label: p.label ?? '',
             });
           }
-          // plan_ready transition
-          if (event.phase === 'plan_ready' || event.phase === 'build_requested') {
-            if (event.phase === 'plan_ready' && p?.detail) {
+          // plan_ready / update_ready transition
+          if (
+            event.phase === 'plan_ready' ||
+            event.phase === 'update_ready' ||
+            event.phase === 'build_requested'
+          ) {
+            if (
+              (event.phase === 'plan_ready' || event.phase === 'update_ready') &&
+              p?.detail
+            ) {
               setHandoffBanner(p.detail);
             }
             void fetchProject();
@@ -277,8 +295,13 @@ export default function Chat() {
 
   const handleSend = async () => {
     if (!input.trim() || loading || !id) return;
-    if (project?.state === 'building' || project?.state === 'qa') {
-      setStatus('빌드 중에는 대화할 수 없습니다.');
+    const s = project?.state;
+    if (s === 'building' || s === 'qa' || s === 'updating' || s === 'update_qa') {
+      setStatus(
+        s === 'updating' || s === 'update_qa'
+          ? '업데이트 중에는 대화할 수 없습니다.'
+          : '빌드 중에는 대화할 수 없습니다.',
+      );
       return;
     }
     const content = input;
@@ -298,25 +321,26 @@ export default function Chat() {
   const handleBuild = async () => {
     if (!id || building) return;
 
-    // can_build이지만 아직 plan_ready가 아니면 = AI가 propose_handoff 안 함.
+    // can_build이지만 아직 plan_ready/update_ready가 아니면 = AI가 propose_handoff 안 함.
     // 자동으로 AI에게 핸드오프 요청 메시지를 보냄 (유저가 직접 프롬프트 안 쳐도 됨)
-    if (project?.state !== 'plan_ready' && readiness?.can_build) {
+    const ready = project?.state === 'plan_ready' || project?.state === 'update_ready';
+    if (!ready && readiness?.can_build) {
       const autoMsg =
         '기획이 충분히 정리됐습니다. propose_handoff 도구를 호출해서 ' +
-        '다음 단계(Building)로 이관을 제안해주세요. ' +
+        '다음 단계로 이관을 제안해주세요. ' +
         '텍스트로만 "완료"라고 답하지 말고 반드시 도구를 호출하세요.';
       setMessages((prev) => [...prev, { role: 'user', content: autoMsg }]);
       setLoading(true);
       setStatus('핸드오프 요청 중...');
       try {
         await client.post(`/projects/${id}/chat/messages`, { content: autoMsg });
-        // Watchdog: 15s 안에 plan_ready 전이가 안 보이면 AI가 도구 호출 안 한 것.
+        // Watchdog: 15s 안에 *_ready 전이가 안 보이면 AI가 도구 호출 안 한 것.
         // ARCHITECTURE.md §6.6 참조.
         const checkAt = Date.now();
         setTimeout(async () => {
           try {
             const r = await client.get(`/projects/${id}`);
-            if (r.data.state !== 'plan_ready') {
+            if (r.data.state !== 'plan_ready' && r.data.state !== 'update_ready') {
               setHandoffBanner(
                 'AI가 도구를 호출하지 않은 것 같아요. "AI에게 핸드오프 요청"을 한 번 더 눌러주세요.',
               );
@@ -352,7 +376,12 @@ export default function Chat() {
     }
   };
 
-  const canBuild = project?.state === 'plan_ready';
+  const canBuild = project?.state === 'plan_ready' || project?.state === 'update_ready';
+  const isUpdateLine =
+    project?.state === 'planning_update' ||
+    project?.state === 'update_ready' ||
+    project?.state === 'updating' ||
+    project?.state === 'update_qa';
   const canEdit = myRole === 'owner' || myRole === 'editor';
   const state = project?.state ?? 'draft';
 
@@ -410,13 +439,19 @@ export default function Chat() {
         </div>
       )}
 
-      {/* Bounce-back banner — build가 반송되어 planning/plan_ready로 돌아왔을 때 */}
-      {(state === 'planning' || state === 'plan_ready') &&
+      {/* Bounce-back banner — build/update가 반송되어 planning/plan_ready/planning_update로 돌아왔을 때 */}
+      {(state === 'planning' ||
+        state === 'plan_ready' ||
+        state === 'planning_update' ||
+        state === 'update_ready') &&
         project?.last_bounce &&
         project.last_bounce.gap_list.length > 0 && (
           <div className="px-6 py-3 bg-yellow-500/10 border-b border-yellow-500/30">
             <p className="text-sm text-yellow-700 dark:text-yellow-400 font-medium mb-1">
-              ↩ 이전 빌드가 아래 이유로 돌아왔습니다. 확인하고 보강한 뒤 다시 빌드를 시작해주세요.
+              ↩ 이전 {isUpdateLine ? '업데이트' : '빌드'}가 아래 이유로 돌아왔습니다.
+              {isUpdateLine
+                ? ' 이전 버전은 계속 운영 중입니다. 확인 후 다시 시도해주세요.'
+                : ' 확인하고 보강한 뒤 다시 빌드를 시작해주세요.'}
             </p>
             <ul className="text-xs text-yellow-700 dark:text-yellow-300 ml-4 list-disc space-y-0.5">
               {project.last_bounce.gap_list.map((reason, i) => (
@@ -444,7 +479,7 @@ export default function Chat() {
         </div>
       )}
 
-      {/* Build redirect prompt */}
+      {/* Build / Update redirect prompt */}
       {(state === 'building' || state === 'qa') && (
         <div className="px-6 py-3 bg-yellow-500/10 border-b border-yellow-500/30 flex items-center justify-between">
           <span className="text-sm text-yellow-700 dark:text-yellow-400">
@@ -453,6 +488,19 @@ export default function Chat() {
           <button
             onClick={() => navigate(`/projects/${id}/build`)}
             className="bg-yellow-500 hover:bg-yellow-400 text-white text-sm px-4 py-1.5 rounded-lg font-medium"
+          >
+            진행 상태 보기 →
+          </button>
+        </div>
+      )}
+      {(state === 'updating' || state === 'update_qa') && (
+        <div className="px-6 py-3 bg-cyan-500/10 border-b border-cyan-500/30 flex items-center justify-between">
+          <span className="text-sm text-cyan-700 dark:text-cyan-300">
+            업데이트가 진행 중입니다. 기존 앱은 계속 접속 가능합니다.
+          </span>
+          <button
+            onClick={() => navigate(`/projects/${id}/build`)}
+            className="bg-cyan-500 hover:bg-cyan-400 text-white text-sm px-4 py-1.5 rounded-lg font-medium"
           >
             진행 상태 보기 →
           </button>
@@ -493,8 +541,12 @@ export default function Chat() {
               onChange={(e) => setInput(e.target.value)}
               placeholder={
                 canBuild
-                  ? '빌드 준비가 완료됐습니다. 추가 요청이 있으면 입력하세요.'
-                  : '아이디어를 입력하세요...'
+                  ? state === 'update_ready'
+                    ? '업데이트 준비가 완료됐습니다. 추가 수정 요청이 있으면 입력하세요.'
+                    : '빌드 준비가 완료됐습니다. 추가 요청이 있으면 입력하세요.'
+                  : isUpdateLine
+                    ? '수정 내용을 입력하세요...'
+                    : '아이디어를 입력하세요...'
               }
               className="flex-1 bg-white dark:bg-gray-900 text-gray-900 dark:text-white rounded-xl px-4 py-3 text-sm border border-gray-200 dark:border-gray-700 focus:border-green-500 focus:outline-none resize-none leading-5"
               rows={2}
@@ -504,11 +556,24 @@ export default function Chat() {
                   handleSend();
                 }
               }}
-              disabled={loading || state === 'building' || state === 'qa'}
+              disabled={
+                loading ||
+                state === 'building' ||
+                state === 'qa' ||
+                state === 'updating' ||
+                state === 'update_qa'
+              }
             />
             <button
               onClick={handleSend}
-              disabled={!input.trim() || loading || state === 'building' || state === 'qa'}
+              disabled={
+                !input.trim() ||
+                loading ||
+                state === 'building' ||
+                state === 'qa' ||
+                state === 'updating' ||
+                state === 'update_qa'
+              }
               className="bg-green-600 hover:bg-green-500 disabled:bg-gray-300 dark:disabled:bg-gray-700 text-white px-6 py-3 rounded-xl text-sm font-medium transition-colors shrink-0"
             >
               전송
@@ -582,16 +647,22 @@ export default function Chat() {
               disabled={!canBuild && !(readiness?.can_build)}
               className={`w-full py-3 rounded-xl text-sm font-medium transition-colors ${
                 canBuild || readiness?.can_build
-                  ? 'bg-green-600 hover:bg-green-500 text-white'
+                  ? isUpdateLine
+                    ? 'bg-teal-600 hover:bg-teal-500 text-white'
+                    : 'bg-green-600 hover:bg-green-500 text-white'
                   : 'bg-gray-200 dark:bg-gray-800 text-gray-400 dark:text-gray-600 cursor-not-allowed'
               }`}
             >
               {canBuild
-                ? '🚀 제작 시작'
+                ? isUpdateLine
+                  ? '↺ 업데이트 시작'
+                  : '🚀 제작 시작'
                 : readiness?.can_build
                   ? loading
                     ? '핸드오프 요청 중...'
-                    : '📋 AI에게 핸드오프 요청'
+                    : isUpdateLine
+                      ? '📋 AI에게 업데이트 이관 요청'
+                      : '📋 AI에게 핸드오프 요청'
                   : `스코어 600점 이상 시 제작 가능`}
             </button>
           </div>

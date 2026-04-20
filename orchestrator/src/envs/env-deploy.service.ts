@@ -20,26 +20,26 @@ const MAX_ENV_ATTEMPTS = 3;
 type FailureKindEffective = FailureKind | 'schema_bug';
 
 /**
- * Env-driven deploy/restart orchestration (ADR 0005 + 0006).
+ * Env-driven deploy/restart orchestration (ADR 0005 + 0006 + 0008).
  *
- * Two entry modes:
+ * Three entry modes:
  *
- * 1. **First-time deploy** (container_id == null): called from BuildingRunner
- *    post-build. Creates a fresh container with whatever env is currently
- *    set (mock-first: system-injected only is fine).
+ * 1. **First-time deploy** (fresh, 첫 빌드 라인): BuildingRunner.handleExit이
+ *    plan_ready 경유 → env_qa로 전이 후 호출. 컨테이너를 새로 생성.
  *
- * 2. **Maintenance restart** (container_id != null, state == 'deployed'):
- *    called from `POST /env apply=true` or `POST /restart`. Uses
- *    `docker restart` on the existing container — no recreate, keeps
- *    rollback-for-free (ADR 0006 §D3).
+ * 2. **Update deploy** (fresh 유사, 업데이트 라인): BuildingRunner가 updating
+ *    성공 후 env_qa로 전이. previous_container_id는 projects에 백업돼있고,
+ *    새 컨테이너를 띄운다. 실패 시 `rollbackToPrevious()`로 복구.
  *
- * Failure routing (ADR 0005 override):
- *   - env_rejected / transient / unknown (non-code) → **stay deployed**,
- *     emit WS toast. Container already running with previous state if
- *     this was a maintenance restart; first-time deploy is rare to hit
- *     these kinds.
- *   - code_bug → `modifying` (dialog fix), not planning.
- *   - schema_bug (env_rejected ≥ 3 streak) → planning (극단).
+ * 3. **Maintenance restart** (container_id != null, state == 'deployed'):
+ *    `POST /env apply=true` 또는 `POST /restart`. 컨테이너 recreate.
+ *
+ * Failure routing:
+ *   - env_rejected / transient / unknown (non-code) → deployed 유지, 토스트.
+ *   - code_bug → planning / planning_update (첫 빌드 / 업데이트 분기).
+ *   - schema_bug (env_rejected ≥ 3 streak) → planning / planning_update.
+ *   - 업데이트 라인 실패는 previous_container_id로 복구 후 deployed 유지 또는
+ *     planning_update 반송 (ADR 0008 §D4 — 기존 버전이 살아있어야 한다는 불변식).
  */
 @Injectable()
 export class EnvDeployService {
@@ -57,7 +57,10 @@ export class EnvDeployService {
     private readonly classifier: FailureClassifierService,
   ) {}
 
-  async applyAndDeploy(projectId: string): Promise<void> {
+  async applyAndDeploy(
+    projectId: string,
+    primaryEndpoints: string[] | null = null,
+  ): Promise<void> {
     const proj = await this.projectRepo.findOne({ where: { id: projectId } });
     if (!proj?.project_path) return;
 
@@ -97,7 +100,7 @@ export class EnvDeployService {
     if (mode === 'maintenance') {
       await this.maintenanceRestart(projectId, proj.container_id!, proj.port!);
     } else {
-      await this.freshDeploy(projectId, proj);
+      await this.freshDeploy(projectId, proj, primaryEndpoints);
     }
   }
 
@@ -129,15 +132,26 @@ export class EnvDeployService {
 
   // -------- mode implementations --------
 
-  private async freshDeploy(projectId: string, proj: Project): Promise<void> {
-    // Clean up previous container (if any, e.g. retry after a freshDeploy failure)
-    if (proj.container_id) {
-      try {
-        await this.docker.removeContainer(proj.container_id);
-      } catch (err: any) {
-        this.logger.warn(
-          `remove previous container failed: ${err?.message ?? err}`,
-        );
+  private async freshDeploy(
+    projectId: string,
+    proj: Project,
+    primaryEndpoints: string[] | null = null,
+  ): Promise<void> {
+    // 업데이트 라인 여부 판별: building.runner.start에서 previous_container_id 백업함.
+    // 업데이트 모드면 기존(= previous) 컨테이너를 **건드리지 않고** 새 컨테이너를
+    // 별도 포트에 띄운다. 헬스체크 성공 시에만 이전 컨테이너를 제거하고 커밋.
+    const isUpdate = !!proj.previous_container_id;
+
+    if (!isUpdate) {
+      // 첫 빌드 라인: 재시도 중이라 잔여물이 있을 수 있음. 안전하게 정리.
+      if (proj.container_id) {
+        try {
+          await this.docker.removeContainer(proj.container_id);
+        } catch (err: any) {
+          this.logger.warn(
+            `remove previous container failed: ${err?.message ?? err}`,
+          );
+        }
       }
     }
 
@@ -159,7 +173,7 @@ export class EnvDeployService {
       await this.handleFailure(
         projectId,
         `container start failed: ${err?.message ?? 'unknown'}`,
-        'fresh',
+        isUpdate ? 'update' : 'fresh',
       );
       return;
     }
@@ -176,8 +190,21 @@ export class EnvDeployService {
       } catch {
         /* ignore */
       }
-      await this.handleFailure(projectId, logs, 'fresh');
+      // 업데이트 라인: 새 컨테이너만 제거. 이전 컨테이너는 그대로 살아있음.
+      // handleFailure가 이전 버전으로 DB를 복구한다.
+      await this.handleFailure(projectId, logs, isUpdate ? 'update' : 'fresh');
       return;
+    }
+
+    // 성공 — 이제야 이전 컨테이너 제거 (업데이트 라인).
+    if (isUpdate && proj.previous_container_id) {
+      try {
+        await this.docker.removeContainer(proj.previous_container_id);
+      } catch (err: any) {
+        this.logger.warn(
+          `post-update: remove previous container failed: ${err?.message ?? err}`,
+        );
+      }
     }
 
     const newVersion = (proj.current_version ?? 0) + 1;
@@ -186,11 +213,22 @@ export class EnvDeployService {
       port,
       container_id: containerId,
       env_attempts: 0,
+      previous_container_id: null,
+      previous_version: null,
     });
-    await this.builds.createVersion(projectId, newVersion, containerId);
+    await this.builds.createVersion(
+      projectId,
+      newVersion,
+      containerId,
+      primaryEndpoints,
+    );
 
     try {
-      await this.stateMachine.transition(projectId, 'deployed', 'fresh deploy ok');
+      await this.stateMachine.transition(
+        projectId,
+        'deployed',
+        isUpdate ? 'update deploy ok' : 'fresh deploy ok',
+      );
     } catch {
       /* ignore */
     }
@@ -293,17 +331,30 @@ export class EnvDeployService {
   }
 
   /**
-   * ADR 0005 routing:
-   *   env_rejected + attempts < 3 → stay deployed, toast
+   * 라우팅 규칙 (ADR 0005 + 0008):
+   *
+   * 첫 빌드 라인 (fresh):
+   *   env_rejected + attempts < 3 → failed, 토스트
    *   env_rejected + attempts ≥ 3 → schema_bug → planning
-   *   transient   → stay deployed, toast "다시 시도"
-   *   code_bug    → modifying (대화 수정 세션)
-   *   unknown     → code_bug 폴백 → modifying
+   *   transient → failed, 토스트
+   *   code_bug / unknown → planning
+   *
+   * 업데이트 라인 (update):
+   *   env_rejected + attempts < 3 → deployed (이전 유지), 토스트 "값 재입력"
+   *   env_rejected + attempts ≥ 3 → schema_bug → planning_update (이전 유지)
+   *   transient → deployed (이전 유지), 토스트
+   *   code_bug / unknown → planning_update (이전 유지)
+   *
+   * 유지보수 라인 (maintenance):
+   *   모든 실패 → deployed 유지 (ADR 0006 rollback-for-free)
+   *   단 code_bug는 planning_update (대화 수정 세션)
+   *
+   * 업데이트/유지보수 라인에서 컨테이너는 previous로 복구되거나 기존 그대로 유지.
    */
   private async handleFailure(
     projectId: string,
     containerLogs: string,
-    mode: 'fresh' | 'maintenance',
+    mode: 'fresh' | 'update' | 'maintenance',
   ): Promise<void> {
     const proj = await this.projectRepo.findOne({ where: { id: projectId } });
     if (!proj) return;
@@ -313,17 +364,23 @@ export class EnvDeployService {
       `env_qa classifier verdict for ${projectId}: ${verdict.kind} (${verdict.matched_rule ?? 'default'}) mode=${mode}`,
     );
 
-    let nextState: 'deployed' | 'modifying' | 'planning' | 'failed' = 'deployed';
+    let nextState: 'deployed' | 'planning' | 'planning_update' | 'failed' = 'deployed';
     let effectiveKind: FailureKindEffective = verdict.kind;
     let userMessage: string;
+
+    // 반송 목적지: 첫 빌드는 planning, 그 외(update/maintenance)는 planning_update.
+    const bounceTarget: 'planning' | 'planning_update' =
+      mode === 'fresh' ? 'planning' : 'planning_update';
 
     if (verdict.kind === 'env_rejected') {
       const nextAttempts = (proj.env_attempts ?? 0) + 1;
       await this.projectRepo.update(projectId, { env_attempts: nextAttempts });
       if (nextAttempts >= MAX_ENV_ATTEMPTS) {
         effectiveKind = 'schema_bug';
-        nextState = 'planning';
-        userMessage = `같은 항목에서 ${MAX_ENV_ATTEMPTS}회 연속 거부됐어요. 기획부터 다시 점검합니다.`;
+        nextState = bounceTarget;
+        userMessage = `같은 항목에서 ${MAX_ENV_ATTEMPTS}회 연속 거부됐어요. ${
+          mode === 'fresh' ? '기획' : '대화'
+        }부터 다시 점검합니다.`;
       } else {
         nextState = mode === 'fresh' ? 'failed' : 'deployed';
         userMessage = '입력하신 값이 거부됐어요. 확인 후 다시 입력해주세요.';
@@ -333,15 +390,27 @@ export class EnvDeployService {
       userMessage =
         '연결한 외부 서비스에서 응답이 없어요. 잠시 뒤 다시 시도해주세요.';
     } else if (verdict.kind === 'code_bug') {
-      nextState = mode === 'fresh' ? 'planning' : 'modifying';
+      nextState = bounceTarget;
       userMessage =
         mode === 'fresh'
           ? '앱 코드에 문제가 있어 기획을 다시 다듬어야 해요.'
-          : '앱 코드에 문제가 있어요. 대화로 수정해보세요.';
+          : '앱 코드에 문제가 있어요. 대화로 수정해보세요. 이전 버전은 유지됩니다.';
     } else {
       // unknown → 안전하게 code_bug로 폴백
-      nextState = mode === 'fresh' ? 'planning' : 'modifying';
+      nextState = bounceTarget;
       userMessage = '원인을 특정하지 못했어요. 세부 내용을 확인해주세요.';
+    }
+
+    // update 라인: previous 컨테이너로 DB 복구 (container_id/version 되돌리기).
+    // deployed 유지든 planning_update 반송이든, 이전 버전이 살아있어야 한다는
+    // 불변식은 동일. 컨테이너 자체는 freshDeploy에서 이미 제거됨.
+    if (mode === 'update' && proj.previous_container_id) {
+      await this.projectRepo.update(projectId, {
+        container_id: proj.previous_container_id,
+        current_version: proj.previous_version ?? proj.current_version,
+        previous_container_id: null,
+        previous_version: null,
+      });
     }
 
     try {
