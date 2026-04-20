@@ -73,13 +73,19 @@ state는 분리하되 코어 로직은 함수 공유.
 
 ### D4. 롤백 시맨틱 (핵심 불변식)
 
-`updating` / `update_qa` 실패 시:
-1. 새 컨테이너는 생성·제거된 상태. 이전 `container_id`가 이미 `projects` 테이블에 없을 수 있음.
-2. **projects에 `previous_container_id`·`previous_version` 컬럼 추가** — update 시작 직전 백업.
-3. 실패 판정 시:
-    - code_bug / schema_bug → `planning_update` 복귀 + previous 복구(컨테이너 이미 제거됐으면 프로젝트 디렉토리 git checkout으로 직전 커밋 체크아웃 후 createContainer)
-    - infra_error / transient → `deployed` 유지 + 토스트. 가능하면 previous로 즉시 복구.
-4. 성공 시: previous 필드는 history 용으로 `project_versions` 테이블에 기록만 하고 projects 컬럼은 clear.
+**불변식**: `updating` / `update_qa` 실패 시 유저의 앱은 끊기지 않는다. 이전 버전 컨테이너가 계속 돌고 있어야 한다.
+
+구현 전략 — **"이전 컨테이너를 섣불리 제거하지 않는다"**:
+
+1. `update_ready → updating` 전이 시 `projects.previous_container_id` / `previous_version`에 현재 값 백업.
+2. Building Agent가 phase를 실행하는 동안 이전 컨테이너는 **그대로 돌고 있다** (코드 적용은 프로젝트 디렉토리 파일 수정만).
+3. Building Agent 성공 후 env-deploy가 **새 포트**에 **새 컨테이너**를 띄우고 헬스체크:
+    - **헬스체크 성공** → 이전 컨테이너 제거, `current_version += 1`, `previous_*` clear, `deployed` 전이.
+    - **헬스체크 실패** → 새 컨테이너만 제거. 이전 컨테이너 그대로 유지. DB의 `container_id` / `current_version`을 `previous_*`로 되돌림. 분류에 따라 `planning_update` 반송 또는 `deployed` 유지.
+4. phase 실행 실패 (`updating` 중 exit 2) → 이전 컨테이너 건드리지 않았으므로 DB만 `previous_*`로 되돌리면 끝. 상태는 `planning_update` (code_bug / schema_bug / unknown) 또는 `deployed` (infra_error / transient).
+5. 성공 시 `project_versions`에 새 버전 row 추가 (container_id, primary_endpoints 포함).
+
+이 전략은 초안의 "git checkout으로 직전 커밋 체크아웃 후 createContainer" 같은 복구 경로를 필요 없게 만든다 — 이전 컨테이너가 살아있으므로 파일 시스템 상태와 무관.
 
 ### D5. Planning Agent 시스템 프롬프트 분기
 

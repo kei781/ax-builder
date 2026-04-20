@@ -57,8 +57,8 @@ const VALID_TRANSITIONS: Record<ProjectState, ProjectState[]> = {
     'planning_update',
     'failed',
   ],
-  // update_qa: regression 실패 시 planning_update로 반송. 성공 시 deployed.
-  update_qa: ['deployed', 'planning_update', 'failed'],
+  // update_qa: regression 통과 후 env_qa 경유 배포. 실패 시 planning_update 반송.
+  update_qa: ['env_qa', 'deployed', 'planning_update', 'failed'],
 };
 
 @Injectable()

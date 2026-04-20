@@ -360,6 +360,21 @@ export class BuildingRunner {
           this.phaseIds.get(projectId)?.set(phaseName, row.id);
         })
         .catch((e) => this.logger.warn(`phase_start persist: ${e.message}`));
+
+      // ADR 0008 / PRD §10.1 — QA phase 진입 시 state를 qa / update_qa로 전이해
+      // UI가 "검증 중" / "회귀 검증 중" 배지를 띄울 수 있게 한다. 이전에는 building /
+      // updating → 바로 env_qa로 건너뛰어 qa·update_qa 배지가 죽은 상태였음.
+      if (phaseName === 'qa') {
+        const mode = this.modes.get(projectId) ?? 'build';
+        const qaState = mode === 'update' ? 'update_qa' : 'qa';
+        void this.stateMachine
+          .transition(projectId, qaState, `${mode} QA phase started`)
+          .catch((err) =>
+            this.logger.warn(
+              `transition to ${qaState} failed: ${(err as Error).message}`,
+            ),
+          );
+      }
     }
 
     if (et === 'phase_end') {
