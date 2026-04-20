@@ -6,7 +6,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In } from 'typeorm';
+import { Repository, In, Not, IsNull } from 'typeorm';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 
@@ -103,43 +103,73 @@ export class BuildingRunner implements OnModuleInit {
    * 수동으로 재시도하거나 프로젝트 삭제 결정.
    */
   async onModuleInit(): Promise<void> {
+    // 1) state 기반 고아 빌드 정리
     const STUCK_STATES = ['building', 'qa', 'updating', 'update_qa'] as const;
     const orphaned = await this.projectRepo.find({
       where: { state: In([...STUCK_STATES]) },
     });
-    if (orphaned.length === 0) return;
-
-    this.logger.warn(
-      `onModuleInit: 고아 빌드 ${orphaned.length}건 감지 — state를 failed로 정리`,
-    );
-    for (const proj of orphaned) {
-      try {
-        // 이 빌드의 최신 build row도 cancelled로.
-        const latestBuild = await this.builds.getLatestBuild(proj.id);
-        if (latestBuild && latestBuild.status === 'running') {
-          await this.builds.closeBuild(latestBuild.id, 'cancelled', [
-            'orchestrator 재시작으로 빌드 프로세스가 고아가 됐어요. "다시 빌드"로 재시도하세요.',
-          ]);
-          // 진행 중이던 phase도 정리 — 직접 UPDATE는 레포 호출로.
-          const phases = await this.builds.getPhasesForBuild(latestBuild.id);
-          for (const ph of phases) {
-            if (ph.status === 'running') {
-              await this.builds.updatePhase(ph.id, {
-                status: 'cancelled',
-                finished_at: new Date(),
-                output_log:
-                  (ph.output_log ?? '') +
-                  '\n[orchestrator 재시작으로 자동 정리]',
-              });
+    if (orphaned.length > 0) {
+      this.logger.warn(
+        `onModuleInit: 고아 빌드 ${orphaned.length}건 감지 — state를 failed로 정리`,
+      );
+      for (const proj of orphaned) {
+        try {
+          // 이 빌드의 최신 build row도 cancelled로.
+          const latestBuild = await this.builds.getLatestBuild(proj.id);
+          if (latestBuild && latestBuild.status === 'running') {
+            await this.builds.closeBuild(latestBuild.id, 'cancelled', [
+              'orchestrator 재시작으로 빌드 프로세스가 고아가 됐어요. "다시 빌드"로 재시도하세요.',
+            ]);
+            // 진행 중이던 phase도 정리.
+            const phases = await this.builds.getPhasesForBuild(latestBuild.id);
+            for (const ph of phases) {
+              if (ph.status === 'running') {
+                await this.builds.updatePhase(ph.id, {
+                  status: 'cancelled',
+                  finished_at: new Date(),
+                  output_log:
+                    (ph.output_log ?? '') +
+                    '\n[orchestrator 재시작으로 자동 정리]',
+                });
+              }
             }
           }
+          // 업데이트 라인이면 previous 컨테이너로 복구 (불변식 유지). 첫 빌드
+          // 라인이면 좀비 컨테이너 정리.
+          const isUpdate = proj.state === 'updating' || proj.state === 'update_qa';
+          if (isUpdate && proj.previous_container_id) {
+            await this.rollbackToPrevious(proj.id);
+          } else {
+            await this.cleanupFailedContainer(proj.id);
+          }
+          await this.stateMachine.transition(proj.id, 'failed', 'orphaned on restart');
+          this.logger.log(`  - ${proj.id} (${proj.state} → failed)`);
+        } catch (err: any) {
+          this.logger.warn(
+            `  - ${proj.id} 정리 실패: ${err?.message ?? err}`,
+          );
         }
-        await this.stateMachine.transition(proj.id, 'failed', 'orphaned on restart');
-        this.logger.log(`  - ${proj.id} (${proj.state} → failed)`);
-      } catch (err: any) {
-        this.logger.warn(
-          `  - ${proj.id} 정리 실패: ${err?.message ?? err}`,
-        );
+      }
+    }
+
+    // 2) state는 정상인데 좀비 컨테이너만 남은 경우 정리
+    // (회고 §7.5 — `failed` 상태인데 container_id가 살아있는 케이스가 오늘 포트
+    // 충돌의 직접 원인이었음. 과거 버그로 이런 row가 누적됐을 수 있으니 startup
+    // 때 sweep.)
+    const zombieFailedWithContainer = await this.projectRepo.find({
+      where: { state: 'failed', container_id: Not(IsNull()) },
+    });
+    if (zombieFailedWithContainer.length > 0) {
+      this.logger.warn(
+        `onModuleInit: failed 상태에 살아있는 컨테이너 ${zombieFailedWithContainer.length}건 감지 — 정리`,
+      );
+      for (const proj of zombieFailedWithContainer) {
+        try {
+          await this.cleanupFailedContainer(proj.id);
+          this.logger.log(`  - ${proj.id}: zombie container removed`);
+        } catch (err: any) {
+          this.logger.warn(`  - ${proj.id} 좀비 정리 실패: ${err?.message ?? err}`);
+        }
       }
     }
   }
@@ -333,6 +363,11 @@ export class BuildingRunner implements OnModuleInit {
         previous_container_id: null,
         previous_version: null,
       });
+    } else {
+      // 첫 빌드 라인 취소: 좀비 컨테이너 정리 (회고 §7.5).
+      // 빌드 도중 취소면 보통 container_id는 null이지만, env_qa 진행 중 취소
+      // 같은 edge case에서 남아있을 수 있음.
+      await this.cleanupFailedContainer(projectId);
     }
 
     const updated = await this.stateMachine.transition(
@@ -667,6 +702,8 @@ export class BuildingRunner implements OnModuleInit {
             /* ignore */
           }
         } else {
+          // 첫 빌드 라인 infra_error: 좀비 컨테이너 정리 (회고 §7.5).
+          await this.cleanupFailedContainer(projectId);
           try {
             await this.stateMachine.transition(
               projectId,
@@ -713,6 +750,8 @@ export class BuildingRunner implements OnModuleInit {
             /* ignore */
           }
         } else {
+          // 첫 빌드 라인 transient: 좀비 컨테이너 정리 (회고 §7.5).
+          await this.cleanupFailedContainer(projectId);
           try {
             await this.stateMachine.transition(
               projectId,
@@ -767,6 +806,8 @@ export class BuildingRunner implements OnModuleInit {
           /* ignore */
         }
       } else {
+        // 첫 빌드 라인 code_bug/unknown: 좀비 컨테이너 정리 (회고 §7.5).
+        await this.cleanupFailedContainer(projectId);
         try {
           await this.stateMachine.transition(
             projectId,
@@ -815,6 +856,8 @@ export class BuildingRunner implements OnModuleInit {
           /* ignore */
         }
       } else {
+        // 첫 빌드 라인 unrecoverable: 좀비 컨테이너 정리 (회고 §7.5).
+        await this.cleanupFailedContainer(projectId);
         try {
           await this.stateMachine.transition(projectId, 'failed', `exit code ${code}`);
         } catch {
@@ -850,5 +893,41 @@ export class BuildingRunner implements OnModuleInit {
     this.logger.log(
       `rolled back project ${projectId} to version ${proj.previous_version}`,
     );
+  }
+
+  /**
+   * 회고 §7.5 후속 — 빌드 실패·취소·고아로 `failed`가 될 때 좀비 컨테이너를
+   * 예방한다. projects.container_id가 있으면 `docker rm -f` 실행 후 필드 clear.
+   *
+   * **호출 조건 (중요)**: 첫 빌드 라인에서 failure로 빠지는 경로에서만 호출.
+   * 업데이트 라인은 previous 컨테이너가 **살아있어야** 하는 불변식(ADR 0008
+   * §D4)이므로 여기 로직 밖. update 쪽은 rollbackToPrevious()로 별도 처리.
+   *
+   * idempotent: container_id 없거나 이미 제거된 경우도 안전하게 no-op.
+   * remove 실패는 warn 로그만 — Docker daemon 다운 등 운영자 상황일 뿐
+   * 반환 흐름은 계속 진행. (DB 필드는 어쨌든 clear해서 port-allocator의
+   * 좀비 방어 쿼리에서 벗어나게 한다.)
+   */
+  private async cleanupFailedContainer(projectId: string): Promise<void> {
+    const proj = await this.projectRepo.findOne({ where: { id: projectId } });
+    if (!proj) return;
+    if (!proj.container_id) return; // 정리할 컨테이너 없음
+
+    try {
+      await this.docker.removeContainer(proj.container_id);
+      this.logger.log(
+        `cleanupFailedContainer: removed ${proj.container_id.slice(0, 12)} for project ${projectId}`,
+      );
+    } catch (err: any) {
+      this.logger.warn(
+        `cleanupFailedContainer: docker rm 실패 (${proj.container_id.slice(0, 12)}): ${err?.message ?? err} — DB 필드는 clear 진행`,
+      );
+    }
+
+    // port-allocator가 이 row를 "점유 중"으로 판단하지 않도록 필드 비움.
+    await this.projectRepo.update(projectId, {
+      container_id: null,
+      port: null,
+    });
   }
 }

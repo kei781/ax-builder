@@ -240,4 +240,4 @@ state: In(['building', 'qa', 'deployed', 'modifying']),
 
 - **할당자(allocator)는 자신의 기록만 믿지 말라**. DB 쿼리는 시작점이지 결론이 아니다. OS의 실제 상태(bind 가능 여부, 프로세스 존재 여부)로 교차검증.
 - **하드코딩을 "허용"하는 시스템은 시간 지나면 깨진다**. ADR 0001의 "관찰 QA"는 단일 앱 테스트엔 맞지만 병렬 기동 환경에는 약함. 앱 측 규율(PORT env 존중)을 명시적으로 요구하는 게 장기적으로 건강.
-- **후속 작업**: 빌드 실패·취소 시 컨테이너를 항상 `docker rm -f` 하고 projects.port/container_id를 null로 clear하는 로직 추가 필요 (현재 env-deploy는 일부만 처리, building.runner 실패 경로는 누락). 좀비 예방이 탐지·복구보다 싸다.
+- **후속 작업** (완료 — 같은 날): `BuildingRunner.cleanupFailedContainer()` 헬퍼 신규. 첫 빌드 라인의 모든 failure 경로(handleExit의 infra/transient/code_bug/unrecoverable, cancel의 rollback 불가 분기)에서 호출해 `docker rm -f` + projects.port/container_id clear. 업데이트 라인은 previous 유지 불변식 때문에 호출 안 함. 추가로 `onModuleInit`에 "state=failed인데 container_id 살아있는" 좀비 스위프 단계도 추가 — 재시작마다 과거 누적 좀비 자동 정리. 예방이 탐지·복구보다 싸다.
