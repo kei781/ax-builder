@@ -141,6 +141,8 @@ export class EnvDeployService {
       }
     }
 
+    const envDict = await this.envs.resolveAllForContainer(projectId);
+
     let port: number;
     let containerId: string;
     try {
@@ -149,6 +151,7 @@ export class EnvDeployService {
         projectId,
         proj.project_path!,
         port,
+        envDict,
       );
       await this.docker.startContainer(containerId);
     } catch (err: any) {
@@ -195,40 +198,79 @@ export class EnvDeployService {
     this.emitCompletion(projectId, port, containerId);
   }
 
+  /**
+   * env 값이 바뀌었을 때 컨테이너에 새 값이 반영되려면 **recreate**가 필요하다.
+   * Docker의 Env는 createContainer 시점에 고정되므로 `docker restart`로는
+   * 값이 갱신되지 않는다. 기존 컨테이너를 정리하고 새 env로 재생성한다.
+   *
+   * 이전 컨테이너는 같은 이름/같은 포트 매핑을 쓰므로 호스트 port는 유지된다.
+   * 문제 발생 시 fresh path와 동일하게 handleFailure → deployed 유지 롤백.
+   */
   private async maintenanceRestart(
     projectId: string,
-    containerId: string,
+    oldContainerId: string,
     port: number,
   ): Promise<void> {
+    const proj = await this.projectRepo.findOne({ where: { id: projectId } });
+    if (!proj?.project_path) {
+      this.logger.error(`project_path missing for ${projectId}`);
+      await this.handleFailure(projectId, 'project_path missing', 'maintenance');
+      return;
+    }
+
+    // 1) Remove old container (stop + rm)
     try {
-      await this.docker.restartContainer(containerId);
+      await this.docker.removeContainer(oldContainerId);
     } catch (err: any) {
-      this.logger.error(`container restart failed: ${err?.message ?? err}`);
+      this.logger.warn(`removing old container failed: ${err?.message ?? err}`);
+      // Proceed anyway — creating with same name will fail and surface the issue.
+    }
+
+    // 2) Recreate with fresh env
+    const envDict = await this.envs.resolveAllForContainer(projectId);
+
+    let newContainerId: string;
+    try {
+      newContainerId = await this.docker.createContainer(
+        projectId,
+        proj.project_path,
+        port,
+        envDict,
+      );
+      await this.docker.startContainer(newContainerId);
+    } catch (err: any) {
+      this.logger.error(`container recreate failed: ${err?.message ?? err}`);
       await this.handleFailure(
         projectId,
-        `container restart failed: ${err?.message ?? 'unknown'}`,
+        `container recreate failed: ${err?.message ?? 'unknown'}`,
         'maintenance',
       );
       return;
     }
 
-    const ok = await this.pollHealth(port, 10_000);
+    // 3) Health check
+    const ok = await this.pollHealth(port, 60_000);
     if (!ok) {
       this.logger.warn(
-        `maintenance restart health poll failed for ${projectId} port ${port}`,
+        `maintenance recreate health poll failed for ${projectId} port ${port}`,
       );
-      const logs = await this.docker.getLogs(containerId, 500);
+      const logs = await this.docker.getLogs(newContainerId, 500);
+      // Keep new container around — user might want to inspect. We stay on
+      // `deployed` via handleFailure routing (non-code failures).
       await this.handleFailure(projectId, logs, 'maintenance');
       return;
     }
 
-    await this.projectRepo.update(projectId, { env_attempts: 0 });
+    await this.projectRepo.update(projectId, {
+      env_attempts: 0,
+      container_id: newContainerId,
+    });
     try {
-      await this.stateMachine.transition(projectId, 'deployed', 'maintenance restart ok');
+      await this.stateMachine.transition(projectId, 'deployed', 'maintenance recreate ok');
     } catch {
       /* ignore */
     }
-    this.emitCompletion(projectId, port, containerId);
+    this.emitCompletion(projectId, port, newContainerId);
   }
 
   private emitCompletion(

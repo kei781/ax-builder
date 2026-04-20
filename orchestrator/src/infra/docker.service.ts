@@ -14,9 +14,10 @@ export class DockerService {
     projectId: string,
     projectPath: string,
     port: number,
+    extraEnv: Record<string, string> = {},
   ): Promise<string> {
     this.logger.log(
-      `Creating container for project ${projectId} on port ${port}`,
+      `Creating container for project ${projectId} on port ${port} (envs=${Object.keys(extraEnv).length})`,
     );
 
     // Ensure base image is available; pull if missing.
@@ -33,10 +34,21 @@ export class DockerService {
     // 컨테이너에 bind-mount되면 `invalid ELF header`로 죽는다. 빈 볼륨으로
     // 덮어서 컨테이너가 `npm install`로 올바른 Linux 바이너리를 새로
     // 세팅하도록 한다.
+    //
+    // `extraEnv` — project_env_vars의 복호화된 값들. 앱이 `require('dotenv').config()`
+    // 를 호출하지 않아도 process.env에서 읽을 수 있도록 Docker Env로 주입한다.
+    // 플랫폼 기본값(PORT/NODE_ENV)보다 나중에 넣어 덮어쓰기 허용.
+    const baseEnv: Record<string, string> = {
+      PORT: '3000',
+      NODE_ENV: 'production',
+      ...extraEnv,
+    };
+    const envArray = Object.entries(baseEnv).map(([k, v]) => `${k}=${v}`);
+
     const container = await this.docker.createContainer({
       Image: 'node:20-slim',
       name: `project-${projectId}`,
-      Env: ['PORT=3000', 'NODE_ENV=production'],
+      Env: envArray,
       ExposedPorts: { '3000/tcp': {} },
       Volumes: {
         '/app/node_modules': {},

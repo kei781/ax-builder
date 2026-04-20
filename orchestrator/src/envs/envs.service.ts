@@ -326,6 +326,27 @@ export class EnvsService {
     this.logger.log(`Wrote .env for project ${projectId} (${rows.length} vars)`);
   }
 
+  /**
+   * Return all resolved env values (decrypted) as a key→value dict.
+   * Used to pass as Docker container Env at create time, so the app
+   * process sees them in process.env without needing `dotenv`.
+   */
+  async resolveAllForContainer(projectId: string): Promise<Record<string, string>> {
+    const rows = await this.envRepo.find({ where: { project_id: projectId } });
+    const dict: Record<string, string> = {};
+    for (const r of rows) {
+      if (!r.value_ciphertext) continue;
+      try {
+        dict[r.key] = this.crypto.decrypt(r.value_ciphertext);
+      } catch (err: any) {
+        this.logger.warn(
+          `resolveAllForContainer: decrypt failed for ${r.key}: ${err?.message ?? err}`,
+        );
+      }
+    }
+    return dict;
+  }
+
   async hasUserRequired(projectId: string): Promise<boolean> {
     const c = await this.envRepo.count({
       where: {
