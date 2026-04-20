@@ -103,12 +103,21 @@ export default function Chat() {
   const [status, setStatus] = useState<string>('');
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const [myRole, setMyRole] = useState<'owner' | 'editor' | 'viewer'>('viewer');
-  const [handoffBanner, setHandoffBanner] = useState<string | null>(null);
+  // handoff 배너 — AI 텍스트 대신 "도구 결과를 직접" 표시해 환각 차단.
+  // kind='success'  = accepted → plan_ready/update_ready 전이됨
+  // kind='rejected' = accepted=false 또는 ok=false → 거부 이유 노출
+  // kind='warning'  = 기타 주의 (ex: watchdog "AI가 도구 호출 안 함")
+  const [handoffBanner, setHandoffBanner] = useState<{
+    kind: 'success' | 'rejected' | 'warning';
+    detail: string;
+    detail_extra?: string;
+  } | null>(null);
   const [building, setBuilding] = useState(false);
   const [readiness, setReadiness] = useState<{
     completeness: Record<string, number>;
     score: number;
     can_build: boolean;
+    is_sufficient: boolean;
     summary: string;
     label: string;
   } | null>(null);
@@ -202,15 +211,27 @@ export default function Chat() {
 
           // readiness_update from evaluate_readiness tool
           if (event.phase === 'readiness_update' && p?.completeness) {
+            // is_sufficient: min >= 0.85 (충분 조건). p에 명시가 없으면 로컬 계산.
+            const vals = Object.values(p.completeness);
+            const minScore = vals.length ? Math.min(...vals) : 0;
+            const canBuild = p.can_build ?? minScore >= 0.6;
+            const isSufficient = p.is_sufficient ?? minScore >= 0.85;
             setReadiness({
               completeness: p.completeness,
               score: p.score ?? 0,
-              can_build: p.can_build ?? false,
+              can_build: canBuild,
+              is_sufficient: isSufficient,
               summary: p.summary ?? '',
-              label: p.label ?? '',
+              label:
+                p.label ||
+                (isSufficient
+                  ? '충분 조건 충족'
+                  : canBuild
+                    ? '최소 조건 충족 (보강 권장)'
+                    : '보강 필요'),
             });
           }
-          // plan_ready / update_ready transition
+          // plan_ready / update_ready — 성공 전이.
           if (
             event.phase === 'plan_ready' ||
             event.phase === 'update_ready' ||
@@ -220,9 +241,30 @@ export default function Chat() {
               (event.phase === 'plan_ready' || event.phase === 'update_ready') &&
               p?.detail
             ) {
-              setHandoffBanner(p.detail);
+              setHandoffBanner({ kind: 'success', detail: p.detail });
             }
             void fetchProject();
+          }
+          // handoff_rejected — accepted=false. AI 텍스트 대신 이 배너가 진실.
+          if (event.phase === 'handoff_rejected') {
+            const pr = p as {
+              detail?: string;
+              min_completeness?: number;
+              is_sufficient?: boolean;
+              has_unresolved?: boolean;
+            };
+            const extras: string[] = [];
+            if (typeof pr.min_completeness === 'number') {
+              extras.push(`최저 완성도 ${(pr.min_completeness * 100).toFixed(0)}%`);
+            }
+            if (pr.has_unresolved) {
+              extras.push('남은 질문 있음');
+            }
+            setHandoffBanner({
+              kind: 'rejected',
+              detail: pr.detail ?? '핸드오프가 거부됐습니다.',
+              detail_extra: extras.length ? extras.join(' · ') : undefined,
+            });
           }
           break;
         }
@@ -253,12 +295,9 @@ export default function Chat() {
           const err = p?.result?.error ? ` — ${p.result.error}` : '';
           setStatus(`${ok ? '✓' : '✗'} ${p?.name ?? 'tool'}${where}${err}`);
 
-          if (p?.name === 'propose_handoff' && ok) {
-            const accepted = p.result?.accepted === true;
-            if (!accepted && p.result?.reason) {
-              setHandoffBanner(`핸드오프 보류: ${p.result.reason}`);
-            }
-          }
+          // propose_handoff 결과는 server-side handleAgentEvent가 progress(phase=
+          // handoff_rejected/plan_ready/update_ready) 이벤트로 전용 emit하므로
+          // 여기서 중복 배너 설정하지 않는다. (AI 텍스트 의존 제거 — 회고 §5)
           break;
         }
         case 'completion': {
@@ -341,9 +380,11 @@ export default function Chat() {
           try {
             const r = await client.get(`/projects/${id}`);
             if (r.data.state !== 'plan_ready' && r.data.state !== 'update_ready') {
-              setHandoffBanner(
-                'AI가 도구를 호출하지 않은 것 같아요. "AI에게 핸드오프 요청"을 한 번 더 눌러주세요.',
-              );
+              setHandoffBanner({
+                kind: 'warning',
+                detail:
+                  'AI가 도구를 호출하지 않은 것 같아요. "AI에게 핸드오프 요청"을 한 번 더 눌러주세요.',
+              });
               setStatus('핸드오프 재시도 필요');
             }
           } catch {
@@ -385,11 +426,20 @@ export default function Chat() {
   const canEdit = myRole === 'owner' || myRole === 'editor';
   const state = project?.state ?? 'draft';
 
-  const scoreColor = (readiness?.score ?? 0) >= 600
-    ? 'text-green-400'
-    : (readiness?.score ?? 0) >= 400
-      ? 'text-yellow-400'
-      : 'text-red-400';
+  // 사이드바 색 체계 (ADR-independent — UX 일관성):
+  //   is_sufficient (min>=0.85): 초록 — "진짜 빌드 가능" 신호
+  //   can_build (min>=0.6)     : 노랑 — "최소 조건 충족, propose_handoff 거부 가능"
+  //   그 외                     : 빨강 — "보강 필요"
+  const scoreColor = readiness?.is_sufficient
+    ? 'text-green-500 dark:text-green-400'
+    : readiness?.can_build
+      ? 'text-yellow-500 dark:text-yellow-400'
+      : 'text-red-500 dark:text-red-400';
+  const scoreBarColor = readiness?.is_sufficient
+    ? 'bg-green-500'
+    : readiness?.can_build
+      ? 'bg-yellow-500'
+      : 'bg-red-500';
 
   const CATEGORY_LABELS: Record<string, string> = {
     problem_definition: '문제 정의',
@@ -461,11 +511,11 @@ export default function Chat() {
           </div>
         )}
 
-      {/* Handoff banner */}
-      {handoffBanner && (
+      {/* Handoff banner — 도구 결과를 직접 표시. AI 텍스트에 의존하지 않는다. */}
+      {handoffBanner && handoffBanner.kind === 'success' && (
         <div className="px-6 py-3 bg-green-500/10 border-b border-green-500/30 flex items-center justify-between">
           <span className="text-sm text-green-700 dark:text-green-400">
-            🎉 {handoffBanner}
+            🎉 {handoffBanner.detail}
           </span>
           {canBuild && (
             <button
@@ -473,9 +523,35 @@ export default function Chat() {
               disabled={building}
               className="bg-green-600 hover:bg-green-500 disabled:bg-gray-400 text-white text-sm px-4 py-1.5 rounded-lg font-medium"
             >
-              {building ? '시작 중...' : '🚀 빌드 시작'}
+              {building
+                ? '시작 중...'
+                : isUpdateLine
+                  ? '↺ 업데이트 시작'
+                  : '🚀 빌드 시작'}
             </button>
           )}
+        </div>
+      )}
+      {handoffBanner && handoffBanner.kind === 'rejected' && (
+        <div className="px-6 py-3 bg-orange-500/10 border-b border-orange-500/30">
+          <p className="text-sm text-orange-700 dark:text-orange-300 font-medium mb-1">
+            ⚠ 핸드오프 거부 — {handoffBanner.detail}
+          </p>
+          {handoffBanner.detail_extra && (
+            <p className="text-xs text-orange-700 dark:text-orange-400">
+              {handoffBanner.detail_extra}
+            </p>
+          )}
+          <p className="text-xs text-orange-600 dark:text-orange-400 mt-1">
+            AI의 텍스트 설명과 무관하게 실제 도구 판정입니다. 대화로 기획을 보강한 뒤 다시 시도해주세요.
+          </p>
+        </div>
+      )}
+      {handoffBanner && handoffBanner.kind === 'warning' && (
+        <div className="px-6 py-3 bg-yellow-500/10 border-b border-yellow-500/30">
+          <p className="text-sm text-yellow-700 dark:text-yellow-300">
+            ⚠ {handoffBanner.detail}
+          </p>
         </div>
       )}
 
@@ -601,11 +677,16 @@ export default function Chat() {
           </div>
           <div className="w-full bg-gray-200 dark:bg-gray-800 rounded-full h-3 mb-2">
             <div
-              className="bg-green-500 h-3 rounded-full transition-all duration-500"
+              className={`${scoreBarColor} h-3 rounded-full transition-all duration-500`}
               style={{ width: `${((readiness?.score ?? 0) / 1000) * 100}%` }}
             />
           </div>
           <p className={`text-sm ${scoreColor}`}>{readiness?.label ?? '대화를 시작하세요'}</p>
+          {readiness?.can_build && !readiness?.is_sufficient && (
+            <p className="text-yellow-600 dark:text-yellow-400 text-xs mt-1">
+              ⚠ 최소 조건만 충족 — propose_handoff가 "보강 권장"으로 거부될 수 있어요.
+            </p>
+          )}
           {readiness?.summary && (
             <p className="text-gray-500 text-xs mt-1">{readiness.summary}</p>
           )}

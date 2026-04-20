@@ -405,9 +405,15 @@ export class BuildingRunner implements OnModuleInit {
       ? await this.builds.getPhasesForBuild(latestBuild.id)
       : [];
 
+    // 연속 실패 횟수 — 프론트가 retry 배너 primary/secondary 순서 결정에 사용.
+    const consecutive_failures = await this.builds.getConsecutiveFailureCount(
+      projectId,
+    );
+
     return {
       active,
       state: project.state,
+      consecutive_failures,
       build: latestBuild
         ? {
             id: latestBuild.id,
@@ -517,7 +523,9 @@ export class BuildingRunner implements OnModuleInit {
         .catch((e) => this.logger.warn(`agent_log persist: ${e.message}`));
     }
 
-    // bounce 이유로 쓸 gap_list 누적.
+    // bounce 이유로 쓸 gap_list 누적. 중복 제거 (동일 phase의 phase_end와
+    // error 이벤트가 같은 gap을 싣는 경우가 있어 배너에 같은 줄이 두 번
+    // 보이는 버그를 차단).
     //   - error 이벤트의 payload.gap_list (phase_failure / qa_failure 등)
     //   - phase_end 이벤트의 payload.gap_list (QA path)
     if (et === 'error' || et === 'phase_end') {
@@ -526,7 +534,13 @@ export class BuildingRunner implements OnModuleInit {
         : [];
       if (gapList.length) {
         const bucket = this.bounceGaps.get(projectId) ?? [];
-        bucket.push(...gapList);
+        const existing = new Set(bucket);
+        for (const g of gapList) {
+          if (!existing.has(g)) {
+            bucket.push(g);
+            existing.add(g);
+          }
+        }
         this.bounceGaps.set(projectId, bucket);
       }
     }
@@ -725,42 +739,58 @@ export class BuildingRunner implements OnModuleInit {
         return;
       }
 
-      // code_bug / unknown → 대화로 고칠 수 있는 실패.
-      //   첫 빌드 라인: planning 반송
-      //   업데이트 라인: planning_update 반송 + previous 복구 (컨테이너는 살아있음)
+      // code_bug / unknown:
+      //   첫 빌드 라인: 이전에는 자동 planning 반송이었지만 — Claude Code
+      //   실행이 확률적이라 같은 PRD로 재빌드하면 풀리는 경우가 많음. 그래서
+      //   상태를 **failed**로 두고 유저가 UI에서 "다시 빌드" vs "기획 대화로"를
+      //   **명시적으로 선택**하게 한다 (/build/retry 엔드포인트).
+      //   2회 연속 실패하면 프론트 배너가 primary CTA를 "기획 대화로"로 뒤집음.
+      //
+      //   업데이트 라인: 여전히 planning_update 반송 + previous 복구. 업데이트는
+      //   이미 배포 버전이 살아있고 대화로 수정하는 흐름이 자연스러우므로.
       await this.builds.closeBuild(
         buildId,
-        'bounced',
+        isUpdate ? 'bounced' : 'failed',
         gaps.length
           ? gaps
-          : ['빌드가 반송됐습니다. 상세 사유가 기록되지 않았습니다.'],
+          : ['빌드가 실패했습니다. 상세 사유가 기록되지 않았습니다.'],
       );
-      const bounceTo = isUpdate ? 'planning_update' : 'planning';
       if (isUpdate) {
         await this.rollbackToPrevious(projectId);
-      }
-      try {
-        await this.stateMachine.transition(
-          projectId,
-          bounceTo,
-          `bounce-back: ${verdict.kind} mode=${mode}`,
-        );
-      } catch {
-        // State might have been transitioned already by a cancel.
+        try {
+          await this.stateMachine.transition(
+            projectId,
+            'planning_update',
+            `bounce-back: ${verdict.kind} mode=update`,
+          );
+        } catch {
+          /* ignore */
+        }
+      } else {
+        try {
+          await this.stateMachine.transition(
+            projectId,
+            'failed',
+            `code_bug/unknown (retry-first): ${verdict.kind}`,
+          );
+        } catch {
+          /* ignore */
+        }
       }
       this.gateway.emit({
         agent: 'building',
         project_id: projectId,
         event_type: 'progress',
-        phase: 'bounce_back',
+        phase: isUpdate ? 'bounce_back' : 'build_failed_retryable',
         payload: {
           detail: isUpdate
             ? '업데이트 실패 — 대화로 돌아가 보강해주세요. 이전 버전은 유지됩니다.'
-            : '빌드 실패 — 기획 대화로 돌아갑니다.',
+            : '빌드 실패 — 같은 기획으로 다시 시도하거나 대화로 보강할 수 있어요.',
           classifier: verdict.kind,
           matched_rule: verdict.matched_rule,
           gap_list: gaps,
           mode,
+          retryable: !isUpdate,
         },
       });
     } else {

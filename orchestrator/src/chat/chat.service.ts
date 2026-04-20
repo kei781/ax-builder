@@ -93,10 +93,14 @@ export class ChatService {
     ]);
 
     // Build readiness from latest handoff (if handoff exists — plan_ready state).
+    // is_sufficient 플래그를 추가: min >= 0.85 (충분 조건).
+    // can_build: min >= 0.6 + unresolved 없음 (최소 조건).
+    // 프론트가 두 값을 구분해 "최소 조건 충족(보강 권장)" vs "충분 조건 충족" 배지 분기.
     let readiness: {
       completeness: Record<string, number>;
       score: number;
       can_build: boolean;
+      is_sufficient: boolean;
       summary: string;
       label: string;
     } | null = null;
@@ -104,12 +108,19 @@ export class ChatService {
     if (handoff) {
       const values = Object.values(handoff.completeness) as number[];
       const minScore = Math.min(...values);
+      const canBuild = minScore >= 0.6 && handoff.unresolved_questions.length === 0;
+      const isSufficient = minScore >= 0.85 && handoff.unresolved_questions.length === 0;
       readiness = {
         completeness: handoff.completeness,
         score: Math.round((values.reduce((a, b) => a + b, 0) / values.length) * 1000),
-        can_build: minScore >= 0.6 && handoff.unresolved_questions.length === 0,
+        can_build: canBuild,
+        is_sufficient: isSufficient,
         summary: '',
-        label: minScore >= 0.6 ? '빌드 가능' : '보완 필요',
+        label: isSufficient
+          ? '충분 조건 충족'
+          : canBuild
+            ? '최소 조건 충족 (보강 권장)'
+            : '보강 필요',
       };
     } else {
       // No handoff yet — fall back to the latest evaluate_readiness tool_result
@@ -128,17 +139,30 @@ export class ChatService {
             completeness?: Record<string, number>;
             score?: number;
             can_build?: boolean;
+            is_sufficient?: boolean;
             summary?: string;
             label?: string;
           };
         };
         if (p.result?.completeness) {
+          // evaluate_readiness는 min>=0.85 여부를 모를 수 있으니 로컬에서 재계산.
+          const vals = Object.values(p.result.completeness) as number[];
+          const minScore = vals.length ? Math.min(...vals) : 0;
+          const canBuild = p.result.can_build ?? minScore >= 0.6;
+          const isSufficient = p.result.is_sufficient ?? minScore >= 0.85;
           readiness = {
             completeness: p.result.completeness,
             score: p.result.score ?? 0,
-            can_build: p.result.can_build ?? false,
+            can_build: canBuild,
+            is_sufficient: isSufficient,
             summary: p.result.summary ?? '',
-            label: p.result.label ?? '',
+            label:
+              p.result.label ||
+              (isSufficient
+                ? '충분 조건 충족'
+                : canBuild
+                  ? '최소 조건 충족 (보강 권장)'
+                  : '보강 필요'),
           };
         }
       }
@@ -481,10 +505,19 @@ export class ChatService {
     // propose_handoff notification — the Python tool writes the handoff row
     // and transitions projects.state directly via SQL; here we surface the
     // transition to the frontend so UI can flip to "빌드 시작" mode.
+    //
     // ADR 0008: propose_handoff는 두 라인의 전이를 모두 담당:
     //   planning → plan_ready  (첫 빌드)
     //   planning_update → update_ready  (업데이트)
-    // 이벤트에 `phase`로 어느 전이인지 구분 — 프론트가 카피/버튼을 나눔.
+    //
+    // [핵심] AI가 tool_result를 잘못 요약해 "이관 완료"라고 환각하는 사례가
+    // 관찰됨 (회고 §5 유사 패턴). 이를 차단하기 위해 **결과와 무관하게** 도구
+    // 호출 직후 전용 이벤트를 emit해 프론트가 확정적 배너를 표시하게 한다.
+    // AI 텍스트 응답은 보조, 이 배너가 진실.
+    //
+    // 이벤트 phase:
+    //   plan_ready / update_ready — accepted=true (전이됨)
+    //   handoff_rejected          — accepted=false (거부됨)
     if (event.event_type === 'tool_result') {
       const payload = (event.payload ?? {}) as {
         name?: string;
@@ -496,29 +529,64 @@ export class ChatService {
           handoff_id?: string;
           min_completeness?: number;
           is_sufficient?: boolean;
+          has_unresolved?: boolean;
+          reason?: string | null;
+          error?: string;
         };
       };
       const r = payload.result;
-      if (payload.name === 'propose_handoff' && r?.ok === true) {
-        const toPlanReady = r.transitioned_to_plan_ready === true;
-        const toUpdateReady = r.transitioned_to_update_ready === true;
-        if (toPlanReady || toUpdateReady) {
-          const phase = toUpdateReady ? 'update_ready' : 'plan_ready';
-          const detailPrefix = toUpdateReady ? '업데이트 준비 완료' : '빌드 준비 완료';
+      if (payload.name === 'propose_handoff' && r) {
+        if (r.ok === true) {
+          const toPlanReady = r.transitioned_to_plan_ready === true;
+          const toUpdateReady = r.transitioned_to_update_ready === true;
+          if (toPlanReady || toUpdateReady) {
+            const phase = toUpdateReady ? 'update_ready' : 'plan_ready';
+            const detailPrefix = toUpdateReady ? '업데이트 준비 완료' : '빌드 준비 완료';
+            this.gateway.emit({
+              agent: 'planning',
+              project_id: event.project_id,
+              session_id: sessionId,
+              event_type: 'progress',
+              phase,
+              progress_percent: 100,
+              payload: {
+                detail: r.is_sufficient
+                  ? `충분 조건 충족 — ${detailPrefix}`
+                  : `최소 조건 충족 — ${detailPrefix}`,
+                handoff_id: r.handoff_id,
+                min_completeness: r.min_completeness,
+                is_sufficient: !!r.is_sufficient,
+                accepted: true,
+              },
+            });
+          } else {
+            // 호출은 됐지만 accepted=false — 거부 이유와 함께 rejected 배너.
+            this.gateway.emit({
+              agent: 'planning',
+              project_id: event.project_id,
+              session_id: sessionId,
+              event_type: 'progress',
+              phase: 'handoff_rejected',
+              payload: {
+                detail: r.reason ?? '핸드오프 조건 미충족',
+                min_completeness: r.min_completeness,
+                is_sufficient: !!r.is_sufficient,
+                has_unresolved: !!r.has_unresolved,
+                accepted: false,
+              },
+            });
+          }
+        } else {
+          // ok=false — 도구 내부 validation 실패 (PRD 없음 등).
           this.gateway.emit({
             agent: 'planning',
             project_id: event.project_id,
             session_id: sessionId,
             event_type: 'progress',
-            phase,
-            progress_percent: 100,
+            phase: 'handoff_rejected',
             payload: {
-              detail: r.is_sufficient
-                ? `충분 조건 충족 — ${detailPrefix}`
-                : `최소 조건 충족 — ${detailPrefix}`,
-              handoff_id: r.handoff_id,
-              min_completeness: r.min_completeness,
-              is_sufficient: !!r.is_sufficient,
+              detail: r.error ?? '핸드오프 호출이 실패했습니다.',
+              accepted: false,
             },
           });
         }

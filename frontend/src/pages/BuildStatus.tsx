@@ -28,6 +28,7 @@ export default function BuildStatus() {
   const [projectState, setProjectState] = useState<string>('building');
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
   const startRef = useRef(Date.now());
 
   useEffect(() => {
@@ -51,6 +52,9 @@ export default function BuildStatus() {
         const data = buildRes.data;
         if (data.build?.started_at) {
           startRef.current = new Date(data.build.started_at).getTime();
+        }
+        if (typeof data.consecutive_failures === 'number') {
+          setConsecutiveFailures(data.consecutive_failures);
         }
         if (data.phases?.length) {
           const phaseLines: string[] = [];
@@ -235,33 +239,56 @@ export default function BuildStatus() {
             <button onClick={() => navigate('/')} className="bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded-xl text-sm">대시보드로</button>
           </div>
         )}
-        {isFailed && (
-          <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-6 flex items-start justify-between gap-4">
-            <div className="flex-1">
-              <p className="text-red-400 font-medium">빌드 실패</p>
-              {error && <p className="text-red-300/70 text-sm mt-1">{error}</p>}
-              <p className="text-red-300/60 text-xs mt-2">
-                프로세스가 중단됐거나 실행 환경 문제였다면 "다시 빌드"로 재시도할 수 있어요.
-                기획 자체에 수정이 필요하면 "기획 대화로"를 선택하세요.
-              </p>
+        {isFailed && (() => {
+          // 2회 이상 연속 실패 시 "기획 대화로"를 primary로 플립.
+          // 같은 기획으로 반복 실패한다는 건 재시도보다 기획 보강이 효과적이라는 신호.
+          const chatFirst = consecutiveFailures >= 2;
+          const retryBtn = (
+            <button
+              key="retry"
+              onClick={handleRetry}
+              disabled={retrying}
+              className={
+                chatFirst
+                  ? 'bg-gray-200 dark:bg-gray-800 text-gray-700 dark:text-gray-200 px-4 py-2 rounded-xl text-sm'
+                  : 'bg-red-500 hover:bg-red-400 disabled:bg-gray-400 text-white px-4 py-2 rounded-xl text-sm font-medium'
+              }
+            >
+              {retrying ? '재시작 중...' : '↻ 다시 빌드'}
+            </button>
+          );
+          const chatBtn = (
+            <button
+              key="chat"
+              onClick={() => navigate(`/projects/${id}/chat`)}
+              className={
+                chatFirst
+                  ? 'bg-red-500 hover:bg-red-400 text-white px-4 py-2 rounded-xl text-sm font-medium'
+                  : 'bg-gray-200 dark:bg-gray-800 text-gray-700 dark:text-gray-200 px-4 py-2 rounded-xl text-sm'
+              }
+            >
+              기획 대화로
+            </button>
+          );
+          return (
+            <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-6 flex items-start justify-between gap-4">
+              <div className="flex-1">
+                <p className="text-red-400 font-medium">
+                  빌드 실패{consecutiveFailures > 1 ? ` (연속 ${consecutiveFailures}회)` : ''}
+                </p>
+                {error && <p className="text-red-300/70 text-sm mt-1">{error}</p>}
+                <p className="text-red-300/60 text-xs mt-2">
+                  {chatFirst
+                    ? '같은 기획으로 여러 번 실패했어요. 대화로 보강한 뒤 다시 빌드하는 편이 효과적입니다.'
+                    : '프로세스가 중단됐거나 실행 환경 문제였다면 "다시 빌드"로 재시도할 수 있어요. 기획 자체에 수정이 필요하면 "기획 대화로"를 선택하세요.'}
+                </p>
+              </div>
+              <div className="flex flex-col gap-2 shrink-0">
+                {chatFirst ? [chatBtn, retryBtn] : [retryBtn, chatBtn]}
+              </div>
             </div>
-            <div className="flex flex-col gap-2 shrink-0">
-              <button
-                onClick={handleRetry}
-                disabled={retrying}
-                className="bg-red-500 hover:bg-red-400 disabled:bg-gray-400 text-white px-4 py-2 rounded-xl text-sm font-medium"
-              >
-                {retrying ? '재시작 중...' : '↻ 다시 빌드'}
-              </button>
-              <button
-                onClick={() => navigate(`/projects/${id}/chat`)}
-                className="bg-gray-200 dark:bg-gray-800 text-gray-700 dark:text-gray-200 px-4 py-2 rounded-xl text-sm"
-              >
-                기획 대화로
-              </button>
-            </div>
-          </div>
-        )}
+          );
+        })()}
         {isBounced && (
           <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4 mb-6 flex items-center justify-between">
             <div>

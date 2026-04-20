@@ -139,13 +139,20 @@ export class ProjectsService {
 
     const parseGaps = (raw: unknown): string[] => {
       if (!raw) return [];
-      if (typeof raw !== 'string') return [String(raw)];
-      try {
-        const v = JSON.parse(raw);
-        return Array.isArray(v) ? v.map(String) : [String(v)];
-      } catch {
-        return [raw];
+      let arr: string[];
+      if (typeof raw !== 'string') {
+        arr = [String(raw)];
+      } else {
+        try {
+          const v = JSON.parse(raw);
+          arr = Array.isArray(v) ? v.map(String) : [String(v)];
+        } catch {
+          arr = [raw];
+        }
       }
+      // dedupe — 과거 DB row에 같은 메시지가 두 번 저장된 경우 UI 배너에서
+      // 중복 표시되는 걸 방지. 저장 시점에서 이미 막긴 했지만 legacy 데이터 대비.
+      return [...new Set(arr)];
     };
 
     if (project.state === 'failed') {
@@ -167,8 +174,15 @@ export class ProjectsService {
 
     // 반송 배너용. 가장 최근 bounced 빌드가 프로젝트 현 세션과 엮여
     // 있을 때만 노출한다(= 유저가 그 빌드 이후 아직 새 빌드를 안 돌림).
+    // ADR 0008 — 업데이트 라인(planning_update / update_ready)도 지원.
+    const bouncableStates = new Set([
+      'planning',
+      'plan_ready',
+      'planning_update',
+      'update_ready',
+    ]);
     if (
-      (project.state === 'planning' || project.state === 'plan_ready') &&
+      bouncableStates.has(project.state) &&
       latest &&
       latest.b_status === 'bounced'
     ) {

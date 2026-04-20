@@ -223,11 +223,32 @@ export default function ProjectCard({
             </button>
           </>
         )}
-        {/* Failed → retry from planning */}
+        {/* Failed → 같은 기획으로 다시 빌드 + 기획 수정 (둘 다 제공) */}
         {state === 'failed' && canEdit && (
-          <button onClick={goChat} className="text-sm bg-blue-500/10 text-blue-400 px-3 py-1.5 rounded-lg hover:bg-blue-500/20 transition-colors">
-            기획 수정
-          </button>
+          <>
+            <button
+              onClick={async () => {
+                try {
+                  await client.post(`/projects/${id}/build/retry`);
+                  navigate(`/projects/${id}/build`);
+                } catch (err: unknown) {
+                  const e = err as { response?: { data?: { message?: string } } };
+                  alert(
+                    `재빌드 실패: ${e.response?.data?.message ?? '알 수 없는 오류'}\n\n기획 대화로 돌아가서 propose_handoff를 다시 호출해주세요.`,
+                  );
+                }
+              }}
+              className="text-sm bg-red-500/10 text-red-600 dark:text-red-400 px-3 py-1.5 rounded-lg hover:bg-red-500/20 transition-colors"
+            >
+              ↻ 다시 빌드
+            </button>
+            <button
+              onClick={goChat}
+              className="text-sm bg-blue-500/10 text-blue-400 px-3 py-1.5 rounded-lg hover:bg-blue-500/20 transition-colors"
+            >
+              기획 수정
+            </button>
+          </>
         )}
         {/* Viewer badge */}
         {!canEdit && (
