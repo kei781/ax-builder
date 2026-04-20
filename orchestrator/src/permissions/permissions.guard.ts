@@ -10,6 +10,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ProjectPermission } from '../projects/entities/project-permission.entity.js';
 import type { PermissionRole } from '../projects/entities/project-permission.entity.js';
+import { User } from '../auth/entities/user.entity.js';
 
 export const REQUIRE_ROLES_KEY = 'require_roles';
 
@@ -19,6 +20,11 @@ export const RequireRoles = (...roles: PermissionRole[]) =>
 /**
  * Checks that req.user has one of the required roles on the path's :id project.
  * Queries project_permissions directly — no dependency on ProjectsService.
+ *
+ * 플랫폼 관리자(is_admin) 우회 — ARCHITECTURE §9.5:
+ *   1순위: JWT payload의 is_admin (O(1), fast path)
+ *   2순위: DB users.is_admin (JWT가 예전 버전이라 is_admin 필드가 없거나,
+ *          ADMIN_EMAILS 승급 후 재로그인하지 않은 유저를 위한 fallback)
  */
 @Injectable()
 export class ProjectPermissionsGuard implements CanActivate {
@@ -26,6 +32,8 @@ export class ProjectPermissionsGuard implements CanActivate {
     private readonly reflector: Reflector,
     @InjectRepository(ProjectPermission)
     private readonly permissionRepo: Repository<ProjectPermission>,
+    @InjectRepository(User)
+    private readonly userRepo: Repository<User>,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -40,14 +48,17 @@ export class ProjectPermissionsGuard implements CanActivate {
     const req = context.switchToHttp().getRequest();
     const projectId: string | undefined = req.params?.id;
     const userId: string | undefined = req.user?.id;
-    const isAdmin: boolean = req.user?.is_admin === true;
     if (!projectId || !userId) {
       throw new ForbiddenException('권한 확인에 필요한 정보가 없습니다.');
     }
 
-    // 플랫폼 관리자는 모든 프로젝트에 owner 권한으로 접근.
-    // (권한 체크 bypass — ARCHITECTURE §9.5 admin 역할.)
-    if (isAdmin) return true;
+    // 1순위: JWT의 is_admin (재로그인한 admin 유저).
+    if (req.user?.is_admin === true) return true;
+
+    // 2순위: DB fallback. JWT가 예전 버전이거나 ADMIN_EMAILS 승급 후
+    // 재로그인하지 않은 경우에도 즉시 admin 권한 활성화.
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (user?.is_admin) return true;
 
     const perm = await this.permissionRepo.findOne({
       where: { project_id: projectId, user_id: userId },
