@@ -122,6 +122,23 @@ def _port_in_use(port: int) -> bool:
             return False
 
 
+def _find_free_port() -> int:
+    """OS가 골라주는 임의의 비어있는 TCP 포트.
+
+    QA 프로세스에 PORT env로 주입해 앱이 이 포트에 바인드하도록 유도.
+    다른 플랫폼 프로세스(orchestrator 4000, planning 4100 등)와 충돌 방지를
+    위해 OS 위임 사용 (사용 가능성이 가장 확실).
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# 앱이 PORT env를 무시하고 하드코딩하는 흔한 포트 — QA가 "왜 실패했는지"
+# 유저에게 설명하기 위해 감지.
+_HARDCODED_COMMON_PORTS = [3000, 5000, 8000, 8080, 3001]
+
+
 # Express/Koa/Fastify 스타일 라우트 추출 — 가장 흔한 패턴만 잡는다.
 # 경로에 :param·쿼리 없는 literal만 대상. 동적 경로는 표본화 못하므로 패스.
 _ROUTE_RE = re.compile(
@@ -280,10 +297,15 @@ def run_qa(
             detail=f"npm install exit={install.returncode}\n{install.stderr[-1000:]}",
         )
 
-    # ---- 3. npm start (no PORT injection) + observation ----
-    # App binds whatever port it wants. We watch the pid.
-    env = {**os.environ}
-    env.pop("PORT", None)  # deliberately strip inherited PORT
+    # ---- 3. npm start + PORT 격리 + observation ----
+    # 이전 방식: PORT env 무시, 앱 하드코딩 포트에 그대로 바인드. ADR 0001 원칙.
+    # 문제: 앱들이 거의 전부 3000에 하드코딩 → 이미 다른 프로젝트가 3000 점유 중이면
+    #       모든 새 빌드의 QA가 EADDRINUSE로 실패 (2026-04-20 3건 연쇄 실패).
+    # 현재 방식: 빈 포트를 골라 PORT env로 주입. 앱이 PORT를 존중하면 격리 성공.
+    # 존중하지 않으면 기존 관찰 방식 폴백 — 단 하드코딩 포트가 점유 중이면 명시적
+    # 에러로 유저에게 설명 (원인 명확화).
+    qa_port = _find_free_port()
+    env = {**os.environ, "PORT": str(qa_port)}
 
     server = subprocess.Popen(
         ["npm", "start"],
@@ -306,6 +328,34 @@ def run_qa(
                 except Exception:
                     pass
                 snippet = (out or b"").decode("utf-8", errors="replace")[-2000:]
+                # EADDRINUSE 감지 — 앱이 PORT env 무시하고 하드코딩한 포트를
+                # 다른 프로세스가 점유 중인 경우. 유저에게 원인을 구체적으로.
+                if "EADDRINUSE" in snippet:
+                    import re as _re
+                    m = _re.search(r":::?(\d+)", snippet) or _re.search(
+                        r"address already in use\D+(\d+)", snippet, _re.I
+                    )
+                    hardcoded_port = m.group(1) if m else "알 수 없음"
+                    gaps.append(
+                        f"앱이 `PORT={qa_port}` 환경변수를 무시하고 포트 "
+                        f"{hardcoded_port}에 직접 바인드하려다 실패했습니다 "
+                        f"(EADDRINUSE — 이미 다른 프로세스가 그 포트를 사용 중)."
+                    )
+                    gaps.append(
+                        "앱 코드에서 `app.listen(3000)` 같은 하드코딩 대신 "
+                        "`app.listen(process.env.PORT || 3000)` 패턴을 써야 "
+                        "배포 환경과 공존 가능합니다. 기획 대화로 돌아가 이 "
+                        "점을 반영해 다시 빌드하거나, 이 빌드를 '다시 빌드'로 "
+                        "재시도해주세요 (LLM이 다음 시도에 패턴을 바꿀 수 있음)."
+                    )
+                    return QaResult(
+                        ok=False,
+                        gaps=gaps,
+                        detail=(
+                            f"EADDRINUSE: 앱이 PORT={qa_port} 무시하고 "
+                            f"{hardcoded_port}에 바인드 시도\n{snippet}"
+                        ),
+                    )
                 gaps.append(
                     f"`npm start`가 즉시 종료됐어요 (exit={server.returncode}). 런타임 에러 확인 필요."
                 )

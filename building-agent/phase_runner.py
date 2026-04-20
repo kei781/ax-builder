@@ -43,7 +43,14 @@ PHASE_STATIC_RULES = """## 작업 디렉토리
 - SQLite (`./data/app.db`, CREATE TABLE IF NOT EXISTS 패턴)
 - 정적 프론트엔드 (`public/index.html`, `public/app.js`, `public/styles.css`)
 - 단일 포트 서비스. 외부 DB/서비스 금지.
-- **포트**: 앱이 원하는 단일 포트 하나에 바인드하면 됨. 시스템이 실제 바인드된 포트를 관찰해서 라우팅함. `PORT` 환경변수 존중은 **필수 아님** — 하드코딩해도 무방.
+- **포트 (반드시 PORT env 존중)**: 앱은 `process.env.PORT` 를 **반드시** 우선 사용하고, 없을 때만 기본값(예: 3000)으로 fallback. 하드코딩 금지.
+
+  ```js
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`listening on ${PORT}`));
+  ```
+
+  이유: QA·배포 환경은 여러 프로젝트가 같은 호스트에서 병렬로 기동한다. 모두 3000을 하드코딩하면 두 번째부터 **EADDRINUSE**로 즉시 죽는다. PORT env를 존중하면 시스템이 빈 포트를 주입해 격리할 수 있음. 시스템은 여전히 실제 바인드된 포트를 관찰하지만, 그 전에 유입된 PORT env를 따르는 게 "좋은 시민" 규약.
 - **LLM 호출 (필요 시)**: `process.env.AX_AI_BASE_URL` + `process.env.AX_AI_TOKEN`를 사용해 OpenAI-호환 엔드포인트로 호출 (openai SDK의 `baseURL` 옵션). `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`GEMINI_API_KEY` 등 provider 키를 **코드·`.env.example` 어디에도 넣지 말 것**. 검출되면 빌드 반송.
 - **`.env.example` 필수**: 모든 빌드는 `.env.example`을 반드시 생성. 각 변수 블록에 `# 주입: system-injected | user-required | user-optional` 메타라인 포함. `AX_AI_BASE_URL`, `AX_AI_TOKEN`은 `system-injected`로 기본 포함.
 
