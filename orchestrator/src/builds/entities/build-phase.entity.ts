@@ -16,7 +16,8 @@ export type BuildPhaseStatus =
   | 'running'
   | 'success'
   | 'failed'
-  | 'skipped';
+  | 'skipped'
+  | 'cancelled';
 
 /**
  * A single phase in a Building run. Phase names come from Hermes's dynamic

@@ -25,6 +25,16 @@ export class BuildController {
     return this.runner.cancel(id);
   }
 
+  /**
+   * Retry a failed build — same handoff, no planning changes.
+   * failed/cancelled → plan_ready → building.
+   */
+  @Post(':id/build/retry')
+  @RequireRoles('owner', 'editor')
+  async retryBuild(@Param('id') id: string) {
+    return this.runner.retry(id);
+  }
+
   /** Status — anyone with auth can read. */
   @Get(':id/build/status')
   async getBuildStatus(@Param('id') id: string) {

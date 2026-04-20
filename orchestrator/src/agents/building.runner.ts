@@ -3,9 +3,10 @@ import {
   Logger,
   BadRequestException,
   NotFoundException,
+  OnModuleInit,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, In } from 'typeorm';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 
@@ -37,7 +38,7 @@ import type { AgentEvent } from '../websocket/events.js';
 export type BuildMode = 'build' | 'update';
 
 @Injectable()
-export class BuildingRunner {
+export class BuildingRunner implements OnModuleInit {
   private readonly logger = new Logger(BuildingRunner.name);
   private readonly buildingAgentDir: string;
   private readonly buildingAgentPython: string;
@@ -85,6 +86,62 @@ export class BuildingRunner {
       'bin',
       'python3',
     );
+  }
+
+  /**
+   * Startup 훅 — nest start --watch로 hot-reload되거나 프로세스가 kill 당해서
+   * 재시작될 때, DB엔 `running` 상태인 빌드가 남아있지만 자식 프로세스는 이미
+   * 사라진 "고아 빌드"를 정리한다.
+   *
+   * 판단 기준: this.processes Map은 비어있는데 (방금 시작했으니 당연히 비어있음)
+   * DB에는 building/qa/updating/update_qa state 프로젝트 + running build가 있음.
+   * 이 조합은 확실한 고아. 프로젝트 상태를 `failed`로, 빌드/phase를 `cancelled`로.
+   *
+   * update 라인에서 고아가 나온 경우는 previous_container_id가 있으면 deployed로
+   * 복구하는 게 더 친절하지만, previous 컨테이너가 실제 살아있는지 확인 필요
+   * (다른 세션이 정리했을 수 있음). MVP에선 안전하게 `failed` — 유저가 대시보드에서
+   * 수동으로 재시도하거나 프로젝트 삭제 결정.
+   */
+  async onModuleInit(): Promise<void> {
+    const STUCK_STATES = ['building', 'qa', 'updating', 'update_qa'] as const;
+    const orphaned = await this.projectRepo.find({
+      where: { state: In([...STUCK_STATES]) },
+    });
+    if (orphaned.length === 0) return;
+
+    this.logger.warn(
+      `onModuleInit: 고아 빌드 ${orphaned.length}건 감지 — state를 failed로 정리`,
+    );
+    for (const proj of orphaned) {
+      try {
+        // 이 빌드의 최신 build row도 cancelled로.
+        const latestBuild = await this.builds.getLatestBuild(proj.id);
+        if (latestBuild && latestBuild.status === 'running') {
+          await this.builds.closeBuild(latestBuild.id, 'cancelled', [
+            'orchestrator 재시작으로 빌드 프로세스가 고아가 됐어요. "다시 빌드"로 재시도하세요.',
+          ]);
+          // 진행 중이던 phase도 정리 — 직접 UPDATE는 레포 호출로.
+          const phases = await this.builds.getPhasesForBuild(latestBuild.id);
+          for (const ph of phases) {
+            if (ph.status === 'running') {
+              await this.builds.updatePhase(ph.id, {
+                status: 'cancelled',
+                finished_at: new Date(),
+                output_log:
+                  (ph.output_log ?? '') +
+                  '\n[orchestrator 재시작으로 자동 정리]',
+              });
+            }
+          }
+        }
+        await this.stateMachine.transition(proj.id, 'failed', 'orphaned on restart');
+        this.logger.log(`  - ${proj.id} (${proj.state} → failed)`);
+      } catch (err: any) {
+        this.logger.warn(
+          `  - ${proj.id} 정리 실패: ${err?.message ?? err}`,
+        );
+      }
+    }
   }
 
   async start(
@@ -297,6 +354,44 @@ export class BuildingRunner {
       message: canRollback ? '업데이트를 중단했습니다.' : '빌드를 중단했습니다.',
       state: updated.state,
     };
+  }
+
+  /**
+   * Retry a failed build without going through planning again.
+   *
+   * 재시작 시나리오: orchestrator hot-reload로 고아화된 빌드, 일시적 인프라
+   * 오류(Docker daemon flicker, npm install 실패 등), 유저가 판단상 "그냥 다시
+   * 돌려보기"로 해결될 거라 믿을 때.
+   *
+   * 조건: state가 `failed` + current_session_id 유효 + 최신 handoff가 빌드 조건
+   * 충족. 첫 빌드 라인만 지원 (업데이트 실패는 planning_update로 돌아가므로
+   * 여기 경로를 타지 않음).
+   */
+  async retry(
+    projectId: string,
+  ): Promise<{ message: string; state: string; build_id: string; mode: BuildMode }> {
+    const project = await this.projectRepo.findOne({ where: { id: projectId } });
+    if (!project) throw new NotFoundException('프로젝트를 찾을 수 없습니다.');
+
+    if (project.state !== 'failed') {
+      throw new BadRequestException(
+        `failed 상태에서만 재빌드할 수 있습니다. (현재: ${project.state})`,
+      );
+    }
+    if (!project.current_session_id) {
+      throw new BadRequestException('세션이 없습니다. 기획 대화부터 시작해주세요.');
+    }
+    const handoff = await this.handoffs.latestForSession(project.current_session_id);
+    if (!handoff || !this.handoffs.isReadyForBuild(handoff)) {
+      throw new BadRequestException(
+        '핸드오프가 없거나 빌드 조건을 충족하지 않습니다. 기획 대화로 돌아가서 propose_handoff를 다시 호출해주세요.',
+      );
+    }
+
+    // failed → plan_ready 복구 (VALID_TRANSITIONS 허용).
+    await this.stateMachine.transition(projectId, 'plan_ready', 'retry from failed');
+    // 이후 start()가 plan_ready → building 전이 + 스폰.
+    return this.start(projectId);
   }
 
   async status(projectId: string): Promise<Record<string, unknown>> {
