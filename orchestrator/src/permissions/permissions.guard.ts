@@ -40,9 +40,14 @@ export class ProjectPermissionsGuard implements CanActivate {
     const req = context.switchToHttp().getRequest();
     const projectId: string | undefined = req.params?.id;
     const userId: string | undefined = req.user?.id;
+    const isAdmin: boolean = req.user?.is_admin === true;
     if (!projectId || !userId) {
       throw new ForbiddenException('권한 확인에 필요한 정보가 없습니다.');
     }
+
+    // 플랫폼 관리자는 모든 프로젝트에 owner 권한으로 접근.
+    // (권한 체크 bypass — ARCHITECTURE §9.5 admin 역할.)
+    if (isAdmin) return true;
 
     const perm = await this.permissionRepo.findOne({
       where: { project_id: projectId, user_id: userId },

@@ -32,6 +32,17 @@ export class User {
   @Column({ type: 'varchar', length: 10, default: 'detailed' })
   profile_explain_depth!: 'brief' | 'detailed';
 
+  /**
+   * 플랫폼 관리자. 설정된 `ADMIN_EMAILS` 환경변수에 이메일이 포함되면
+   * 로그인 시 자동 true가 된다. admin은:
+   *   - 모든 프로젝트에 owner 권한으로 접근 가능 (채팅·빌드·env·삭제)
+   *   - findAllForUser / findPublicList에서 전체 프로젝트를 본다
+   *   - ProjectPermissionsGuard / ChatService.requireMembership 우회
+   * JWT payload에도 포함돼 O(1) 체크 가능.
+   */
+  @Column({ type: 'boolean', default: false })
+  is_admin!: boolean;
+
   @CreateDateColumn()
   created_at!: Date;
 

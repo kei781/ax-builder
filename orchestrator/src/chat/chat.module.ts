@@ -8,6 +8,7 @@ import { Session } from '../sessions/entities/session.entity.js';
 import { ConversationMessage } from '../sessions/entities/conversation-message.entity.js';
 import { AgentLog } from '../builds/entities/agent-log.entity.js';
 import { Handoff } from '../handoffs/entities/handoff.entity.js';
+import { User } from '../auth/entities/user.entity.js';
 import { StateMachineModule } from '../state-machine/state-machine.module.js';
 import { AgentsModule } from '../agents/agents.module.js';
 import { WebsocketModule } from '../websocket/websocket.module.js';
@@ -22,6 +23,7 @@ import { PermissionsModule } from '../permissions/permissions.module.js';
       ConversationMessage,
       AgentLog,
       Handoff,
+      User,
     ]),
     StateMachineModule,
     AgentsModule,

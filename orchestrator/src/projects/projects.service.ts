@@ -29,8 +29,32 @@ export class ProjectsService {
     private readonly dataSource: DataSource,
   ) {}
 
-  /** Projects the user has any role on (owner/editor/viewer). */
+  private async isAdmin(userId: string): Promise<boolean> {
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    return user?.is_admin === true;
+  }
+
+  /** Projects the user has any role on (owner/editor/viewer).
+   *  Admin은 모든 프로젝트를 owner 권한으로 본다 (ARCHITECTURE §9.5).
+   */
   async findAllForUser(userId: string) {
+    if (await this.isAdmin(userId)) {
+      const allProjects = await this.projectRepo.find({
+        relations: ['owner'],
+        order: { created_at: 'DESC' },
+      });
+      return allProjects.map((p) => ({
+        id: p.id,
+        title: p.title,
+        state: p.state,
+        port: p.port,
+        ownerName: p.owner?.name ?? 'Unknown',
+        myRole: 'owner' as const,
+        locked_until: p.locked_until,
+        created_at: p.created_at,
+      }));
+    }
+
     const permissions = await this.permissionRepo.find({
       where: { user_id: userId },
       relations: ['project', 'project.owner'],
@@ -53,8 +77,13 @@ export class ProjectsService {
   /**
    * All projects except those the user is already a member of.
    * Per ARCHITECTURE §9.2: project listing is public to any authenticated user.
+   *
+   * Admin은 findAllForUser에서 이미 모든 프로젝트를 받으므로 이 엔드포인트의
+   * "publicList"가 비게 된다 (의도된 동작 — admin 입장에선 모든 게 내 것).
    */
   async findPublicList(userId: string) {
+    if (await this.isAdmin(userId)) return [];
+
     const myPerms = await this.permissionRepo.find({ where: { user_id: userId } });
     const myProjectIds = new Set(myPerms.map((p) => p.project_id));
 
@@ -200,6 +229,8 @@ export class ProjectsService {
     projectId: string,
     userId: string,
   ): Promise<string | null> {
+    // Admin은 실제 permission row가 없어도 owner로 간주.
+    if (await this.isAdmin(userId)) return 'owner';
     const perm = await this.permissionRepo.findOne({
       where: { project_id: projectId, user_id: userId },
     });

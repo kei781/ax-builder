@@ -11,6 +11,7 @@ import * as fs from 'fs/promises';
 
 import { Project } from '../projects/entities/project.entity.js';
 import { ProjectPermission } from '../projects/entities/project-permission.entity.js';
+import { User } from '../auth/entities/user.entity.js';
 import { Session } from '../sessions/entities/session.entity.js';
 import { ConversationMessage } from '../sessions/entities/conversation-message.entity.js';
 import { AgentLog } from '../builds/entities/agent-log.entity.js';
@@ -60,6 +61,8 @@ export class ChatService {
     private readonly agentLogRepo: Repository<AgentLog>,
     @InjectRepository(Handoff)
     private readonly handoffRepo: Repository<Handoff>,
+    @InjectRepository(User)
+    private readonly userRepo: Repository<User>,
     private readonly dataSource: DataSource,
     private readonly stateMachine: StateMachineService,
     private readonly planning: PlanningClient,
@@ -373,6 +376,12 @@ export class ChatService {
     userId: string,
     allowedRoles: string[] = ['owner', 'editor', 'viewer'],
   ) {
+    // 플랫폼 관리자(is_admin)는 모든 프로젝트에 대해 owner 권한으로 접근.
+    // ARCHITECTURE §9.5. JWT payload에 is_admin이 있으면 그걸 쓰는 게 빠르지만,
+    // 이 함수는 userId만 받으므로 DB 조회 1회로 확인.
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (user?.is_admin) return;
+
     const perm = await this.permissionRepo.findOne({
       where: { project_id: projectId, user_id: userId },
     });

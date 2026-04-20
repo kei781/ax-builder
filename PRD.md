@@ -134,6 +134,9 @@ CREATE TABLE users (
   -- 유저 단위 정적 속성 (명시적으로 설정, 암묵적 학습 없음)
   is_developer INTEGER DEFAULT 0,         -- 개발자 여부 (0: 비개발자, 1: 개발자)
   explanation_depth TEXT DEFAULT 'simple', -- 설명 깊이 ('simple' | 'detailed')
+  -- ARCHITECTURE §9.5 — 플랫폼 관리자. 모든 프로젝트에 owner 권한으로 접근.
+  -- 환경변수 ADMIN_EMAILS의 이메일로 로그인하면 자동 true.
+  is_admin INTEGER DEFAULT 0,
   created_at TEXT DEFAULT (datetime('now'))
 );
 ```
