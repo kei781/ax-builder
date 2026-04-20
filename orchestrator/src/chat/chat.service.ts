@@ -244,6 +244,22 @@ export class ChatService {
         'planning',
         'resuming after failure',
       );
+    } else if (project.state === 'deployed') {
+      // 배포된 프로젝트에 유저가 채팅으로 수정 요청 — modifying 진입.
+      // propose_handoff이 modifying → plan_ready 전이를 처리하므로 여기선
+      // 상태만 옮겨준다. (이 분기가 없으면 유저는 deployed 상태에서
+      // 무한정 대화하고 AI는 tool을 호출해도 transitioned=false 받음.)
+      try {
+        await this.stateMachine.transition(
+          projectId,
+          'modifying',
+          'user started modify via chat',
+        );
+      } catch (err) {
+        this.logger.warn(
+          `deployed → modifying transition failed: ${(err as Error).message}`,
+        );
+      }
     }
 
     // Persist the user message before dispatching. Single-writer pattern:

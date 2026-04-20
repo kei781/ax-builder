@@ -174,10 +174,14 @@ async def fn(project_id: str, args: dict[str, Any]) -> dict[str, Any]:
             ),
         )
 
-        if accepted and current_state == "planning":
+        # planning OR modifying 상태에서 plan_ready로 전이. 수정 세션
+        # (deployed → modifying → 대화 보강 → plan_ready → 재빌드)도
+        # 같은 도구를 사용해 전이한다. state_machine의 VALID_TRANSITIONS와
+        # 일관되게 두 출발점을 모두 허용.
+        if accepted and current_state in ("planning", "modifying"):
             cur = conn.execute(
                 "UPDATE projects SET state = 'plan_ready', updated_at = ? "
-                "WHERE id = ? AND state = 'planning'",
+                "WHERE id = ? AND state IN ('planning', 'modifying')",
                 (now, project_id),
             )
             transitioned = cur.rowcount > 0
