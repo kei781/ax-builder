@@ -29,6 +29,8 @@ export default function BuildStatus() {
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  // classifier 결과 저장 — "infra_failure"면 실패 배너에 관리자 문의 노출 (retry 의미 無).
+  const [failureKind, setFailureKind] = useState<string | null>(null);
   const startRef = useRef(Date.now());
 
   useEffect(() => {
@@ -132,8 +134,11 @@ export default function BuildStatus() {
           break;
         }
         case 'error': {
-          const msg = (event.payload?.message as string) || 'unknown error';
+          const payload = event.payload ?? {};
+          const msg = (payload.message as string) || 'unknown error';
+          const kind = (payload.kind as string) || null;
           setError(msg);
+          if (kind) setFailureKind(kind);
           setLogs((p) => [...p, `⚠ ERROR: ${msg}`]);
           break;
         }
@@ -239,7 +244,26 @@ export default function BuildStatus() {
             <button onClick={() => navigate('/')} className="bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded-xl text-sm">대시보드로</button>
           </div>
         )}
-        {isFailed && (() => {
+        {/* infra_failure — 관리자 개입 필요. retry·기획수정 둘 다 의미 없음. */}
+        {isFailed && failureKind === 'infra_failure' && (
+          <div className="bg-red-600/10 border border-red-600/40 rounded-xl p-4 mb-6">
+            <p className="text-red-500 font-bold text-base">
+              ⚠ 시스템 인프라 문제 — 관리자 문의 필요
+            </p>
+            {error && <p className="text-red-400 text-sm mt-1">{error}</p>}
+            <p className="text-red-400/80 text-xs mt-2">
+              앱 빌드 시스템 자체의 문제(Claude CLI 인증 만료·리소스 부족 등)라
+              기획을 바꾸거나 재시도해도 해결되지 않습니다. 관리자에게 문의해주세요.
+            </p>
+            <button
+              onClick={() => navigate('/')}
+              className="mt-3 bg-gray-200 dark:bg-gray-800 text-gray-700 dark:text-gray-200 px-4 py-2 rounded-xl text-sm"
+            >
+              대시보드로
+            </button>
+          </div>
+        )}
+        {isFailed && failureKind !== 'infra_failure' && (() => {
           // 2회 이상 연속 실패 시 "기획 대화로"를 primary로 플립.
           // 같은 기획으로 반복 실패한다는 건 재시도보다 기획 보강이 효과적이라는 신호.
           const chatFirst = consecutiveFailures >= 2;

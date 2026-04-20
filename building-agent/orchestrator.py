@@ -138,9 +138,20 @@ def main(raw_args: str) -> int:
             if not result.ok:
                 # Per H2 policy: any phase failure = immediate bounce-back,
                 # no local retries (Planning agent fixes the gap).
+                #
+                # gap_list 수집 원칙: orchestrator의 FailureClassifier가 gap_list
+                # 를 regex로 분류해 infra_error / code_bug / transient를 구분한다.
+                # 따라서 gap_list에 **분류에 필요한 에러 원문**이 포함돼야 한다.
+                #
+                # Claude CLI는 인증 실패(401) 같은 에러를 **stdout**에 출력하고
+                # stderr에는 warning만 남기는 경우가 많다. stderr만 실으면 classifier
+                # 가 auth 패턴을 놓쳐 code_bug로 오분류 (회고 §1 버그 #2 재발).
+                # 해결: stdout·stderr 둘 다 tail 포함.
                 gaps = [
                     f"Phase '{phase.name}' 실패: {result.error or 'unknown'}"
                 ]
+                if result.stdout:
+                    gaps.append(f"stdout 요약: {result.stdout[-500:]}")
                 if result.stderr:
                     gaps.append(f"에러 로그 요약: {result.stderr[-300:]}")
                 events.emit(
