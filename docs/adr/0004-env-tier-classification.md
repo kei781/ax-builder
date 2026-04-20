@@ -45,6 +45,26 @@
 - Claude Code 프롬프트에 `# 주입: system-injected` 메타라인 작성 규칙을 **예시 스니펫**까지 박아 넣어야 순종률 확보. 규칙 1줄만으로는 약함.
 - 메타라인 파싱이 엄격하면 Claude Code가 다른 표기(예: `# kind: system`)를 쓸 때 누락 발생. 파서는 관대하게 (`kind`, `주입`, `source` 등 동의어 받기).
 
+## 보강 (2026-04-20) — 네임스페이스 강제
+
+운영 중 Claude Code가 `.env.example`을 다음과 같이 **그룹 헤더 스타일**로 생성하는 사례 발생:
+
+```
+# 주입: system-injected
+AX_AI_BASE_URL=
+AX_AI_TOKEN=
+
+# SLACK_BOT_TOKEN
+# 주입: user-required
+SLACK_BOT_TOKEN=
+```
+
+파서는 변수 한 개 파싱할 때마다 메타를 초기화하므로 첫 번째 `AX_AI_BASE_URL`만 `system-injected`로 분류되고, 두 번째 `AX_AI_TOKEN`은 기본값(`user-required`)로 떨어져 **유저 UI에 AX_AI_TOKEN 입력 필드가 노출**됨. 유저는 "이게 뭐지?" → 아무 값이나 입력 → 실제 Gateway 토큰 덮어씀 → 앱 LLM 호출이 영영 401.
+
+**수정**: `env-parser.ts`에 `SYSTEM_NAMESPACE_PATTERNS` 추가 — 키가 `AX_*` 또는 `AI_GATEWAY_*` 패턴에 매칭되면 **metaline 무관 `system-injected` 강제**. 플랫폼이 네임스페이스를 소유하는 변수는 정책적으로 유저 입력 대상이 될 수 없음 → 안전망으로 파싱 계층에서 고정.
+
+Claude Code 프롬프트도 동시 강화: "한 변수당 한 메타블록, 그룹 헤더 금지" 규칙 + AX_AI_* 필수 포함 예시 (system-injected 명시).
+
 ## 연관 구현
 
 **현재 상태 (PR #4)**

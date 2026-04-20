@@ -407,9 +407,11 @@ GET    /api/projects/:id                     → 프로젝트 상세 (status, po
 DELETE /api/projects/:id                     → 프로젝트 삭제 (owner만)
 POST   /api/projects/:id/stop               → 서비스 중지 (owner, editor)
 POST   /api/projects/:id/restart            → 서비스 재시작 (ADR 0006 — owner만)
-                                               · docker restart {container_id}
-                                               · 10s 헬스체크 후 WS completion/error 방출
-                                               · 실패해도 컨테이너 유지(롤백 여지)
+                                               · env 전체 복호화 → Docker Env로 주입
+                                               · 기존 컨테이너 제거 → 새 env로 재생성(recreate)
+                                                 * `docker restart`는 Env 갱신 불가라 못 씀
+                                               · 60s 헬스체크 후 WS completion/error 방출
+                                               · 실패해도 state=deployed 유지 (값 수정 후 재호출)
 ```
 
 ### 5.3 프로젝트 권한
@@ -493,7 +495,8 @@ GET    /api/projects/:id/env           → user-tier 목록 (마스킹 preview, 
 PUT    /api/projects/:id/env           → 부분 업데이트 { vars: [{key, value}],
                                          apply?: boolean }  (ADR 0006 §D2·D6)
                                          · apply=false (기본): DB만 갱신, 컨테이너 영향 無
-                                         · apply=true: 저장 + docker restart + 헬스체크
+                                         · apply=true: 저장 + 컨테이너 recreate + 헬스체크
+                                           (docker Env가 create 시점 고정이라 restart 못 씀)
                                          · 또는 awaiting_env 상태면 env_qa 자동 트리거
 GET    /api/projects/:id/env/guide     → 발급 가이드 + 밸리데이션 메타 +
                                          any_missing_required 플래그
@@ -836,11 +839,13 @@ env는 **배포의 선행 조건이 아니라 점진적 향상**이다. 앱은 e
         │     · 상태 deployed 유지
         │
         └── [💾 저장 후 재시작]
-              · DB 갱신 → .env 파일 재기록 → docker restart
-              · status=env_qa → 10s 헬스체크
-                ├── 성공 → deployed
+              · DB 갱신 → resolveAllForContainer → .env 재기록 →
+                컨테이너 제거 → 새 Env dict로 recreate → start
+                (Docker Env는 create 시점 고정이라 restart 불가)
+              · status=env_qa → 60s 헬스체크
+                ├── 성공 → container_id 갱신 + deployed
                 ├── env_rejected → deployed 유지 + 에러 토스트
-                │                  (값이 잘못됐지만 이전 컨테이너 상태 보존)
+                │                  (값을 되돌리고 다시 `/restart` 하면 복구)
                 ├── transient    → deployed 유지 + "잠시 뒤 다시" 안내
                 ├── code_bug     → status='modifying' (채팅으로 수정)
                 └── schema_bug   → status='planning' (기획 재검토, 극단 케이스)

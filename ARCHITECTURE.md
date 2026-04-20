@@ -730,24 +730,30 @@ ADR 0005 이전엔 `hasUserRequired()`가 true면 `awaiting_env`로 블로킹했
       └── "🔄 재시작" → POST /restart → 19.3
 ```
 
-### 19.3 재시작 경로 (env_qa)
+### 19.3 재시작 경로 (env_qa) — recreate 기반
 
 ```
 PUT /env { apply:true }  또는  POST /restart
       │
       ▼
 [env_qa 진입]
-      ├── writeDotenv (유지보수 모드에서만 — restart는 skip)
-      ├── docker.restartContainer(container_id)  ← **재생성 X, 재기동만**
-      ├── 호스트 HEAD 폴링 10초
-      └── ┌── 성공 → deployed
-          ├── transient → deployed 유지 + 토스트 "잠시 뒤 다시"
-          ├── env_rejected → deployed 유지 + 토스트 "값 확인 필요" (env_attempts++)
-          ├── code_bug → modifying (대화 수정 세션 생성)
+      ├── envs.resolveAllForContainer(projectId) — 전 변수 복호화 → dict
+      ├── writeDotenv (dev 편의·폴백용)
+      ├── docker.removeContainer(container_id)  ← 이전 컨테이너 제거
+      ├── docker.createContainer(... extraEnv=dict)  ← **새 env로 재생성**
+      ├── docker.startContainer(newId)
+      ├── 호스트 HEAD 폴링 60초
+      └── ┌── 성공 → container_id 갱신 + deployed
+          ├── transient / env_rejected / unknown → deployed 유지 + 토스트
+          ├── code_bug → modifying (대화 수정 세션)
           └── schema_bug (극단) → planning bounce
 ```
 
-**핵심 불변식**: 재시작 실패 시 **컨테이너는 제거하지 않는다**. 이전 바이너리·코드·env 파일이 디스크에 그대로 있어 `docker start <old_id>`로 복구 가능. 유저는 "배포됐는데 새 값이 안 먹었다" 정도의 체감만 갖고 본질적 서비스 중단은 없음.
+**왜 restart가 아니라 recreate인가 (2026-04-20 반영)**: Docker의 `Env` 배열은 `createContainer` 시점에 고정되므로 `docker restart`로는 새 env가 반영되지 않는다. 유저가 ADMIN_PASSWORD를 "1111"로 설정해도 컨테이너가 예전 Env(또는 생성 시 주입한 기본값) 기반으로 계속 돌았다. **recreate 경로는 반드시 필요**.
+
+**Docker Env 주입 경로**: `docker.service.createContainer`가 `extraEnv: Record<string, string>`을 받아 PORT/NODE_ENV 기본값과 합쳐 `Env` 배열 구성. 앱 프로세스가 `require('dotenv').config()` 호출 여부와 무관하게 `process.env`에서 읽음. `.env` 파일은 디버깅·개발 편의용으로 계속 생성(이중 공급).
+
+**롤백 시맨틱 변경**: recreate 경로는 이전 컨테이너를 즉시 제거한다. 실패 시 "이전 컨테이너로 돌아가기"는 불가 — 하지만 실패해도 `.env`·소스·빌드 산출물은 디스크에 남아있으므로 **값을 되돌리고 다시 `/restart`** 하면 복구된다. state 자체는 classifier 결과에 따라 `deployed` 유지(서비스 중단 인상 최소화)·`modifying`·`planning`으로 분기.
 
 ### 19.4 system-injected 값 해석
 `EnvsService.resolveSystemInjected`가 변수 이름 → 실제 값 매핑:
