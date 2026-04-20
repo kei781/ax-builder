@@ -18,6 +18,7 @@ import { PortAllocatorService } from '../infra/port-allocator.service.js';
 import { BuildGateway } from '../websocket/build.gateway.js';
 import { EnvsService } from '../envs/envs.service.js';
 import { EnvDeployService } from '../envs/env-deploy.service.js';
+import { FailureClassifierService } from '../envs/failure-classifier.service.js';
 import type { AgentEvent } from '../websocket/events.js';
 
 /**
@@ -59,6 +60,7 @@ export class BuildingRunner {
     private readonly gateway: BuildGateway,
     private readonly envs: EnvsService,
     private readonly envDeploy: EnvDeployService,
+    private readonly classifier: FailureClassifierService,
   ) {
     this.buildingAgentDir = path.resolve(process.cwd(), '..', 'building-agent');
     this.buildingAgentPython = path.resolve(
@@ -399,10 +401,99 @@ export class BuildingRunner {
       }
       await this.envDeploy.applyAndDeploy(projectId);
     } else if (code === 2) {
-      // Bounce-back to Planning. 수집한 gap_list를 DB로 영속화해서
-      // 프론트 chat 페이지 배너가 "왜 돌아왔는지" 표시할 수 있게.
+      // Phase 실패 exit. 수집한 gap_list + build_phases의 output_log를 합쳐
+      // classifier로 원인 분류 → 분류에 따라 라우팅.
       const gaps = this.bounceGaps.get(projectId) ?? [];
       this.bounceGaps.delete(projectId);
+
+      // phase 로그까지 긁어모아서 regex 매칭 대상에 포함
+      let phaseLogs = '';
+      try {
+        const phases = await this.builds.getPhasesForBuild(buildId);
+        phaseLogs = phases
+          .map((p) => p.output_log ?? '')
+          .filter(Boolean)
+          .join('\n---\n');
+      } catch {
+        /* ignore */
+      }
+      const classificationInput = [gaps.join('\n'), phaseLogs]
+        .filter(Boolean)
+        .join('\n');
+      const verdict = this.classifier.classify(classificationInput);
+      this.logger.log(
+        `bounce classifier for ${projectId}: ${verdict.kind} (${verdict.matched_rule ?? 'default'})`,
+      );
+
+      // infra_error = 운영자 문제. 유저·AI로는 복구 불가. `failed` 상태로
+      // 못박고 운영자에게 보일 메시지를 남긴다. planning 반송 X.
+      if (verdict.kind === 'infra_error') {
+        const operatorMsg = [
+          '시스템 인프라 문제로 빌드가 중단됐어요. 기획을 바꿔도 해결되지 않습니다.',
+          `분류: ${verdict.matched_rule ?? 'infra_error'}`,
+          ...(gaps.length ? gaps : []),
+          '관리자에게 문의해주세요.',
+        ];
+        await this.builds.closeBuild(buildId, 'failed', operatorMsg);
+        try {
+          await this.stateMachine.transition(
+            projectId,
+            'failed',
+            `infra_error: ${verdict.matched_rule ?? 'unknown'}`,
+          );
+        } catch {
+          /* ignore */
+        }
+        this.gateway.emit({
+          agent: 'building',
+          project_id: projectId,
+          event_type: 'error',
+          payload: {
+            kind: 'infra_failure',
+            classifier: verdict.kind,
+            matched_rule: verdict.matched_rule,
+            message: operatorMsg[0],
+            gap_list: operatorMsg,
+          },
+        });
+        return;
+      }
+
+      // transient = 재시도 가능하지만 자동 retry는 Phase 6.1에 — 지금은
+      // failed로 표시 + "잠시 뒤 재시도" 안내. planning 반송 X.
+      if (verdict.kind === 'transient') {
+        const msg = [
+          '외부 서비스 일시 장애로 빌드가 중단됐어요. 잠시 뒤 다시 시도해주세요.',
+          ...(gaps.length ? gaps : []),
+        ];
+        await this.builds.closeBuild(buildId, 'failed', msg);
+        try {
+          await this.stateMachine.transition(
+            projectId,
+            'failed',
+            `transient: ${verdict.matched_rule ?? 'unknown'}`,
+          );
+        } catch {
+          /* ignore */
+        }
+        this.gateway.emit({
+          agent: 'building',
+          project_id: projectId,
+          event_type: 'error',
+          payload: {
+            kind: 'transient_failure',
+            classifier: verdict.kind,
+            matched_rule: verdict.matched_rule,
+            message: msg[0],
+            gap_list: msg,
+          },
+        });
+        return;
+      }
+
+      // code_bug / unknown / (env_rejected는 빌드 단계엔 올 일 없음) →
+      // 기존 planning 반송. PRD가 진짜 부실했거나 AI가 고칠 수 있는 로직
+      // 문제인 경우.
       await this.builds.closeBuild(
         buildId,
         'bounced',
@@ -414,7 +505,7 @@ export class BuildingRunner {
         await this.stateMachine.transition(
           projectId,
           'planning',
-          'bounce-back: build failed',
+          `bounce-back: ${verdict.kind}`,
         );
       } catch {
         // State might have been transitioned already by a cancel.
@@ -426,6 +517,8 @@ export class BuildingRunner {
         phase: 'bounce_back',
         payload: {
           detail: '빌드 실패 — 기획 대화로 돌아갑니다.',
+          classifier: verdict.kind,
+          matched_rule: verdict.matched_rule,
           gap_list: gaps,
         },
       });
