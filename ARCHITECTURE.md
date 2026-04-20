@@ -113,7 +113,8 @@ Building은 **2-layer** 구조다.
 - **리스크**: 동적 phase 생성 품질이 Gemini 3 Flash의 PRD 해석력에 의존. 로컬 모델 전환 시 특히 모니터링 필요. 품질 저하 감지 시 고정 템플릿 fallback 고려.
 
 ### 4.2 Claude Code 층 (실행)
-- **호출 방식** (ADR 0009): **stream-json 프로토콜**. phase마다 `claude --print --input-format stream-json --output-format stream-json --permission-mode acceptEdits --verbose`로 spawn. Hermes는 stdin에 `{"type":"user","message":{"role":"user","content":"<phase prompt>"}}` 한 줄 쓰고, stdout에 오는 JSON 이벤트 스트림을 관찰. 최종 `{"type":"result","is_error":bool,"result":"..."}`가 종료 신호.
+- **호출 방식** (ADR 0009): **stream-json 프로토콜**. phase마다 `claude --print --input-format stream-json --output-format stream-json --permission-mode acceptEdits --model claude-opus-4-7 --effort max --verbose`로 spawn. Hermes는 stdin에 `{"type":"user","message":{"role":"user","content":"<phase prompt>"}}` 한 줄 쓰고, stdout에 오는 JSON 이벤트 스트림을 관찰. 최종 `{"type":"result","is_error":bool,"result":"..."}`가 종료 신호.
+- **모델·effort**: 기본값은 `claude-opus-4-7` + `max`. phase 구현 품질이 QA 통과율을 좌우하므로 최고 사양. `CLAUDE_CODE_MODEL` / `CLAUDE_CODE_EFFORT` 환경변수로 오버라이드 가능.
 - **이유**:
   - 이전 `--print --output-format text` 방식은 warning/stderr가 stdout에 섞여 classifier 입력 오염 (회고 §6). stream-json은 이벤트 단위로 깔끔 분리.
   - tool use loop(Read/Write/Edit/Bash/Glob/Grep)는 Claude 내부에서 자율 수행 → Hermes는 **위임하는 상위 에이전트**로서 Claude Code를 자기 도구처럼 호출 (ADR 0009 "Hermes의 도구화" 비전).

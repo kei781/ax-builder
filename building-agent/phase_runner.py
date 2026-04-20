@@ -306,12 +306,18 @@ def _run_claude_stream(
     Returns: (ok, final_text, tool_use_log, num_tool_uses, error_lines)
     """
     env = _claude_env()
+    # 모델·effort는 환경변수로 오버라이드 가능. 기본값은 opus 4.7 + high —
+    # phase 구현은 품질이 QA 통과율을 좌우하므로 사양 상한 가까이 사용.
+    claude_model = os.environ.get("CLAUDE_CODE_MODEL", "claude-opus-4-7")
+    claude_effort = os.environ.get("CLAUDE_CODE_EFFORT", "max")
     cmd = [
         settings.CLAUDE_BIN,
         "--print",
         "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--permission-mode", "acceptEdits",
+        "--model", claude_model,
+        "--effort", claude_effort,
         "--verbose",
     ]
 
