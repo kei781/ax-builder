@@ -243,9 +243,12 @@ NestJS ──spawn──> orchestrator.py (Hermes, Python)
 [propose_handoff.py]
   1. 검증: completeness 5개 모두 ≥ 0.6, unresolved_questions 비어있음
   2. INSERT handoffs 행 (handoff_id 발급)
-  3. accepted && current_state == 'planning' 일 때:
-     UPDATE projects SET state='plan_ready' WHERE id=? AND state='planning'
-  4. 반환: { ok, accepted, transitioned_to_plan_ready, handoff_id, ... }
+  3. 전이 분기 (ADR 0008):
+     - current_state == 'planning'        → plan_ready
+     - current_state == 'planning_update' → update_ready
+     - 그 외                               → 전이 X (tool은 accepted=true지만
+                                            transitioned=false)
+  4. 반환: { ok, accepted, transitioned, transition_target, handoff_id, ... }
         │
         ▼
 [Orchestrator (ChatService.handleAgentEvent)]
@@ -269,59 +272,98 @@ NestJS ──spawn──> orchestrator.py (Hermes, Python)
 
 ---
 
-## 7. 프로젝트 상태 머신 (ADR 0005 mock-first)
+## 7. 프로젝트 상태 머신 (ADR 0005 mock-first + ADR 0008 update line)
 
-### 7.1 상태 목록
+### 7.1 상태 목록 (두 라인 + env 사이드)
+
+**첫 빌드 라인** (신규 프로젝트)
 ```
 draft → planning → plan_ready → building → qa → deployed ←──────┐
           ↑                                      ↕ self-loop     │
-          │                                   (저장만, 재시작 無)  │
+          │                                   (env 저장, 재시작 無)│
           │                                      ▼                │
           │                                   env_qa              │
-          │                                      │                │
           │                               ┌──────┼──────────┐     │
-          │                             success / transient /     │
-          │                             env_rejected               │
+          │                           success / transient /       │
+          │                           env_rejected                 │
           │                                      │ (모두 deployed 유지)│
           │                                      ▼                 │
           │                                 code_bug / schema_bug  │
-          │                                      │                 │
           │                                      ▼                 │
-          │                               modifying / planning     │
+          │                              planning_update / planning│
           │                                                        │
           └──── phase 실행 실패(구조 버그) ──────── planning bounce ┘
 ```
 
-**핵심(ADR 0005)**: 빌드는 **env 없이도 mock 상태로 `deployed`까지 직행**한다. env 입력/수정/재시작은 전부 **배포 후 유지보수 액션**이며, 실패해도 현 배포를 유지하는 방향으로 안전하게 롤백된다.
+**업데이트 라인** (배포된 앱의 수정, ADR 0008)
+```
+deployed → planning_update → update_ready → updating → update_qa ──┐
+    ▲              ▲                             ▼           ▼     │
+    │              │           rollback (previous 복구, deployed 유지)│
+    │              │                             │                  │
+    │              └──── bounce (code_bug / schema_bug /             │
+    │                            regression_fail) ──────────────────┘
+    │
+    └── update_qa 통과 시 deployed (version+1, previous 필드 clear)
+```
+
+**핵심 불변식**
+- **mock-first** (ADR 0005): 첫 빌드는 env 없이도 mock으로 deployed까지 직행.
+- **update 실패 = 기존 배포 유지** (ADR 0008): `updating` / `update_qa` 실패는 `projects.previous_container_id`로 복구 + `deployed` 유지. 유저의 앱은 계속 동작. Planning 반송은 schema_bug 등 극단 케이스만.
+- **modifying은 폐기** (ADR 0008): 사실상 `planning_update`로 리네임.
 
 실패 분기는 전부 FailureClassifier(§11.2, ADR 0002)가 판정한다.
 
-| 상태 | 의미 |
-|---|---|
-| `draft` | 프로젝트 생성 직후, Planning 시작 전 |
-| `planning` | Planning Agent와 대화 중 (신규 또는 bounce-back 수신) |
-| `plan_ready` | Planning 완료 제안, 유저의 "빌드 시작" 대기 |
-| `building` | Building Agent 실행 중 (phase 진행) |
-| `qa` | 관찰 기반 QA 진행 중 (ADR 0001) — **mock 상태로 구조 검증** |
-| `awaiting_env` | (레거시) 초기 ADR 0004 플로우의 블로킹 입력 대기. ADR 0005 적용 후엔 기본 흐름에서 나타나지 않음. |
-| `env_qa` | "저장 후 재시작" 또는 `/restart` 직후 헬스체크 진행 |
-| `deployed` | 컨테이너 기동 완료, 접속 가능. env 유무와 무관 — mock 또는 real |
-| `modifying` | deployed 이후 수정 요청(새 세션) — env_qa의 code_bug 결과도 여기로 |
-| `failed` | 해결 불가 (H1 lock / 극단 케이스) |
+| 상태 | 라인 | 의미 |
+|---|---|---|
+| `draft` | 첫 빌드 | 프로젝트 생성 직후 |
+| `planning` | 첫 빌드 | Planning Agent와 신규 대화 |
+| `plan_ready` | 첫 빌드 | 완성도 충분, "빌드 시작" 대기 |
+| `building` | 첫 빌드 | Building Agent phase 진행 |
+| `qa` | 첫 빌드 | 관찰 기반 QA (mock 상태) |
+| `awaiting_env` | env (레거시) | ADR 0005 이전 블로킹 플로우 호환 |
+| `env_qa` | env | 재시작 헬스체크 진행 |
+| `deployed` | 터미널·재진입 | 첫 빌드와 update 라인 공통 종착/출발 |
+| `planning_update` | 업데이트 | 배포된 앱의 수정 아이디어를 Planning Agent와 논의 |
+| `update_ready` | 업데이트 | 수정 사양 확정, "업데이트 시작" 대기 |
+| `updating` | 업데이트 | 변경 범위 적용 중 (previous 백업 후 진입) |
+| `update_qa` | 업데이트 | regression + 새 기능 검증 |
+| `failed` | 터미널 | 해결 불가 (infra_error 등) |
 
 ### 7.2 전환 트리거
+
+**첫 빌드 라인**
 | 전환 | 트리거 |
 |---|---|
-| `draft → planning` | 유저 첫 메시지 입력 |
-| `planning → plan_ready` | Planning Agent `propose_handoff` + 유저 UI 확인 |
-| `plan_ready → building` | **유저가 "빌드 시작" 버튼 클릭** |
+| `draft → planning` | 유저 첫 메시지 |
+| `planning → plan_ready` | `propose_handoff(from='planning')` |
+| `plan_ready → building` | "빌드 시작" 클릭 |
 | `building → qa` | 모든 phase 성공 |
-| `qa → deployed` | 관찰 QA 통과 (mock-first — env 유무 무관) |
-| `deployed → deployed` | env 저장(재시작 없음) — DB만 업데이트 |
-| `deployed → env_qa` | "저장 후 재시작" 또는 `POST /restart` |
-| `env_qa → deployed` | 헬스체크 통과, 또는 `transient`/`env_rejected` 판정 (**현 배포 유지**하는 방향) |
-| `env_qa → modifying` | classifier = `code_bug` — 통합 로직 버그, 채팅 수정 |
-| `env_qa → planning` | classifier = `schema_bug` (극단) |
+| `qa → deployed` | 관찰 QA 통과 |
+| `qa / building → planning` | classifier `code_bug` / `schema_bug` → bounce |
+
+**env 사이드**
+| 전환 | 트리거 |
+|---|---|
+| `deployed → deployed` | env 저장 (재시작 X) |
+| `deployed → env_qa` | 저장 후 재시작 / `POST /restart` |
+| `env_qa → deployed` | 헬스체크 통과 또는 transient/env_rejected 폴백 (현 배포 유지) |
+| `env_qa → planning_update` | classifier `code_bug` |
+| `env_qa → planning` | classifier `schema_bug` (극단) |
+| `awaiting_env → env_qa` | (레거시) 초기 설정 제출 |
+
+**업데이트 라인** (ADR 0008)
+| 전환 | 트리거 |
+|---|---|
+| `deployed → planning_update` | 유저 배포 앱 채팅 첫 메시지 or "수정 요청" 클릭 |
+| `planning_update → update_ready` | `propose_handoff(from='planning_update')` |
+| `update_ready → updating` | "업데이트 시작" 클릭. `previous_container_id`/`previous_version` 백업. |
+| `updating → update_qa` | 변경 범위 적용 완료 |
+| `update_qa → deployed` (성공) | regression + 새 기능 통과, version+1 |
+| `update_qa → deployed` (롤백) | classifier `infra_error` / `transient` → previous 복구 + 토스트 |
+| `updating → planning_update` | classifier `code_bug` → 채팅 보강. previous 복구. |
+| `update_qa → planning_update` | regression_fail → 깨진 엔드포인트 gap 첨부 |
+| `updating → planning` | classifier `schema_bug` (극단, 드묾) |
 | `deployed → modifying` | 유저 수정 요청 (새 세션 생성) |
 | `qa / building → planning` | phase 실행 실패 (구조 bounce-back) |
 | `awaiting_env → env_qa` | (레거시) 초기 설정 모드에서 유저 제출 시 |

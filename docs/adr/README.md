@@ -13,6 +13,7 @@
 | [0005](./0005-mock-first-env-strategy.md) | Mock-first env 전략 — 점진적 향상 | Accepted |
 | [0006](./0006-env-maintenance-ui.md) | Env 유지보수 UI + 재시작 + 밸리데이션 | Accepted |
 | [0007](./0007-gateway-internal-vs-separate-process.md) | AI Gateway 구현 위치 — orchestrator 내장 우선 | Accepted |
+| [0008](./0008-update-state-line-separation.md) | 업데이트(수정) 상태 라인 분리 | Accepted |
 
 ## 새 ADR 추가 규칙
 
