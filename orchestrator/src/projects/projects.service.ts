@@ -95,7 +95,18 @@ export class ProjectsService {
     return saved;
   }
 
-  async findOne(id: string): Promise<Project & { failure_reason?: string[] | null }> {
+  async findOne(
+    id: string,
+  ): Promise<
+    Project & {
+      failure_reason?: string[] | null;
+      last_bounce?: {
+        build_id: string;
+        finished_at: string | null;
+        gap_list: string[];
+      } | null;
+    }
+  > {
     const project = await this.projectRepo.findOne({
       where: { id },
       relations: ['owner'],
@@ -104,28 +115,42 @@ export class ProjectsService {
       throw new NotFoundException('프로젝트를 찾을 수 없습니다.');
     }
 
-    // Include failure reason for failed projects.
+    // `failure_reason` — state=='failed'일 때의 최종 실패 설명.
+    // `last_bounce` — planning/plan_ready로 되돌아온 "반송 직후" 상황용.
+    //   build_ready로 진입했지만 아직 새 빌드가 안 시작된 구간(= state
+    //   in planning|plan_ready)에서, 가장 최근 bounced 빌드의 gap_list를
+    //   함께 내려준다. 프론트는 state와 last_bounce를 같이 보고 배너
+    //   표시 여부를 결정.
     let failure_reason: string[] | null = null;
-    if (project.state === 'failed') {
-      const failed = await this.dataSource
-        .getRepository('Build')
-        .createQueryBuilder('b')
-        .where('b.project_id = :pid', { pid: id })
-        .andWhere("b.status IN ('failed', 'bounced')")
-        .orderBy('b.finished_at', 'DESC')
-        .limit(1)
-        .getRawOne();
-      if (failed?.b_bounce_reason_gap_list) {
-        try {
-          failure_reason = JSON.parse(failed.b_bounce_reason_gap_list);
-        } catch {
-          failure_reason = [String(failed.b_bounce_reason_gap_list)];
-        }
+    let last_bounce: {
+      build_id: string;
+      finished_at: string | null;
+      gap_list: string[];
+    } | null = null;
+
+    const latest = await this.dataSource
+      .getRepository('Build')
+      .createQueryBuilder('b')
+      .where('b.project_id = :pid', { pid: id })
+      .andWhere("b.status IN ('failed', 'bounced')")
+      .orderBy('b.finished_at', 'DESC')
+      .limit(1)
+      .getRawOne();
+
+    const parseGaps = (raw: unknown): string[] => {
+      if (!raw) return [];
+      if (typeof raw !== 'string') return [String(raw)];
+      try {
+        const v = JSON.parse(raw);
+        return Array.isArray(v) ? v.map(String) : [String(v)];
+      } catch {
+        return [raw];
       }
-      // Fallback when the build row has no structured reason (legacy data,
-      // or the process crashed before writing it). Infer from observable
-      // state so the user at least sees something actionable.
-      if (!failure_reason || failure_reason.length === 0) {
+    };
+
+    if (project.state === 'failed') {
+      failure_reason = parseGaps(latest?.b_bounce_reason_gap_list);
+      if (failure_reason.length === 0) {
         if (!project.container_id && !project.port) {
           failure_reason = [
             '빌드 후 Docker 컨테이너 배포에 실패했습니다.',
@@ -140,7 +165,21 @@ export class ProjectsService {
       }
     }
 
-    return Object.assign(project, { failure_reason });
+    // 반송 배너용. 가장 최근 bounced 빌드가 프로젝트 현 세션과 엮여
+    // 있을 때만 노출한다(= 유저가 그 빌드 이후 아직 새 빌드를 안 돌림).
+    if (
+      (project.state === 'planning' || project.state === 'plan_ready') &&
+      latest &&
+      latest.b_status === 'bounced'
+    ) {
+      last_bounce = {
+        build_id: latest.b_id,
+        finished_at: latest.b_finished_at ?? null,
+        gap_list: parseGaps(latest.b_bounce_reason_gap_list),
+      };
+    }
+
+    return Object.assign(project, { failure_reason, last_bounce });
   }
 
   async getUserRole(

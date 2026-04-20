@@ -47,6 +47,15 @@ interface ProjectInfo {
   current_session_id: string | null;
   port: number | null;
   failure_reason?: string[] | null;
+  /**
+   * 빌드가 반송(bounced)돼서 planning/plan_ready로 되돌아왔을 때만
+   * 채워진다. 유저가 직전 실패 이유를 즉시 볼 수 있도록 배너로 노출.
+   */
+  last_bounce?: {
+    build_id: string;
+    finished_at: string | null;
+    gap_list: string[];
+  } | null;
 }
 
 const STATE_LABELS: Record<ProjectState, string> = {
@@ -400,6 +409,22 @@ export default function Chat() {
           </ul>
         </div>
       )}
+
+      {/* Bounce-back banner — build가 반송되어 planning/plan_ready로 돌아왔을 때 */}
+      {(state === 'planning' || state === 'plan_ready') &&
+        project?.last_bounce &&
+        project.last_bounce.gap_list.length > 0 && (
+          <div className="px-6 py-3 bg-yellow-500/10 border-b border-yellow-500/30">
+            <p className="text-sm text-yellow-700 dark:text-yellow-400 font-medium mb-1">
+              ↩ 이전 빌드가 아래 이유로 돌아왔습니다. 확인하고 보강한 뒤 다시 빌드를 시작해주세요.
+            </p>
+            <ul className="text-xs text-yellow-700 dark:text-yellow-300 ml-4 list-disc space-y-0.5">
+              {project.last_bounce.gap_list.map((reason, i) => (
+                <li key={i}>{reason}</li>
+              ))}
+            </ul>
+          </div>
+        )}
 
       {/* Handoff banner */}
       {handoffBanner && (

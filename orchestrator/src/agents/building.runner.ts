@@ -41,6 +41,13 @@ export class BuildingRunner {
   /** project_id → phase tracking state for DB writes. */
   private readonly phaseIds = new Map<string, Map<string, string>>();
 
+  /**
+   * project_id → 빌드 중 수집된 bounce-back용 gap_list.
+   * `error` / `phase_failure` 이벤트의 `gap_list`를 누적해뒀다가 handleExit(code=2)에서
+   * `builds.bounce_reason_gap_list`로 영속. 프론트 chat 배너에서 읽어 표시.
+   */
+  private readonly bounceGaps = new Map<string, string[]>();
+
   constructor(
     @InjectRepository(Project)
     private readonly projectRepo: Repository<Project>,
@@ -140,6 +147,7 @@ export class BuildingRunner {
 
     this.processes.set(projectId, proc);
     this.phaseIds.set(projectId, new Map());
+    this.bounceGaps.set(projectId, []);
 
     proc.stdout?.on('data', (data: Buffer) => {
       // Building agent writes nothing important on stdout; capture for logs.
@@ -318,6 +326,20 @@ export class BuildingRunner {
         })
         .catch((e) => this.logger.warn(`agent_log persist: ${e.message}`));
     }
+
+    // bounce 이유로 쓸 gap_list 누적.
+    //   - error 이벤트의 payload.gap_list (phase_failure / qa_failure 등)
+    //   - phase_end 이벤트의 payload.gap_list (QA path)
+    if (et === 'error' || et === 'phase_end') {
+      const gapList = Array.isArray(p['gap_list'])
+        ? (p['gap_list'] as unknown[]).map((x) => String(x))
+        : [];
+      if (gapList.length) {
+        const bucket = this.bounceGaps.get(projectId) ?? [];
+        bucket.push(...gapList);
+        this.bounceGaps.set(projectId, bucket);
+      }
+    }
   }
 
   private async handleExit(
@@ -332,6 +354,7 @@ export class BuildingRunner {
       // ADR 0005 mock-first: build success always → deploy with whatever env
       // is currently resolved. user-required 값이 없어도 mock 상태로 배포.
       // 실제 값 입력은 배포 후 유지보수 모드에서 언제든.
+      this.bounceGaps.delete(projectId);
       await this.builds.closeBuild(buildId, 'success');
       const proj = await this.projectRepo.findOne({ where: { id: projectId } });
       if (!proj) return;
@@ -376,8 +399,17 @@ export class BuildingRunner {
       }
       await this.envDeploy.applyAndDeploy(projectId);
     } else if (code === 2) {
-      // Bounce-back to Planning
-      await this.builds.closeBuild(buildId, 'bounced');
+      // Bounce-back to Planning. 수집한 gap_list를 DB로 영속화해서
+      // 프론트 chat 페이지 배너가 "왜 돌아왔는지" 표시할 수 있게.
+      const gaps = this.bounceGaps.get(projectId) ?? [];
+      this.bounceGaps.delete(projectId);
+      await this.builds.closeBuild(
+        buildId,
+        'bounced',
+        gaps.length
+          ? gaps
+          : ['빌드가 반송됐습니다. 상세 사유가 기록되지 않았습니다.'],
+      );
       try {
         await this.stateMachine.transition(
           projectId,
@@ -392,10 +424,14 @@ export class BuildingRunner {
         project_id: projectId,
         event_type: 'progress',
         phase: 'bounce_back',
-        payload: { detail: '빌드 실패 — 기획 대화로 돌아갑니다.' },
+        payload: {
+          detail: '빌드 실패 — 기획 대화로 돌아갑니다.',
+          gap_list: gaps,
+        },
       });
     } else {
       // Unrecoverable failure
+      this.bounceGaps.delete(projectId);
       await this.builds.closeBuild(buildId, 'failed', [
         `Building Agent가 비정상 종료했습니다 (exit code ${code})`,
         '빌드 로그를 확인하고, 기획 문서에 누락된 정보가 있다면 보완해주세요.',
