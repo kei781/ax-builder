@@ -113,22 +113,33 @@ Building은 **2-layer** 구조다.
 - **리스크**: 동적 phase 생성 품질이 Gemini 3 Flash의 PRD 해석력에 의존. 로컬 모델 전환 시 특히 모니터링 필요. 품질 저하 감지 시 고정 템플릿 fallback 고려.
 
 ### 4.2 Claude Code 층 (실행)
-- **호출 방식**: **phase별 격리 세션**. 각 phase마다 `claude-cli` 서브프로세스를 새로 spawn.
-- **이유**: 긴 컨텍스트로 인한 품질 저하 방지, phase 간 오염 차단.
+- **호출 방식** (ADR 0009): **stream-json 프로토콜**. phase마다 `claude --print --input-format stream-json --output-format stream-json --permission-mode acceptEdits --verbose`로 spawn. Hermes는 stdin에 `{"type":"user","message":{"role":"user","content":"<phase prompt>"}}` 한 줄 쓰고, stdout에 오는 JSON 이벤트 스트림을 관찰. 최종 `{"type":"result","is_error":bool,"result":"..."}`가 종료 신호.
+- **이유**:
+  - 이전 `--print --output-format text` 방식은 warning/stderr가 stdout에 섞여 classifier 입력 오염 (회고 §6). stream-json은 이벤트 단위로 깔끔 분리.
+  - tool use loop(Read/Write/Edit/Bash/Glob/Grep)는 Claude 내부에서 자율 수행 → Hermes는 **위임하는 상위 에이전트**로서 Claude Code를 자기 도구처럼 호출 (ADR 0009 "Hermes의 도구화" 비전).
+  - LLM 호출은 Claude Code가 OAuth 구독 크레딧으로 처리 (`apiKeySource: "none"` 확인). 정액제 유지.
+- **phase별 격리 세션**: 한 phase에 한 subprocess. 긴 컨텍스트 품질 저하·phase 간 오염 차단. 후속 최적화로 세션 재사용 가능하지만 MVP는 격리.
 - **프롬프트 조립**: 각 phase 시작 시 다음을 주입:
   - `PRD.md` 전문
   - `DESIGN.md` 전문
   - `PHASES.md`에서 현재 phase 섹션
   - 이전 phase들의 요약 (완료 파일 경로 + 완료 상태)
-- **권한**: Claude Code의 Read/Write/Edit/Bash/Glob/Grep 전체.
+  - 업데이트 라인이면 `UPDATE_MODE_RULES_SUFFIX` 추가 (ADR 0008)
+- **권한**: `--permission-mode acceptEdits`로 Read/Write/Edit/NotebookEdit 자동 승인. Bash 승인은 별도 — 일부 `npm install` 같은 명령은 prompt에 의해 수동 스킵될 수 있음 (QA 단계에서 어차피 재실행).
 
 ### 4.3 프로세스 계층
 ```
 NestJS ──spawn──> orchestrator.py (Hermes, Python)
                       │
                       └── for each phase in PHASES.md:
-                            ├── spawn(claude-cli --prompt=...)
-                            ├── 실행 완료 대기
+                            ├── spawn(claude --print --input-format stream-json
+                            │         --output-format stream-json
+                            │         --permission-mode acceptEdits)
+                            ├── stdin ← user message (phase prompt)
+                            ├── stdout 이벤트 스트림 관찰
+                            │     · type=assistant (thinking, tool_use)
+                            │     · type=user (tool_result)
+                            │     · type=result (종료 — is_error / result text)
                             └── QA 실행 → 실패 시 동일 phase 재진입
 ```
 

@@ -14,6 +14,7 @@ stdout/stderr are captured for agent_logs. Success = exit 0.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -268,6 +269,158 @@ def _compose_prompt(
     return header + PHASE_STATIC_RULES + footer
 
 
+def _claude_env() -> dict[str, str]:
+    """Claude binary 실행용 env.
+
+    NVM 경로를 PATH 앞쪽에 붙여 `claude` binary를 찾을 수 있게 한다.
+    `CLAUDE_CODE_OAUTH_TOKEN` 등 상위에서 상속된 stale 토큰은 orchestrator
+    측 ecosystem.config.cjs에서 이미 비워져 있으므로 여기서 추가 조치 없음.
+    """
+    nvm_bin = os.path.expanduser("~/.nvm/versions/node")
+    extra_paths: list[str] = []
+    if os.path.isdir(nvm_bin):
+        for sub in sorted(os.listdir(nvm_bin), reverse=True):
+            candidate = os.path.join(nvm_bin, sub, "bin")
+            if os.path.isfile(os.path.join(candidate, "claude")):
+                extra_paths.append(candidate)
+                break
+    extra_paths.append("/usr/local/bin")
+    return {
+        **os.environ,
+        "PATH": ":".join([*extra_paths, os.environ.get("PATH", "")]),
+    }
+
+
+def _run_claude_stream(
+    prompt: str, cwd: Path, timeout: float
+) -> tuple[bool, str, str, int, list[str]]:
+    """ADR 0009 — Claude Code를 stream-json 프로토콜로 호출.
+
+    stdin에 `{"type":"user","message":{...}}` JSON line 하나 보내고, stdout에
+    쏟아지는 이벤트 스트림을 읽어 최종 `{"type":"result"}` 신호가 올 때까지 대기.
+
+    Claude Code는 내부 tool loop(Read/Write/Edit/Bash/Glob/Grep)를 자율 수행
+    하고, 완료 시 `result.is_error` / `result.result` 필드로 결과를 알려준다.
+    Hermes는 이벤트만 관찰 — 파일 편집·명령 실행은 전부 Claude가 수행.
+
+    Returns: (ok, final_text, tool_use_log, num_tool_uses, error_lines)
+    """
+    env = _claude_env()
+    cmd = [
+        settings.CLAUDE_BIN,
+        "--print",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--permission-mode", "acceptEdits",
+        "--verbose",
+    ]
+
+    user_msg = json.dumps({
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+    }, ensure_ascii=False)
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"claude CLI not found at '{settings.CLAUDE_BIN}': {e}"
+        ) from e
+
+    # 단일 턴 — user message 하나 보내고 stdin EOF.
+    try:
+        assert proc.stdin is not None and proc.stdout is not None
+        proc.stdin.write(user_msg + "\n")
+        proc.stdin.flush()
+        proc.stdin.close()
+
+        # 이벤트 스트림 읽기. 마지막 `type: result` 도착이 종료 신호.
+        tool_use_log: list[str] = []
+        num_tool_uses = 0
+        error_lines: list[str] = []
+        final_text = ""
+        ok = False
+        result_seen = False
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                # EOF — 프로세스 종료 확인
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                error_lines.append(f"[non-JSON stdout] {line[:200]}")
+                continue
+
+            t = evt.get("type")
+            if t == "assistant":
+                # tool_use 이벤트 로그
+                msg = evt.get("message", {})
+                for item in msg.get("content", []) or []:
+                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                        tname = item.get("name", "?")
+                        targs = item.get("input", {})
+                        path = targs.get("file_path") or targs.get("path") or ""
+                        num_tool_uses += 1
+                        tool_use_log.append(f"  - {tname}({path})"[:120])
+            elif t == "result":
+                result_seen = True
+                ok = not bool(evt.get("is_error"))
+                final_text = evt.get("result") or ""
+                break
+            # system/user(tool_result)/rate_limit_event 등은 무시
+
+        if not result_seen:
+            # timeout or abnormal exit
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            return False, final_text or "(no result)", "\n".join(tool_use_log), num_tool_uses, error_lines + [
+                f"claude stream-json did not emit 'result' within {timeout}s (exit={proc.returncode})"
+            ]
+
+        # stderr tail — 디버깅용
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+        stderr_text = ""
+        if proc.stderr is not None:
+            try:
+                stderr_text = proc.stderr.read() or ""
+            except Exception:
+                stderr_text = ""
+        if stderr_text.strip():
+            error_lines.extend(stderr_text.strip().splitlines()[-10:])
+
+        return ok, final_text, "\n".join(tool_use_log), num_tool_uses, error_lines
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
 def run_phase(
     phase: Phase,
     phases: list[Phase],
@@ -278,68 +431,41 @@ def run_phase(
     previous_results: list[tuple[Phase, PhaseResult]],
     mode: str = "build",
 ) -> PhaseResult:
+    """ADR 0009 — Claude Code를 stream-json으로 호출.
+
+    이전 `claude --print --output-format text` subprocess 방식을 대체.
+    stdout 파싱 오염(warning 섞임, stdout vs stderr 구분 실패) 제거 + tool use
+    loop는 Claude가 전담해 에이전틱 구조 유지 + OAuth 구독 크레딧 사용.
+    """
     prompt = _compose_prompt(
         phase, phases, phase_idx, prd, design, previous_results, mode=mode
     )
-
-    # Ensure Claude's Node path is in PATH (NVM installs under ~/.nvm/...).
-    nvm_bin = os.path.expanduser("~/.nvm/versions/node")
-    extra_paths: list[str] = []
-    if os.path.isdir(nvm_bin):
-        # Pick the first node version dir — good enough for single-user dev boxes.
-        for sub in sorted(os.listdir(nvm_bin), reverse=True):
-            candidate = os.path.join(nvm_bin, sub, "bin")
-            if os.path.isfile(os.path.join(candidate, "claude")):
-                extra_paths.append(candidate)
-                break
-    extra_paths.append("/usr/local/bin")
-    env = {**os.environ, "PATH": ":".join([*extra_paths, os.environ.get("PATH", "")])}
-
-    cmd = [
-        settings.CLAUDE_BIN,
-        "--print",
-        "--permission-mode",
-        "acceptEdits",
-        "--output-format",
-        "text",
-        prompt,
-    ]
-
     start = time.monotonic()
+
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(project_path),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=settings.CLAUDE_PHASE_TIMEOUT_S,
+        ok, final_text, tool_log, num_tools, errs = _run_claude_stream(
+            prompt, project_path, timeout=float(settings.CLAUDE_PHASE_TIMEOUT_S)
         )
-    except subprocess.TimeoutExpired as e:
-        return PhaseResult(
-            ok=False,
-            duration_s=time.monotonic() - start,
-            exit_code=-1,
-            stdout=e.stdout or "",
-            stderr=e.stderr or "",
-            error=f"timeout after {settings.CLAUDE_PHASE_TIMEOUT_S}s",
-        )
-    except FileNotFoundError:
+    except RuntimeError as e:
         return PhaseResult(
             ok=False,
             duration_s=time.monotonic() - start,
             exit_code=-1,
             stdout="",
-            stderr="",
-            error=f"claude CLI not found at '{settings.CLAUDE_BIN}'",
+            stderr=str(e),
+            error=str(e),
         )
 
-    ok = proc.returncode == 0
+    # stdout = 최종 result 텍스트 + tool use 요약 (classifier 입력 풍부화)
+    stdout_combined = final_text
+    if tool_log:
+        stdout_combined += f"\n\n[tool_uses={num_tools}]\n{tool_log}"
+
     return PhaseResult(
         ok=ok,
         duration_s=time.monotonic() - start,
-        exit_code=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-        error=None if ok else f"claude exited with code {proc.returncode}",
+        exit_code=0 if ok else 1,
+        stdout=stdout_combined,
+        stderr="\n".join(errs[-20:]) if errs else "",
+        error=None if ok else f"claude stream-json reported is_error=true: {final_text[:500]}",
     )
