@@ -106,3 +106,39 @@ Phase 6 MVP 배포 직후 유저가 실제 앱을 사용하면서 **연쇄적으
 3. **E2E 스모크 하네스** (유저 역할을 스크립트가 대신)
 
 유저 메시지 한 줄("왜 안되냐")이 가장 강력한 regression 탐지기로 작동하는 동안은 플랫폼이 살아있는 피드백 루프를 가진 셈. 이게 유지되게 하려면 **문제 제기가 빠르게 고칠 수 있는 형태로 내려오도록** — 배너·분류·로그가 단계마다 있어야 한다.
+
+---
+
+## 5. 추가 사건 — orchestrator hot-reload 고아 빌드 (2026-04-20 후속)
+
+### 5.1 증상
+
+유저: "140분째 67%래 확인좀해봐." 스크린샷은 `backend_llm_logic (running)` phase 진행바가 2시간 20분째 67% 멈춤.
+
+### 5.2 원인
+
+`CLAUDE_PHASE_TIMEOUT_S=900`(15분)인데 2시간 20분 경과 → 정상이면 이미 `TimeoutExpired`로 bounce됐어야 함. 진단:
+
+1. `ps aux`로 `python3 orchestrator.py`, `claude` 바이너리 둘 다 **없음**.
+2. orchestrator(nest start --watch) 프로세스는 빌드 시작 시각(04:30 UTC) 이후인 06:20 UTC에 재시작됨.
+3. 즉 **개발 중 파일 저장이 hot-reload를 트리거하면서 orchestrator가 죽었고, 자식 `building-agent` subprocess가 고아로 남았다가 어느 순간 사라짐**. `processes` Map은 리셋됐지만 DB의 `build_phases.status='running'` / `builds.status='running'` / `projects.state='building'`은 그대로.
+
+UI는 DB 기준으로 렌더링하므로 영원히 "진행 중". 유저가 할 수 있는 건 프로젝트 삭제뿐이었음 (중단·재시작 UI가 없었음).
+
+### 5.3 근본 문제 — "계약 불변식: 상태는 실제 프로세스를 반영한다"
+
+"선언→강제" 격차 패턴의 또 다른 사례. `state='running'`이라는 선언이 실제 프로세스 존재를 **보장한다고 가정**한 코드가 여러 곳에 있었지만, 부모 프로세스 재시작이라는 경계 이벤트에서 이 불변식이 깨짐.
+
+§2.1~2.3의 4건은 **한 프로세스 안에서의 계약**이었고, 이번은 **프로세스 재시작 경계에서의 계약**이라는 차이.
+
+### 5.4 대응 (같은 날 적용)
+
+- `POST /projects/:id/build/cancel` — BuildStatus UI에 중단 버튼 노출. 프로세스 Map에 없어도 DB만 정리하고 state `failed`로 (또는 update 라인이면 previous 복구).
+- `POST /projects/:id/build/retry` — 실패 상태 + 유효 handoff면 `failed → plan_ready → building` 원자 전이. 유저가 "그냥 다시 돌려보기"로 복구.
+- `BuildingRunner.onModuleInit()` — startup 훅에서 `building / qa / updating / update_qa` 상태 프로젝트 전수 검사 후 고아 확정 시 자동 정리. orchestrator가 재시작되기만 하면 **사용자 개입 없이** 복구. 이게 근본 해결.
+
+### 5.5 교훈 추가
+
+- **부모 프로세스 lifecycle 훅은 기본 장착**. `onModuleInit` 같은 startup hook은 "프로세스 사라진 동안 시스템이 거짓말한 DB row"를 감지할 유일한 지점. 선택이 아니라 기본.
+- **dev 환경도 운영 계약을 배신하면 안 됨**. `--watch`가 프로덕션에 안 돈다고 무시하면 개발 중 stuck이 반복돼 신뢰가 갉아먹힘. dev 경험이 곧 제품 신뢰.
+- **"유저가 삭제 외엔 할 게 없다"는 UX 실패 신호**. 장시간 진행 중 화면엔 언제나 중단 버튼, 실패 화면엔 재시도/대화 분기 — 한 번에 설계에 포함.
