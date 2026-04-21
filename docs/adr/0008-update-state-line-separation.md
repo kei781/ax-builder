@@ -118,6 +118,26 @@ state는 분리하되 코어 로직은 함수 공유.
 
 이 3중 격리로 AI가 이미 배포된 앱의 맥락을 확실히 인지하며, 이전 대화로 오염되지 않음. `propose_handoff`는 이전과 동일하게 작동하되 "이 변경을 개발에 넘김" 의미로 재정의.
 
+**경계 조건 (재발 방지를 위한 기록)**:
+
+세션 격리 로직(`archiveCurrentSessionForUpdate`)은 **`deployed → planning_update` 전이 순간**에만 발동한다. 이 entry point를 지나지 않고 이미 `planning_update` / `update_ready` 상태로 DB에 들어가 있는 프로젝트(예: 이 코드 배포 이전에 `modifying` 상태에서 마이그레이션된 row, 또는 `planning_update` 상태에서 orchestrator가 재시작된 경우)는 자동 격리가 안 된다.
+
+→ **일회성 backfill**로 해결:
+```sql
+BEGIN;
+UPDATE sessions SET state='archived' WHERE id IN (
+  SELECT current_session_id FROM projects
+  WHERE state IN ('planning_update','update_ready') AND current_session_id IS NOT NULL
+);
+UPDATE projects SET current_session_id=NULL
+  WHERE state IN ('planning_update','update_ready');
+COMMIT;
+```
+
+이 SQL은 2026-04-21 실행됨 (`5f1e10a8 랜덤 간식 당번`, `783ba47d SNS 메시지 자동 답변`).
+
+**후속 작업 (필요 시)**: `sessions` 엔티티에 `cycle` 필드 (`'initial' | 'update'`) 추가 → 생성 시 project state 라인에 따라 설정 → `ensureActiveSession`이 existing session의 `cycle`과 현재 project 라인 불일치 시 자동 archive. 구조적 완벽 방어지만 DB 스키마 변경과 마이그레이션 필요 — 현재 backfill로 충분하면 skip.
+
 ### D6. Building Agent — update 모드
 
 ```python
