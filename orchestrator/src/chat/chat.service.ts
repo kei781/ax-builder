@@ -254,6 +254,17 @@ export class ChatService {
     // resume them explicitly (makes the state transition auditable).
     await this.suspendStaleSessions();
 
+    // ADR 0008 §D5 후속 — 업데이트 사이클은 **세션을 격리**한다.
+    // deployed → planning_update로 진입할 때, 이전 planning/update 대화는
+    // 전부 PRD·DESIGN에 반영돼있다는 전제. AI 컨텍스트가 과거 대화로
+    // 오염되면 "개발 전 단계"처럼 답변하는 오류 발생. 여기서 기존 session을
+    // archived로 돌리고 current_session_id를 null로 비운 다음,
+    // ensureActiveSession이 새 session을 만들게 한다.
+    const isStartingUpdateCycle = project.state === 'deployed';
+    if (isStartingUpdateCycle) {
+      await this.archiveCurrentSessionForUpdate(project);
+    }
+
     // First turn? Ensure project dir, session, and state transition.
     const session = await this.ensureActiveSession(project);
     const isFirstTurn = project.state === 'draft';
@@ -271,15 +282,13 @@ export class ChatService {
         'planning',
         'resuming after failure',
       );
-    } else if (project.state === 'deployed') {
-      // ADR 0008 — 배포된 프로젝트에 유저가 채팅으로 수정 요청.
-      // 업데이트 라인으로 진입: deployed → planning_update. propose_handoff가
-      // planning_update → update_ready 전이를 담당.
+    } else if (isStartingUpdateCycle) {
+      // deployed → planning_update. 세션은 위에서 이미 새로 만들어졌다.
       try {
         await this.stateMachine.transition(
           projectId,
           'planning_update',
-          'user started modify via chat',
+          'user started modify via chat (fresh session)',
         );
       } catch (err) {
         this.logger.warn(
@@ -404,6 +413,32 @@ export class ChatService {
    *   - project has no current_session_id yet, OR
    *   - the referenced session is `archived` (post-deploy modify flow)
    */
+  /**
+   * ADR 0008 §D5 — 업데이트 사이클 진입 시 이전 session을 명시적으로
+   * archived로 돌리고 current_session_id를 비운다. 그러면 ensureActiveSession
+   * 이 새 session을 만들어 AI 컨텍스트 오염을 차단한다.
+   *
+   * 원칙: 배포된 앱의 수정 요청은 **PRD.md·DESIGN.md만이 진실원**이다.
+   * 이전 대화는 모두 문서에 반영됐다는 전제로 새 세션에서 대화 시작.
+   */
+  private async archiveCurrentSessionForUpdate(project: Project): Promise<void> {
+    if (!project.current_session_id) return;
+    const existing = await this.sessionRepo.findOne({
+      where: { id: project.current_session_id },
+    });
+    if (existing && existing.state !== 'archived') {
+      existing.state = 'archived';
+      await this.sessionRepo.save(existing);
+      this.logger.log(
+        `archived session ${existing.id} for update cycle on project ${project.id}`,
+      );
+    }
+    // current_session_id를 비워 ensureActiveSession이 새 session 생성하게.
+    await this.projectRepo.update(project.id, { current_session_id: null });
+    // 메모리의 project 객체도 sync
+    project.current_session_id = null;
+  }
+
   private async ensureActiveSession(project: Project): Promise<Session> {
     if (project.current_session_id) {
       const existing = await this.sessionRepo.findOne({

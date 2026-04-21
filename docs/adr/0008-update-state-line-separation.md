@@ -87,17 +87,36 @@ state는 분리하되 코어 로직은 함수 공유.
 
 이 전략은 초안의 "git checkout으로 직전 커밋 체크아웃 후 createContainer" 같은 복구 경로를 필요 없게 만든다 — 이전 컨테이너가 살아있으므로 파일 시스템 상태와 무관.
 
-### D5. Planning Agent 시스템 프롬프트 분기
+### D5. 업데이트 에이전트 — 세션·페르소나 완전 격리 (2026-04-21 보강)
 
-`planning_update` 세션 진입 시 다음 추가:
+**초안 판단의 수정**: 초안은 "planning_update 세션에 시스템 프롬프트 섹션을 추가"하는 정도였으나, 실측 결과 부족. 유저가 배포된 앱에 "테스트 버튼 없어"라고 기능 추가 요청을 했는데 AI가 "개발 완료 후에 가능합니다"라고 **첫 빌드 언어로 답변**하는 현상 관찰 (2026-04-21 스크린샷). 원인 두 겹:
+1. 같은 session을 재사용해 이전 planning 대화가 전부 LLM 컨텍스트에 실림 → "개발 전 단계" 착각
+2. 시스템 프롬프트의 update suffix가 약해 "이미 배포된 앱" 제1원칙이 뚫림
 
-```
-당신은 지금 **이미 배포된 앱의 수정**을 논의합니다. 전체 재작성이 아닙니다.
-- 기존 PRD.md를 읽고, 유저가 요청한 변경사항을 **최소한의 diff**로 반영하세요.
-- 기존 기능·데이터 모델은 기본 유지. 변경이 필요하면 이유를 유저에게 확인.
-- propose_handoff 시 `change_summary`(변경 요약 3~5줄)를 반드시 포함.
-- "이번 수정에서 기존 <X 기능>은 그대로 둡니다"처럼 명시적 확인 문구 권장.
-```
+**변경 — 3중 격리**:
+
+1. **세션 격리** (`chat.service.ts`):
+    - `deployed → planning_update` 진입 시 기존 session을 `archived`로 전환하고 `current_session_id`를 null로 비운다
+    - `ensureActiveSession`이 새 session 생성 → LLM 대화 history는 깨끗한 상태에서 시작
+    - 이전 대화는 DB에는 남지만 이번 사이클에 로드되지 않음 (PRD/DESIGN만이 진실원)
+
+2. **독립 시스템 프롬프트** (`planning-agent/app/agent/system_prompt.py`):
+    - 기존 `BASE_PLANNING_SYSTEM_PROMPT + UPDATE_SUFFIX` 조합 폐기
+    - `UPDATE_SYSTEM_PROMPT` 독립 정의. `build_system_prompt(is_update_mode=True)`가 이것만 반환
+    - 제1원칙: "이미 배포되어 운영 중인 앱에 새 기능 추가·수정"을 반복 강조
+    - **"개발 완료 후 가능합니다" 같은 첫 빌드 언어를 명시적 금지**
+
+3. **권한·책임 4부**:
+    1. **실현 가능성 평가 선행** — 현재 스택에서 가능한지, 기존 기능과 충돌 없는지 평가 후 "반영 가능" 판단 시에만 문서 업데이트
+    2. **문서 반영은 필수** — 대화로만 합의하고 끝내면 안 됨. 기존 PRD 컨벤션(섹션 번호, `[user-required]`/`[ai-fillable]` 태그, FR1/FR2 번호 체계) 유지
+    3. **개발 가능성 지속 평가** — 매 write_prd 후 "이 문서만으로 개발팀이 구현 가능한가" 자체 점검, 모호하면 유저에게 추가 질문
+    4. **기존 기능 보존 불변식** — DB 스키마 깨는 변경 금지, 기존 엔드포인트 계약 유지, 새 의존성만 추가
+
+4. **UI 안내** (`frontend/src/pages/Chat.tsx`):
+    - `planning_update`/`update_ready` + messages.length ≤ 2일 때 인디고 배너 노출: "↻ 업데이트 사이클을 새로 시작합니다. 이전 기획 대화는 PRD·DESIGN에 이미 반영돼 있습니다."
+    - 빈 채팅 화면 placeholder를 "어떤 기능을 추가하거나 수정하고 싶으세요?"로 분기
+
+이 3중 격리로 AI가 이미 배포된 앱의 맥락을 확실히 인지하며, 이전 대화로 오염되지 않음. `propose_handoff`는 이전과 동일하게 작동하되 "이 변경을 개발에 넘김" 의미로 재정의.
 
 ### D6. Building Agent — update 모드
 

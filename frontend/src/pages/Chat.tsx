@@ -489,6 +489,21 @@ export default function Chat() {
         </div>
       )}
 
+      {/* 업데이트 사이클 안내 — planning_update / update_ready에서 노출.
+          이전 대화가 안 보이는 이유를 유저가 오해하지 않게. 대화가 몇 개
+          없을 때만 표시 (사이클 중간부턴 이미 맥락 알고 있음). */}
+      {(state === 'planning_update' || state === 'update_ready') &&
+        messages.length <= 2 && (
+          <div className="px-6 py-3 bg-indigo-500/10 border-b border-indigo-500/30">
+            <p className="text-sm text-indigo-700 dark:text-indigo-300 font-medium mb-1">
+              ↻ 업데이트 사이클을 새로 시작합니다
+            </p>
+            <p className="text-xs text-indigo-700 dark:text-indigo-400">
+              이전 기획 대화는 PRD·DESIGN 문서에 이미 반영된 상태입니다. 이번 사이클은 **새로 추가·수정하고 싶은 기능**만 논의해요. AI가 현재 문서를 읽고 맞춰드립니다.
+            </p>
+          </div>
+        )}
+
       {/* Bounce-back banner — build/update가 반송되어 planning/plan_ready/planning_update로 돌아왔을 때 */}
       {(state === 'planning' ||
         state === 'plan_ready' ||
@@ -593,10 +608,23 @@ export default function Chat() {
         )}
         {!historyLoading && messages.length === 0 && !pendingAssistant && (
           <div className="text-center text-gray-500 dark:text-gray-600 mt-20">
-            <p className="text-lg mb-2 text-gray-900 dark:text-white">
-              어떤 문제를 해결하고 싶으신가요?
-            </p>
-            <p className="text-sm">AI가 아이디어를 제품으로 구체화해드립니다.</p>
+            {isUpdateLine ? (
+              <>
+                <p className="text-lg mb-2 text-gray-900 dark:text-white">
+                  어떤 기능을 추가하거나 수정하고 싶으세요?
+                </p>
+                <p className="text-sm">
+                  현재 앱은 이미 운영 중이에요. 새 기능 요청이나 개선 아이디어를 알려주시면 AI가 검토 후 문서에 반영합니다.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-lg mb-2 text-gray-900 dark:text-white">
+                  어떤 문제를 해결하고 싶으신가요?
+                </p>
+                <p className="text-sm">AI가 아이디어를 제품으로 구체화해드립니다.</p>
+              </>
+            )}
           </div>
         )}
         {messages.map((msg, i) => (
