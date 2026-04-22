@@ -71,6 +71,27 @@ state는 분리하되 코어 로직은 함수 공유.
 | FailureClassifier | 공유 | 분류 결과가 state에 따라 라우팅만 다름 |
 | 프론트 UI | ✅ 배지·카피·버튼 | 컴포넌트 구조 공유 |
 
+### D4-bis. 업데이트 사이클 취소 (유저 주도 롤백, 2026-04-22 추가)
+
+D4의 롤백은 **빌드 실패** 시 시스템이 수행하는 자동 롤백. 이번 추가는 **유저가 대화 중 "이 방향 아니다"** 판단했을 때의 사용자 주도 롤백이다.
+
+배경: 배포된 앱에 업데이트 요청을 시작했지만 도중에 "내가 요구사항을 잘못 설명했다" / "기획 방향이 틀렸다"는 걸 깨닫는 경우. 대화를 그대로 두면 잘못된 방향이 이어지고, PRD에 이미 write_prd로 수정이 들어갔다면 롤백해야 원래 배포 상태로 돌아감.
+
+구현:
+1. **자동 백업**: `chat.service.archiveCurrentSessionForUpdate`(즉 `deployed → planning_update` 첫 진입 시점)가 `projects/<id>/.ax-build/pre-update-backup/`에 PRD.md·DESIGN.md 스냅샷 저장. 이미 백업 존재 시 덮어쓰지 않음 (사이클 중 여러 번 write_prd 호출돼도 **최초 진입 시점의 원본** 보존).
+2. **취소 엔드포인트**: `POST /projects/:id/update/cancel` (ChatController)
+    - state 요구: `planning_update` 또는 `update_ready`
+    - 실행:
+      1. 현재 session `archived`로 전환
+      2. `.ax-build/pre-update-backup/`의 PRD·DESIGN을 원본 위치로 복사 → 백업 디렉토리 제거
+      3. `projects.current_session_id` null
+      4. `state → deployed` (VALID_TRANSITIONS 기존 경로 사용)
+      5. WS `progress(phase='update_cycle_cancelled')` emit
+3. **UI 트리거**: Chat header 상단 "↩ 업데이트 취소" 버튼 (planning_update / update_ready + owner/editor). 확인 모달에 "이 대화 + PRD 변경사항 모두 이전 상태로 복원" 명시 후 호출. 성공 시 대시보드로 이동.
+4. **다중 협업자 동기화**: `update_cycle_cancelled` WS 이벤트를 다른 연결된 클라이언트가 수신하면 1.5초 후 자동으로 대시보드로 navigate.
+
+**왜 첫 빌드 라인엔 이게 필요 없는가**: 첫 빌드(draft/planning/plan_ready)에서 "방향이 틀렸다"면 유저가 그냥 프로젝트를 **삭제**하고 새로 시작하면 됨 — 잃을 게 배포된 앱이 없으므로. 업데이트 라인만 "운영 중인 앱을 건드리지 않고 이번 사이클만 취소"가 의미 있음.
+
 ### D4. 롤백 시맨틱 (핵심 불변식)
 
 **불변식**: `updating` / `update_qa` 실패 시 유저의 앱은 끊기지 않는다. 이전 버전 컨테이너가 계속 돌고 있어야 한다.

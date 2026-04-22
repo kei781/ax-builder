@@ -429,6 +429,10 @@ export class ChatService {
    *
    * 원칙: 배포된 앱의 수정 요청은 **PRD.md·DESIGN.md만이 진실원**이다.
    * 이전 대화는 모두 문서에 반영됐다는 전제로 새 세션에서 대화 시작.
+   *
+   * 추가: 업데이트 취소 경로(ADR 0008 §D4 확장)를 위해 **문서 스냅샷 백업**도
+   * 함께 생성. 사용자가 사이클 중 "이 대화 잘못했다, 이전으로" 선택 시
+   * 이 백업을 복원해 PRD/DESIGN을 deployed 시점 상태로 되돌린다.
    */
   private async archiveCurrentSessionForUpdate(project: Project): Promise<void> {
     if (!project.current_session_id) return;
@@ -446,6 +450,133 @@ export class ChatService {
     await this.projectRepo.update(project.id, { current_session_id: null });
     // 메모리의 project 객체도 sync
     project.current_session_id = null;
+
+    // 문서 백업 — 취소 시 복원용.
+    if (project.project_path) {
+      await this.backupDocsForUpdate(project.project_path);
+    }
+  }
+
+  /**
+   * 업데이트 사이클 진입 시점의 PRD.md·DESIGN.md 스냅샷을 `.ax-build/
+   * pre-update-backup/`에 저장. 이미 존재하면 덮어쓰지 않음 (사이클 중간의
+   * write_prd로 인한 덮어쓰기를 원본 복원 가능하게).
+   */
+  private async backupDocsForUpdate(projectPath: string): Promise<void> {
+    const backupDir = path.join(projectPath, '.ax-build', 'pre-update-backup');
+    try {
+      await fs.mkdir(backupDir, { recursive: true });
+    } catch {
+      return;
+    }
+    for (const name of ['PRD.md', 'DESIGN.md']) {
+      const src = path.join(projectPath, name);
+      const dst = path.join(backupDir, name);
+      try {
+        // 이미 백업이 있으면 skip — 이번 사이클의 "진짜 원본"은 첫 진입 때 저장됨.
+        await fs.access(dst);
+        continue;
+      } catch {
+        /* backup absent, create */
+      }
+      try {
+        const content = await fs.readFile(src, 'utf8');
+        await fs.writeFile(dst, content, 'utf8');
+      } catch (err: any) {
+        this.logger.warn(
+          `pre-update backup failed for ${name}: ${err?.message ?? err}`,
+        );
+      }
+    }
+    this.logger.log(`pre-update docs backup created at ${backupDir}`);
+  }
+
+  /**
+   * 업데이트 취소 — 문서 복원 + session archive + state를 deployed로.
+   * ADR 0008 §D4 확장. Controller에서 호출.
+   */
+  async cancelUpdateCycle(
+    projectId: string,
+    userId: string,
+  ): Promise<{ state: string }> {
+    await this.requireMembership(projectId, userId, ['owner', 'editor']);
+    const project = await this.projectRepo.findOne({ where: { id: projectId } });
+    if (!project) throw new NotFoundException('프로젝트를 찾을 수 없습니다.');
+
+    const cancellableStates = new Set(['planning_update', 'update_ready']);
+    if (!cancellableStates.has(project.state)) {
+      throw new ForbiddenException(
+        `업데이트 사이클 중에만 취소할 수 있습니다. (현재: ${project.state})`,
+      );
+    }
+
+    // 1) 현재 session archived
+    if (project.current_session_id) {
+      const sess = await this.sessionRepo.findOne({
+        where: { id: project.current_session_id },
+      });
+      if (sess && sess.state !== 'archived') {
+        sess.state = 'archived';
+        await this.sessionRepo.save(sess);
+      }
+    }
+
+    // 2) PRD·DESIGN 복원
+    if (project.project_path) {
+      await this.restoreDocsFromBackup(project.project_path);
+    }
+
+    // 3) current_session_id null + state → deployed
+    await this.projectRepo.update(projectId, { current_session_id: null });
+    await this.stateMachine.transition(
+      projectId,
+      'deployed',
+      'user cancelled update cycle',
+    );
+
+    // 4) WS event로 프론트에 취소 알림
+    this.gateway.emit({
+      agent: 'planning',
+      project_id: projectId,
+      event_type: 'progress',
+      phase: 'update_cycle_cancelled',
+      payload: {
+        detail: '업데이트 사이클을 취소하고 이전 상태로 돌아갔어요.',
+      },
+    });
+
+    return { state: 'deployed' };
+  }
+
+  /**
+   * backupDocsForUpdate로 만든 백업을 원본 위치로 복원. 성공 시 백업 제거.
+   */
+  private async restoreDocsFromBackup(projectPath: string): Promise<void> {
+    const backupDir = path.join(projectPath, '.ax-build', 'pre-update-backup');
+    try {
+      await fs.access(backupDir);
+    } catch {
+      this.logger.warn(
+        `restoreDocsFromBackup: no backup at ${backupDir}, skipping`,
+      );
+      return;
+    }
+    for (const name of ['PRD.md', 'DESIGN.md']) {
+      const src = path.join(backupDir, name);
+      const dst = path.join(projectPath, name);
+      try {
+        const content = await fs.readFile(src, 'utf8');
+        await fs.writeFile(dst, content, 'utf8');
+      } catch {
+        /* file absent in backup — skip */
+      }
+    }
+    try {
+      await fs.rm(backupDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+    this.logger.log(`pre-update docs restored from ${backupDir}`);
   }
 
   private async ensureActiveSession(project: Project): Promise<Session> {

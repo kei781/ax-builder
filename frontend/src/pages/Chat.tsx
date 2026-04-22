@@ -245,6 +245,19 @@ export default function Chat() {
             }
             void fetchProject();
           }
+          // update_cycle_cancelled — 다른 협업자가 업데이트 취소 실행.
+          // 현재 유저도 대시보드로 보내 맥락 일치시킴.
+          if (event.phase === 'update_cycle_cancelled') {
+            setHandoffBanner({
+              kind: 'warning',
+              detail:
+                (p as { detail?: string })?.detail ??
+                '업데이트 사이클이 취소되었습니다.',
+            });
+            setTimeout(() => {
+              navigate('/');
+            }, 1500);
+          }
           // hallucination_detected — AI가 "도구 호출합니다" 텍스트 + 실제 tool_call
           // 0회. 유저가 "왜 안 되지?" 혼란스럽지 않게 명시적 배너.
           if (event.phase === 'hallucination_detected') {
@@ -482,6 +495,36 @@ export default function Chat() {
           {connected ? '실시간' : '연결 중'}
         </span>
         {status && <span className="text-xs text-gray-500 ml-auto">{status}</span>}
+        {/* 업데이트 사이클 취소 — planning_update/update_ready + owner/editor */}
+        {(state === 'planning_update' || state === 'update_ready') && canEdit && (
+          <button
+            onClick={async () => {
+              if (
+                !confirm(
+                  '이번 업데이트 사이클을 취소하고 이전 배포 상태로 돌아갑니다.\n\n' +
+                    '• 이 대화는 아카이브되고 다음에 다시 보이지 않습니다.\n' +
+                    '• PRD/DESIGN 변경사항도 이전 상태로 복원됩니다.\n\n' +
+                    '취소하시겠어요?',
+                )
+              )
+                return;
+              try {
+                await client.post(`/projects/${id}/update/cancel`);
+                setMessages([]);
+                setPendingAssistant('');
+                setStatus('');
+                setHandoffBanner(null);
+                navigate('/');
+              } catch (err: unknown) {
+                const e = err as { response?: { data?: { message?: string } } };
+                alert(`취소 실패: ${e.response?.data?.message ?? '알 수 없는 오류'}`);
+              }
+            }}
+            className={`${status ? '' : 'ml-auto'} text-xs bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 px-3 py-1.5 rounded-lg transition-colors`}
+          >
+            ↩ 업데이트 취소
+          </button>
+        )}
       </header>
 
       {/* Failure banner */}
