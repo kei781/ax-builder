@@ -167,6 +167,29 @@ PRD §10.1 상태 머신 대응 UI:
 - "세부 내용 보기" 토글 시 **원문 stdout** + **tool_use/tool_result** 스트림 표시.
 - 색상: assistant = 흰색, tool_call = 파란색, tool_result = 녹색, error = 빨간색.
 
+### 3.4 기획 대화 화면 (Chat) — 공통 UI 요소
+
+planning / planning_update 양쪽에서 공유. 상태에 따라 카피·버튼만 분기.
+
+**헤더**
+- 좌측: `← 대시보드` · 프로젝트 제목 · 상태 배지 (§2 표) · 실시간/연결중 배지 · status 라인
+- 우측: (업데이트 라인 한정) `↩ 업데이트 취소` 버튼 — planning_update / update_ready + owner/editor일 때만. 확인 모달: "이 대화는 아카이브되고 PRD/DESIGN 변경사항도 이전 상태로 복원됩니다." 승인 시 `POST /update/cancel` → 대시보드 이동.
+
+**AI 진행 상태 인디케이터**
+`loading=true` + `pendingAssistant` 미도착 구간에는 대화창 끝에:
+- 점 3개 bounce 애니메이션 (`animate-bounce`, 150ms 스태거)
+- 텍스트: 첫 빌드 `"생각 중..."` / 업데이트 `"수정 사항 검토 중..."`
+- status에 tool_call 이벤트가 들어오면 `"🔧 write_prd 호출 중..."`으로 실시간 교체
+
+유저가 묵묵부답 같은 상태에서 AI가 살아있는지 인지. pendingAssistant 토큰이 도착하기 시작하면 자동으로 실시 메시지 렌더링으로 전환.
+
+**환각 감지 배너 (WS `phase=hallucination_detected`)**
+AI가 `<tool_name> 도구를 호출합니다` 텍스트만 쓰고 실제 tool_call=0회면 orchestrator가 감지해 WS emit. 프론트는 warning 배너로 노출:
+> ⚠ AI가 도구를 호출한다고 말했지만 실제로는 호출되지 않았어요. 같은 요청을 한 번 더 보내거나 "AI에게 핸드오프 요청" 버튼을 눌러주세요.
+
+**업데이트 사이클 취소 피드백 (WS `phase=update_cycle_cancelled`)**
+다른 탭/협업자가 취소를 실행하면 해당 이벤트가 브로드캐스트돼 현재 유저도 1.5초 안내 배너 → 대시보드 자동 이동 (맥락 동기화).
+
 ---
 
 ## 4. ENV 입력 화면 (2-모드, ADR 0005 + 0006)
