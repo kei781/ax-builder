@@ -44,10 +44,11 @@ ax-builder는 그 문제를 해결합니다.
 
 - Node.js 20+
 - Python 3.11+ (`brew install python@3.11`)
-- Docker (빌드한 프로젝트 격리 실행용, 선택)
+- **Docker** (빌드된 프로젝트 컨테이너 격리 실행용 — **필수**)
 - [Gemini API 키](https://aistudio.google.com/) (무료 발급 가능)
 - [Google OAuth 클라이언트](https://console.cloud.google.com) (로그인용)
-- Anthropic 계정 (`claude login`용)
+- Claude Pro/Team 구독 + `claude` CLI (phase 실행을 정액제 OAuth 크레딧으로 사용)
+- pm2 (권장: `npm i -g pm2`) — 4개 프로세스(orchestrator/planning-agent/frontend/hermes-mcp)를 한 번에 관리
 
 ### 1단계: .env 설정
 
@@ -76,20 +77,26 @@ chmod +x setup.sh
 ```
 
 setup.sh가 자동으로 처리하는 것:
-- Node.js 의존성 설치 (frontend + backend)
-- Hermes Agent 설치 + Python 경로 자동 감지 → `.env`에 기록
+- `orchestrator` + `frontend` Node.js 의존성 설치
+- `planning-agent` + `building-agent` Python venv·의존성 설치
 - `.env` 파일 생성 (없을 경우)
 - `data/`, `projects/` 디렉토리 생성
 
 ### 3단계: 실행
 
-```bash
-# 터미널 1: 백엔드
-cd backend && npm run start:dev
+pm2로 4개 프로세스를 한 번에 기동:
 
-# 터미널 2: 프론트엔드
-cd frontend && npm run dev
+```bash
+npx pm2 start ecosystem.config.cjs
+npx pm2 logs  # 로그 스트림 확인
 ```
+
+| 프로세스 | 역할 | 포트 |
+|---|---|---|
+| `ax-orchestrator` | NestJS API + WebSocket + AI Gateway | 4000 |
+| `ax-planning-agent` | Planning LLM Socket.IO 서버 (Python) | 4100 |
+| `ax-frontend` | Vite dev 서버 | 5173 |
+| 배포된 프로젝트 | Docker 컨테이너 | 3000~3999 중 자동 할당 |
 
 http://localhost:5173 에서 접속. 끝.
 
@@ -98,11 +105,8 @@ http://localhost:5173 에서 접속. 끝.
 ### 최초 1회 추가 설정
 
 ```bash
-# Hermes Agent 초기 설정 (모델 선택 등)
-hermes setup
-
-# Claude Code CLI 로그인
-claude login
+# Claude Code CLI 로그인 (정액제 구독 크레딧으로 phase 실행)
+claude auth login
 ```
 
 ---
@@ -114,7 +118,7 @@ claude login
 1. 메인 페이지에서 **[+ 새 프로젝트]** 클릭
 2. 프로젝트 이름 입력
 3. AI와 대화하며 아이디어 구체화
-4. 스코어가 900점 이상이 되면 **[제작]** 버튼 활성화
+4. 스코어 600점 이상(모든 항목 최소 60%)에서 **[빌드 시작]** 또는 **[AI에게 핸드오프 요청]** 버튼 활성화 (최적 구간은 850점 이상 = "충분 조건 충족")
 5. 제작 버튼 클릭 → AI가 빌드 + QA 자동 진행
 6. 완료되면 접속 URL 확인
 
@@ -154,8 +158,8 @@ AI는 대화를 통해 아이디어를 1000점 만점으로 평가합니다.
 |---|---|---|
 | 0~499 | 🔴 모호함 | 문제 자체가 불명확. 더 많은 대화 필요 |
 | 500~699 | 🟠 문제 정리됨 | 문제는 파악됐으나 해결 방법 미정 |
-| 700~899 | 🟡 프로세스 완료 | 기능까지 정리됐으나 세부사항 부족 |
-| 900~1000 | 🟢 제작 가능 | UI/UX까지 설계 완료. 빌드 가능 |
+| 600~849 | 🟡 최소 조건 충족 | 핸드오프 요청 가능하나 "보강 권장"으로 거부될 수 있음 |
+| 850~1000 | 🟢 충분 조건 충족 | UI/UX까지 설계 완료. 빌드 권장 |
 
 평가 항목 (각 200점):
 - 문제 정의 / 기능 목록 / 사용 흐름 / 기술 실현성 / 사용자 경험
@@ -180,15 +184,19 @@ AI는 대화를 통해 아이디어를 1000점 만점으로 평가합니다.
 
 ```
 ax-builder/
-├── frontend/          # React 웹 UI
-├── backend/           # NestJS API 서버
-├── bridge/            # Hermes Agent ↔ Claude Code CLI 브릿지
-│   └── hermes_pipeline.py
-├── data/              # SQLite DB (ax-builder.db, 자동 생성)
-├── projects/          # 빌드된 프로젝트들 (자동 생성)
-├── docker/            # Docker Compose + Nginx 설정
-├── setup.sh           # 자동 설치 스크립트
-├── .env.example       # 환경 변수 템플릿
+├── frontend/           # React + Vite 웹 UI
+├── orchestrator/       # NestJS API + WebSocket + AI Gateway
+├── planning-agent/     # Python FastAPI + Socket.IO (기획 대화 LLM 루프)
+├── building-agent/     # Python Hermes — phase 계획·Claude Code 호출
+├── docs/
+│   ├── adr/            # 설계 결정 기록 (0001~0009)
+│   └── ops/            # 트러블슈팅 회고
+├── data/               # SQLite DB (자동 생성)
+├── projects/           # 빌드된 프로젝트들 (자동 생성)
+├── docker/             # MySQL compose
+├── ecosystem.config.cjs # pm2 설정
+├── setup.sh
+├── .env.example
 └── README.md
 ```
 
