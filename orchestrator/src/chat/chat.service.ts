@@ -48,6 +48,13 @@ export class ChatService {
     { userId: string; lockedAt: number }
   >();
 
+  /**
+   * 턴 단위 도구 호출 카운터 — 회고 §6/9 환각 감지용.
+   * sendUserMessage 시작 시 0으로 세팅, tool_call 이벤트마다 증가,
+   * completion 이벤트에 0이면 AI 텍스트 환각 감지 가동.
+   */
+  private readonly turnToolCallCount = new Map<string, number>();
+
   constructor(
     @InjectRepository(Project)
     private readonly projectRepo: Repository<Project>,
@@ -229,6 +236,8 @@ export class ChatService {
       }
     }
     this.chatLocks.set(projectId, { userId, lockedAt: Date.now() });
+    // 환각 감지 카운터 reset — 이번 턴의 tool_call 이벤트 수를 센다.
+    this.turnToolCallCount.set(projectId, 0);
 
     // Concurrency limit (ARCHITECTURE §10.1): 2 concurrent planning sessions
     // per user. Only check on first turn (state=draft → planning), not on
@@ -492,6 +501,12 @@ export class ChatService {
   ): Promise<void> {
     this.gateway.emit(event);
 
+    // 환각 감지 — 이번 턴의 실제 tool_call 횟수 카운트.
+    if (event.event_type === 'tool_call') {
+      const prev = this.turnToolCallCount.get(event.project_id) ?? 0;
+      this.turnToolCallCount.set(event.project_id, prev + 1);
+    }
+
     // Tool call audit — we record both the call and the result so failures
     // and arguments are replayable offline. Token/progress events are high
     // volume; we skip them on purpose.
@@ -639,19 +654,47 @@ export class ChatService {
 
     if (event.event_type === 'completion') {
       const payload = (event.payload ?? {}) as { role?: string; content?: string };
-      if (
-        payload.role === 'assistant' &&
-        typeof payload.content === 'string' &&
-        payload.content.trim().length > 0
-      ) {
+      const content = typeof payload.content === 'string' ? payload.content : '';
+      if (payload.role === 'assistant' && content.trim().length > 0) {
         await this.messageRepo.save(
           this.messageRepo.create({
             session_id: sessionId,
             role: 'assistant',
-            content: payload.content,
+            content,
           }),
         );
       }
+
+      // 환각 감지 (회고 §6/9) — AI가 텍스트로 "<tool_name> 도구를 호출합니다"
+      // 류 문구를 쓰면서 이번 턴에 실제 tool_call을 한 번도 발사하지 않았으면
+      // 유저에게 경고 배너. AI가 "호출하겠다"고 예고만 하고 실제 상태 전이가
+      // 안 되는 가장 흔한 환각 패턴.
+      const toolCallsThisTurn = this.turnToolCallCount.get(event.project_id) ?? 0;
+      this.turnToolCallCount.delete(event.project_id);
+      if (toolCallsThisTurn === 0 && content) {
+        // 도구 이름 + 동작 동사가 근접 위치에 있는 텍스트만 환각 후보.
+        // "도구 호출 시 주의" 같은 일반 문장은 매칭 안 되게 도구 이름 필수.
+        const toolMentionPattern =
+          /(write_prd|write_design|propose_handoff|evaluate_readiness|update_memory|search_memory)[\s\S]{0,40}(호출|실행|저장|제안|평가)/;
+        if (toolMentionPattern.test(content)) {
+          this.logger.warn(
+            `Planning hallucination detected on project ${event.project_id}: ` +
+            `AI mentioned tool call in text but no actual tool_call event fired.`,
+          );
+          this.gateway.emit({
+            agent: 'planning',
+            project_id: event.project_id,
+            session_id: sessionId,
+            event_type: 'progress',
+            phase: 'hallucination_detected',
+            payload: {
+              detail:
+                'AI가 도구를 호출한다고 말했지만 실제로는 호출되지 않았어요. 같은 요청을 한 번 더 보내거나 "AI에게 핸드오프 요청" 버튼을 눌러주세요.',
+            },
+          });
+        }
+      }
+
       // Bump activity on completion so idle timer tracks assistant output too.
       await this.sessionRepo.update(sessionId, { last_activity_at: new Date() });
       // Release concurrent chat lock.

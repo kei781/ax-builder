@@ -245,6 +245,15 @@ export default function Chat() {
             }
             void fetchProject();
           }
+          // hallucination_detected — AI가 "도구 호출합니다" 텍스트 + 실제 tool_call
+          // 0회. 유저가 "왜 안 되지?" 혼란스럽지 않게 명시적 배너.
+          if (event.phase === 'hallucination_detected') {
+            const pr = p as { detail?: string };
+            setHandoffBanner({
+              kind: 'warning',
+              detail: pr.detail ?? 'AI가 도구 호출을 텍스트로만 언급했고 실제 호출은 없었어요.',
+            });
+          }
           // handoff_rejected — accepted=false. AI 텍스트 대신 이 배너가 진실.
           if (event.phase === 'handoff_rejected') {
             const pr = p as {
@@ -632,6 +641,26 @@ export default function Chat() {
         ))}
         {pendingAssistant && (
           <ChatMessage role="assistant" content={pendingAssistant} userLabel="owner" />
+        )}
+        {/* AI 진행 상태 — pendingAssistant 토큰이 아직 안 왔어도 loading이면 표시.
+            유저가 "얘가 뭐 하고 있나?" 불확실하지 않게. status에는 tool call 등
+            상세 정보가 실시간으로 들어옴. */}
+        {loading && !pendingAssistant && (
+          <div className="flex items-start gap-3 my-4 ml-1">
+            <div className="w-8 h-8 rounded-full bg-gray-200 dark:bg-gray-800 flex items-center justify-center text-xs text-gray-500 shrink-0">
+              AI
+            </div>
+            <div className="bg-gray-100 dark:bg-gray-900 rounded-2xl px-4 py-3 flex items-center gap-2">
+              <div className="flex gap-1">
+                <span className="w-2 h-2 bg-gray-400 dark:bg-gray-600 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                <span className="w-2 h-2 bg-gray-400 dark:bg-gray-600 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                <span className="w-2 h-2 bg-gray-400 dark:bg-gray-600 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+              </div>
+              <span className="text-xs text-gray-500 dark:text-gray-400">
+                {status || (isUpdateLine ? '수정 사항 검토 중...' : '생각 중...')}
+              </span>
+            </div>
+          </div>
         )}
         <div ref={messagesEndRef} />
       </div>
