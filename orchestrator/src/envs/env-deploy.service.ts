@@ -157,6 +157,13 @@ export class EnvDeployService {
 
     const envDict = await this.envs.resolveAllForContainer(projectId);
 
+    // ADR 0008 §D4 + 회고 §10: update 모드는 옛 컨테이너가 살아있는 동안 새
+    // 컨테이너를 띄워야 한다. Docker 컨테이너 이름은 unique 제약이 있어 같은
+    // canonical 이름을 두 개 못 쓴다. 따라서 update 사이클의 새 컨테이너는
+    // 임시 suffix(`update-{ts}`)로 띄우고, 헬스체크 통과 직후(아래) 옛 컨테이너
+    // 제거 + 새 컨테이너 rename으로 swap.
+    const nameSuffix = isUpdate ? `update-${Date.now()}` : undefined;
+
     let port: number;
     let containerId: string;
     try {
@@ -166,6 +173,7 @@ export class EnvDeployService {
         proj.project_path!,
         port,
         envDict,
+        nameSuffix,
       );
       await this.docker.startContainer(containerId);
     } catch (err: any) {
@@ -197,13 +205,22 @@ export class EnvDeployService {
     }
 
     // 성공 — 이제야 이전 컨테이너 제거 (업데이트 라인).
+    // 옛 컨테이너 제거 후 임시 이름의 새 컨테이너를 canonical 이름으로 rename.
+    // 회고 §10: 두 단계가 같은 try 안에 있어야 부분 실패 시 일관성 보장.
     if (isUpdate && proj.previous_container_id) {
       try {
         await this.docker.removeContainer(proj.previous_container_id);
+        await this.docker.renameContainer(
+          containerId,
+          this.docker.canonicalName(projectId),
+        );
       } catch (err: any) {
         this.logger.warn(
-          `post-update: remove previous container failed: ${err?.message ?? err}`,
+          `post-update swap (remove old + rename new) failed: ${err?.message ?? err}`,
         );
+        // rename 실패는 치명적이지 않다 — 새 컨테이너는 임시 이름으로 살아있고
+        // DB가 container_id를 정확히 가리킨다. 다음 update 사이클에서 또
+        // 임시 suffix 붙여 띄우면 충돌 없다.
       }
     }
 

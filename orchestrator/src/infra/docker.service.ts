@@ -10,14 +10,28 @@ export class DockerService {
     this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
   }
 
+  /**
+   * Canonical 컨테이너 이름. update 사이클이 아닌 경우 이 이름 그대로 사용.
+   * update 사이클에서는 임시 이름(suffix 포함)으로 띄운 뒤 헬스체크 통과 시
+   * `renameContainer`로 canonical로 swap한다 — ADR 0008 §D4의 "두 컨테이너
+   * 동시 보유" 모델을 도커의 unique-name 제약 위에서 실현하기 위함.
+   */
+  canonicalName(projectId: string): string {
+    return `project-${projectId}`;
+  }
+
   async createContainer(
     projectId: string,
     projectPath: string,
     port: number,
     extraEnv: Record<string, string> = {},
+    nameSuffix?: string,
   ): Promise<string> {
+    const containerName = nameSuffix
+      ? `${this.canonicalName(projectId)}-${nameSuffix}`
+      : this.canonicalName(projectId);
     this.logger.log(
-      `Creating container for project ${projectId} on port ${port} (envs=${Object.keys(extraEnv).length})`,
+      `Creating container "${containerName}" for project ${projectId} on port ${port} (envs=${Object.keys(extraEnv).length})`,
     );
 
     // Ensure base image is available; pull if missing.
@@ -47,7 +61,7 @@ export class DockerService {
 
     const container = await this.docker.createContainer({
       Image: 'node:20-slim',
-      name: `project-${projectId}`,
+      name: containerName,
       Env: envArray,
       ExposedPorts: { '3000/tcp': {} },
       Volumes: {
@@ -127,6 +141,29 @@ export class DockerService {
     const container = this.docker.getContainer(containerId);
     await container.restart();
     this.logger.log(`Container ${containerId} restarted`);
+  }
+
+  /**
+   * 컨테이너 이름을 canonical(`project-{id}`)로 swap.
+   * 2026-04-24 회고 §10 — update 사이클 한정. 새 컨테이너를 임시 이름으로 띄우고
+   * 헬스체크 통과 직후 옛 컨테이너 제거 → 새 컨테이너 rename. 이렇게 해야
+   * docker name unique 제약과 §D4 무중단 invariant가 동시에 성립한다.
+   * 404(없음)/409(이미 존재)는 silently 무시 — caller가 실패해도 동작에 영향 없음.
+   */
+  async renameContainer(containerId: string, newName: string): Promise<void> {
+    try {
+      const container = this.docker.getContainer(containerId);
+      await container.rename({ name: newName });
+      this.logger.log(`Container ${containerId} renamed to ${newName}`);
+    } catch (err: any) {
+      if (err?.statusCode === 404 || err?.statusCode === 409) {
+        this.logger.warn(
+          `rename ${containerId} → ${newName} skipped: ${err?.message ?? err}`,
+        );
+        return;
+      }
+      throw err;
+    }
   }
 
   /**
