@@ -18,7 +18,12 @@ import { Injectable, Logger } from '@nestjs/common';
  * 같은 변수에서 3회 반복"은 `EnvDeployService`가 카운터로 관리하며,
  * 이 서비스는 단일 로그에 대한 분류만 담당.
  */
-export type FailureKind = 'env_rejected' | 'transient' | 'code_bug' | 'unknown';
+export type FailureKind =
+  | 'env_rejected'
+  | 'transient'
+  | 'code_bug'
+  | 'infra_error'
+  | 'unknown';
 
 export interface Classification {
   kind: FailureKind;
@@ -35,6 +40,45 @@ interface Rule {
 }
 
 const RULES: Rule[] = [
+  // --- infra_error: Claude Code CLI / 빌드 환경 자체 문제. ---
+  //     유저나 AI가 재시도해도 풀리지 않는다. 운영자 개입 필요.
+  //     env_rejected의 401보다 먼저 매칭해서 가려낸다.
+  {
+    label: 'claude-auth-failed',
+    pattern: /(Failed to authenticate|authentication_error).*(401|Invalid authentication credentials)/is,
+    kind: 'infra_error',
+  },
+  {
+    label: 'claude-cli-not-found',
+    pattern: /claude CLI not found|command not found: claude/i,
+    kind: 'infra_error',
+  },
+  {
+    label: 'claude-rate-limit',
+    pattern: /rate[_\s-]?limit.*(exceeded|reached|429)/i,
+    kind: 'infra_error',
+  },
+  {
+    label: 'claude-context-overflow',
+    pattern: /context[_\s-]?length[_\s-]?exceeded|maximum context length|prompt is too long/i,
+    kind: 'infra_error',
+  },
+  {
+    label: 'disk-full',
+    pattern: /ENOSPC|No space left on device/i,
+    kind: 'infra_error',
+  },
+  {
+    label: 'oom',
+    pattern: /OOMKilled|out of memory|ENOMEM|JavaScript heap out of memory/i,
+    kind: 'infra_error',
+  },
+  {
+    label: 'docker-daemon',
+    pattern: /docker.*daemon|Is the docker daemon running/i,
+    kind: 'infra_error',
+  },
+
   // --- env_rejected: 유저 귀책 ---
   {
     label: 'http-401',
@@ -90,6 +134,14 @@ const RULES: Rule[] = [
   },
 
   // --- code_bug: 앱 코드 문제 ---
+  // ADR 0008 — 업데이트 라인에서 qa_supervisor가 regression 발생 시 gap_list에
+  // "업데이트 후 기존 기능이 깨졌어요" 또는 "regression detected" 문구를 남긴다.
+  // 이를 명시적으로 code_bug로 분류해 telemetry에서 "update regression"을 구분.
+  {
+    label: 'update-regression',
+    pattern: /업데이트 후 기존 기능이 깨졌|regression detected on \d+ endpoint/i,
+    kind: 'code_bug',
+  },
   {
     label: 'syntax-error',
     pattern: /SyntaxError/,

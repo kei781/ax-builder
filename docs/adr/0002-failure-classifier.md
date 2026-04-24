@@ -17,19 +17,23 @@
 
 ## 결정
 
-4-way 분류기를 도입한다.
+**5-way 분류기**를 도입한다.
 
-| # | 원인 | 시그니처 | 핸들링 |
-|---|---|---|---|
-| 1 | `env_rejected` | 401, 403, Unauthorized, Invalid.\*key | `awaiting_env` 복귀, 최대 3회 재입력 |
-| 2 | `transient` | ECONNREFUSED, ETIMEDOUT, 503, 502 | 현 상태 유지 + 지수 백오프 재시도(1·5·15분) + 수동 재시도 버튼 |
-| 3 | `code_bug` | SyntaxError, TypeError, ReferenceError, 포트 미바인드, 파싱 실패 | Planning bounce-back |
-| 4 | `schema_bug` | 같은 변수에서 케이스 1이 3회 연속 | Planning bounce-back (변수 이력 첨부) |
+| # | 원인 | 고치는 주체 | 시그니처 예 | 핸들링 |
+|---|---|---|---|---|
+| 1 | `infra_error` | **운영자** | Claude CLI auth 401, rate-limit 429, context overflow, OOM, disk full, docker daemon down | `state='failed'` + "관리자에게 문의" 메시지. 기획·유저·AI 다 손댈 수 없음. |
+| 2 | `env_rejected` | 유저 | 401, 403, Unauthorized, Invalid.\*key | `awaiting_env` 복귀 (또는 mock-first 흐름에선 `deployed` 유지 + 토스트), 최대 3회 재입력 |
+| 3 | `transient` | 아무도 (대기) | ECONNREFUSED, ETIMEDOUT, 503, 502 | 현 상태 유지 + "잠시 뒤 재시도" 안내. 자동 retry는 Phase 6.1. |
+| 4 | `code_bug` | AI (Claude Code) | SyntaxError, TypeError, ReferenceError, 포트 미바인드, 파싱 실패 | env_qa에선 `modifying` (대화 수정), phase 실행 실패에선 `planning` bounce. |
+| 5 | `schema_bug` | AI (PRD/Planning) | 같은 변수에서 env_rejected가 3회 연속 | `planning` bounce-back (변수 이력 첨부). |
+| — | `unknown` | — | 규칙 미매칭 | `code_bug`로 안전 폴백 (유저를 재입력 지옥에 두지 않음) |
+
+**`infra_error` 추가 배경 (2026-04-20)**: 실제 운영에서 **Claude CLI OAuth 토큰 만료 → 401 → phase 실패 → "기획 대화로 돌아가세요"** 잘못된 안내 사례 발생. 유저가 기획을 아무리 바꿔도 해결 안 되는 종류이므로 PRD bounce가 아니라 **관리자 개입 필요** 상태로 분리 필요. `claude-auth-failed` regex 룰이 env_rejected의 `http-401` 룰보다 먼저 매칭되도록 RULES 테이블 순서 배치.
 
 **판정 순서**
-1. **regex 룰 테이블** — 에러 로그에 대한 1차 매칭. 확정되면 즉시 분기.
-2. **LLM judge** (Gemini `qa_judge` 슬롯) — 1차에서 미매칭 시 2차. 프롬프트: "env/transient/code 중 무엇인가".
-3. **안전 폴백** — 2차도 모호하면 `code_bug`로 처리. (유저를 재입력 지옥에 두지 않음 — 이 쪽이 더 보수적 안전판.)
+1. **regex 룰 테이블** — 에러 로그에 대한 1차 매칭. 확정되면 즉시 분기.  `infra_error` 룰이 최우선 — auth/rate/infra 신호가 있으면 env_rejected/transient의 겹치는 신호(401 등)보다 먼저 가로챈다.
+2. **LLM judge** (Gemini `qa_judge` 슬롯) — 1차에서 미매칭 시 2차. 프롬프트: "infra/env/transient/code 중 무엇인가". **Phase 6.1 구현 예정**.
+3. **안전 폴백** — 2차도 모호하면 `code_bug`로 처리.
 
 ## 대안
 
@@ -51,17 +55,30 @@
 
 ## 연관 구현
 
-**현재 상태 (PR #4)**
+**현재 상태 (Phase 6 MVP, PR #5)**
 
-- `orchestrator/src/envs/failure-classifier.service.ts` — regex 룰 테이블 + `classify(logs)` API. 복수 매칭 시 "뒤쪽(= 실제 실패 라인) 우선" 로직 포함. LLM judge 2차는 **미구현 (TODO)**, 미매칭 시 `code_bug` 안전 폴백.
-- `orchestrator/src/envs/env-deploy.service.ts` — 실패 시 `docker.getLogs()` → classify → `handleFailure`에서 kind별 전이 분기 + `env_attempts` 카운터 관리 (3회 시 `schema_bug`로 에스컬레이션).
-- `orchestrator/src/projects/entities/project.entity.ts` — `env_attempts` INTEGER 컬럼 추가.
-- `orchestrator/src/infra/docker.service.ts` — `getLogs(containerId, tailLines)` (Docker 멀티플렉스 8바이트 프레임 헤더 파싱 포함).
-- WebSocket `error` 이벤트 payload에 `classifier / matched_rule / reason_snippet / next_state` 전달.
-- `frontend/src/pages/EnvInput.tsx` — `FailureBanner` 컴포넌트, kind별 톤(주황/파랑/빨강)·카피·행동 분기, 개발자용 "세부 내용" 토글.
+- `orchestrator/src/envs/failure-classifier.service.ts`
+  - `FailureKind`: `infra_error | env_rejected | transient | code_bug | unknown` (5종)
+  - `RULES` 테이블 — 우선순위: infra_error → env_rejected → transient → code_bug. 복수 매칭 시 "뒤쪽(실제 실패 라인) 우선".
+  - `infra_error` 패턴 7종: claude-auth-failed, claude-cli-not-found, claude-rate-limit, claude-context-overflow, disk-full(ENOSPC), oom(JavaScript heap out of memory 등), docker-daemon
+- `orchestrator/src/envs/env-deploy.service.ts` — **env_qa 실패**에 classifier 적용. mode(fresh/maintenance) + kind 조합으로 전이 결정.
+- `orchestrator/src/agents/building.runner.ts` **(2026-04-20 추가)** — **build phase 실패 (exit code 2)**에도 classifier 적용.
+  - `bounceGaps: Map<string, string[]>`로 빌드 중 error/phase_end의 gap_list 누적
+  - handleExit에서 gap_list + build_phases.output_log를 합쳐 classifier에 투입
+  - **`infra_error` → `state=failed` + 운영자 메시지** (기획 반송 X). 이전엔 전부 planning으로 보내 유저를 헷갈리게 했음.
+  - `transient` → `state=failed` + "잠시 뒤 재시도" 안내
+  - `code_bug` / `unknown` → 기존 planning 반송 유지
+- `orchestrator/src/projects/entities/project.entity.ts` — `env_attempts` INTEGER 컬럼.
+- `orchestrator/src/projects/projects.service.ts` **(2026-04-20 추가)** — `findOne`이 `last_bounce: {build_id, finished_at, gap_list}` 필드 반환. planning/plan_ready로 돌아온 직후 프론트 배너에서 "왜 돌아왔는지" 즉시 보이게.
+- `orchestrator/src/builds/builds.service.ts` — `closeBuild(id, 'bounced', gaps)`가 이제 항상 gaps를 받음. `bounce_reason_gap_list` 컬럼에 영속화.
+- `orchestrator/src/infra/docker.service.ts` — `getLogs(containerId, tailLines)` (Docker 멀티플렉스 프레임 헤더 파싱 포함).
+- WebSocket `error` 이벤트 payload에 `classifier / matched_rule / reason_snippet / next_state / gap_list` 전달.
+- 프론트
+  - `EnvInput.tsx` — `FailureBanner` (kind별 톤·카피·행동 분기, 세부 내용 토글)
+  - `Chat.tsx` **(2026-04-20 추가)** — `last_bounce` 배너 (주황 톤, planning/plan_ready 상태 + bounced 빌드 최근 발생 시)
 
 **아직 안 한 것**
 
-- `building-agent` 쪽 초기 QA 실패 분류: 현재는 exit 2 = 무조건 Planning 반송. env 주입 전 단계라 대부분 `code_bug`이므로 당장은 필요 없음.
-- LLM judge 2차 — regex 룰이 커버 못 하는 로그가 쌓이면 도입.
-- `build_phases.failure_kind` 컬럼: 현재는 `agent_logs` payload에만 남음. 통계가 필요해지면 별도 컬럼으로 승격.
+- **LLM judge 2차** — regex 룰이 커버 못 하는 로그가 쌓이면 Phase 6.1에서 도입.
+- **`build_phases.failure_kind` 컬럼** — 현재는 agent_logs payload에만 남음. 통계가 쌓이면 승격.
+- **자동 재시도** — `infra_error`가 일시적일 수 있는 경우(claude 토큰 일시 만료 등) 운영자 개입 전 1~2회 자동 retry. 현재는 즉시 failed.

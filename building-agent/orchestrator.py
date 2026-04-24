@@ -41,6 +41,11 @@ def main(raw_args: str) -> int:
     project_path = Path(args["project_path"])
     session_id: str | None = args.get("session_id")
     build_id: str | None = args.get("build_id")
+    # ADR 0008 — 'build' (첫 빌드) vs 'update' (업데이트). 기본값은 build로,
+    # 이전 계약과 호환. update 모드면 phase_planner/phase_runner가 다르게 동작.
+    mode: str = args.get("mode", "build")
+    if mode not in ("build", "update"):
+        mode = "build"
 
     def progress(phase: str, detail: str, pct: int) -> None:
         events.emit(
@@ -53,7 +58,11 @@ def main(raw_args: str) -> int:
             payload={"detail": detail},
         )
 
-    events.log(f"Build started for project {project_id}", path=str(project_path))
+    events.log(
+        f"{'Update' if mode == 'update' else 'Build'} started for project {project_id}",
+        path=str(project_path),
+        mode=mode,
+    )
 
     try:
         # -------- 1. Load PRD/DESIGN --------
@@ -72,7 +81,7 @@ def main(raw_args: str) -> int:
 
         # -------- 2. Generate PHASES.md --------
         progress("planning", "PHASES.md 생성 중", 5)
-        phases = generate_phases(prd, design)
+        phases = generate_phases(prd, design, mode=mode)
         write_phases_md(project_path, phases)
         events.emit(
             "progress",
@@ -105,7 +114,7 @@ def main(raw_args: str) -> int:
             )
 
             result = run_phase(
-                phase, phases, idx, project_path, prd, design, previous
+                phase, phases, idx, project_path, prd, design, previous, mode=mode
             )
 
             events.emit(
@@ -129,9 +138,20 @@ def main(raw_args: str) -> int:
             if not result.ok:
                 # Per H2 policy: any phase failure = immediate bounce-back,
                 # no local retries (Planning agent fixes the gap).
+                #
+                # gap_list 수집 원칙: orchestrator의 FailureClassifier가 gap_list
+                # 를 regex로 분류해 infra_error / code_bug / transient를 구분한다.
+                # 따라서 gap_list에 **분류에 필요한 에러 원문**이 포함돼야 한다.
+                #
+                # Claude CLI는 인증 실패(401) 같은 에러를 **stdout**에 출력하고
+                # stderr에는 warning만 남기는 경우가 많다. stderr만 실으면 classifier
+                # 가 auth 패턴을 놓쳐 code_bug로 오분류 (회고 §1 버그 #2 재발).
+                # 해결: stdout·stderr 둘 다 tail 포함.
                 gaps = [
                     f"Phase '{phase.name}' 실패: {result.error or 'unknown'}"
                 ]
+                if result.stdout:
+                    gaps.append(f"stdout 요약: {result.stdout[-500:]}")
                 if result.stderr:
                     gaps.append(f"에러 로그 요약: {result.stderr[-300:]}")
                 events.emit(
@@ -161,7 +181,7 @@ def main(raw_args: str) -> int:
             progress_percent=88,
             payload={"description": "npm install + 서버 기동 검증"},
         )
-        qa = run_qa(project_path)
+        qa = run_qa(project_path, project_id=project_id, mode=mode)
         events.emit(
             "phase_end",
             project_id=project_id,
@@ -174,6 +194,7 @@ def main(raw_args: str) -> int:
                 "detail": qa.detail,
                 "gap_list": qa.gaps,
                 "observed_port": qa.observed_port,
+                "primary_endpoints": qa.primary_endpoints,
             },
         )
         if not qa.ok:
@@ -199,9 +220,11 @@ def main(raw_args: str) -> int:
             build_id=build_id,
             progress_percent=100,
             payload={
-                "detail": "빌드 완료",
+                "detail": "업데이트 완료" if mode == "update" else "빌드 완료",
                 "phases": [p.name for p in phases],
                 "port": settings.QA_TEST_PORT,
+                "primary_endpoints": qa.primary_endpoints,
+                "mode": mode,
             },
         )
         return 0

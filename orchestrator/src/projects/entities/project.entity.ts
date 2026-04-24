@@ -17,24 +17,38 @@ import { ProjectPermission } from './project-permission.entity.js';
 /**
  * Project lifecycle state machine.
  *
- * Transitions (see ARCHITECTURE.md §7):
- *   draft → planning → plan_ready → building → qa → deployed
- *              ↑                       │
- *              └──── bounce-back ──────┘
- *   deployed → modifying  (new session for edits)
- *   * → failed            (lock or fatal error)
+ * 두 개의 라인이 존재합니다(ADR 0008):
+ *
+ *   [첫 빌드 라인]
+ *     draft → planning → plan_ready → building → qa → env_qa → deployed
+ *                ↑                       │
+ *                └──── bounce-back ──────┘
+ *
+ *   [업데이트 라인]
+ *     deployed → planning_update → update_ready → updating → update_qa → deployed
+ *                      ↑                             │            │
+ *                      └──── rollback / bounce ──────┴────────────┘
+ *
+ *   * → failed  (lock, fatal error, 또는 운영자 개입 필요한 infra_error)
  */
 export type ProjectState =
+  // 첫 빌드 라인
   | 'draft'
   | 'planning'
   | 'plan_ready'
   | 'building'
   | 'qa'
+  // env 사이드 (양 라인 공유)
   | 'awaiting_env'
   | 'env_qa'
+  // 터미널
   | 'deployed'
   | 'failed'
-  | 'modifying';
+  // 업데이트 라인
+  | 'planning_update'
+  | 'update_ready'
+  | 'updating'
+  | 'update_qa';
 
 @Entity('projects')
 export class Project {
@@ -72,6 +86,20 @@ export class Project {
   @Column({ type: 'varchar', length: 100, nullable: true })
   container_id!: string | null;
 
+  /**
+   * ADR 0008 §D4 — update 시작 직전의 container_id 백업.
+   * `updating`/`update_qa` 실패 시 복구 대상. 성공하면 clear.
+   */
+  @Column({ type: 'varchar', length: 100, nullable: true })
+  previous_container_id!: string | null;
+
+  /**
+   * ADR 0008 §D4 — update 시작 직전의 current_version 백업.
+   * 롤백 시 `current_version`과 `container_id`를 되돌리는 데 쓰임.
+   */
+  @Column({ type: 'int', nullable: true })
+  previous_version!: number | null;
+
   /** Lock expiry (H1: nonsense-input lock). Counts toward owner's planning quota. */
   @Column({ type: 'datetime', nullable: true })
   locked_until!: Date | null;
@@ -85,6 +113,16 @@ export class Project {
    */
   @Column({ type: 'int', default: 0 })
   env_attempts!: number;
+
+  /**
+   * Phase 6 / ADR 0003 — AI Gateway 프로젝트 토큰의 SHA-256 hex 해시.
+   * 평문 토큰은 project_env_vars에 AX_AI_TOKEN(system-injected)로 암호화 저장.
+   * 이 해시는 Gateway HTTP 인증(Authorization: Bearer ...) 역조회용.
+   * revoke하려면 NULL로 비우면 됨.
+   */
+  @Column({ type: 'varchar', length: 64, nullable: true })
+  @Index()
+  ai_token_hash!: string | null;
 
   @CreateDateColumn()
   created_at!: Date;

@@ -74,6 +74,30 @@ export class BuildsService {
     });
   }
 
+  /**
+   * 같은 세션의 가장 최근 실패(failed/bounced/cancelled) 연속 개수.
+   * 성공 빌드 또는 진행 중 빌드를 만나면 스톱.
+   *
+   * 프론트가 "다시 빌드" vs "기획 대화로" CTA 순서를 뒤집을 기준으로 사용.
+   * 2회 이상 같은 맥락에서 실패하면 재시도보다는 대화 보강이 효과적이라는 휴리스틱.
+   */
+  async getConsecutiveFailureCount(projectId: string): Promise<number> {
+    const builds = await this.buildRepo.find({
+      where: { project_id: projectId },
+      order: { started_at: 'DESC' },
+      take: 10,
+    });
+    let count = 0;
+    for (const b of builds) {
+      if (b.status === 'success') break;
+      if (b.status === 'running') continue; // 진행 중은 세지 않음
+      if (b.status === 'failed' || b.status === 'bounced' || b.status === 'cancelled') {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
   async getPhasesForBuild(buildId: string): Promise<BuildPhase[]> {
     return this.phaseRepo.find({
       where: { build_id: buildId },
@@ -93,6 +117,7 @@ export class BuildsService {
     projectId: string,
     version: number,
     containerId?: string | null,
+    primaryEndpoints?: string[] | null,
   ): Promise<ProjectVersion> {
     return this.versionRepo.save(
       this.versionRepo.create({
@@ -100,6 +125,7 @@ export class BuildsService {
         project_id: projectId,
         version,
         container_id: containerId ?? null,
+        primary_endpoints: primaryEndpoints ?? null,
       }),
     );
   }

@@ -4,11 +4,13 @@ When the agent thinks the spec is ready (or nearly so), it calls this tool
 with a structured payload. The tool:
   1. Writes a row to the `handoffs` table.
   2. If minimum criteria are met (all completeness >= 0.6 AND no unresolved
-     questions), atomically transitions projects.state: 'planning' → 'plan_ready'.
+     questions), atomically transitions projects.state:
+       - 'planning' → 'plan_ready' (첫 빌드 라인)
+       - 'planning_update' → 'update_ready' (업데이트 라인, ADR 0008)
 
 The orchestrator picks up the transition via the tool_result event and
-notifies the frontend. The user then clicks "빌드 시작" to advance to
-'building' (ARCHITECTURE §6.3, §7.2).
+notifies the frontend. The user then clicks "빌드 시작" or "업데이트 시작"
+to advance to 'building' / 'updating' (ARCHITECTURE §6.3, §7.2).
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from app.agent.tools.base import Tool, ToolSchema
+from app.agent.tools.base import Tool, ToolCtx, ToolSchema
 from app.config import settings
 from app.storage.db import connection
 
@@ -112,7 +114,8 @@ def _validate(args: dict[str, Any]) -> tuple[bool, str | None]:
     return True, None
 
 
-async def fn(project_id: str, args: dict[str, Any]) -> dict[str, Any]:
+async def fn(ctx: ToolCtx, args: dict[str, Any]) -> dict[str, Any]:
+    project_id = ctx.project_id
     ok, err = _validate(args)
     if not ok:
         return {"ok": False, "accepted": False, "error": err}
@@ -140,7 +143,8 @@ async def fn(project_id: str, args: dict[str, Any]) -> dict[str, Any]:
     # Persist handoff row and (if accepted) transition state atomically.
     handoff_id = str(uuid.uuid4())
     now = time.strftime("%Y-%m-%d %H:%M:%S")
-    transitioned = False
+    transitioned_to_plan_ready = False
+    transitioned_to_update_ready = False
 
     with connection() as conn:
         session_row = conn.execute(
@@ -174,18 +178,32 @@ async def fn(project_id: str, args: dict[str, Any]) -> dict[str, Any]:
             ),
         )
 
-        if accepted and current_state == "planning":
-            cur = conn.execute(
-                "UPDATE projects SET state = 'plan_ready', updated_at = ? "
-                "WHERE id = ? AND state = 'planning'",
-                (now, project_id),
-            )
-            transitioned = cur.rowcount > 0
+        # ADR 0008 — 두 라인의 전이를 분리해서 처리:
+        #   planning → plan_ready  (첫 빌드)
+        #   planning_update → update_ready  (업데이트)
+        # state_machine.service의 VALID_TRANSITIONS와 정확히 일치시켜서
+        # "전이가 여기선 성공했는데 저기선 막혀있음" 상황을 방지한다.
+        if accepted:
+            if current_state == "planning":
+                cur = conn.execute(
+                    "UPDATE projects SET state = 'plan_ready', updated_at = ? "
+                    "WHERE id = ? AND state = 'planning'",
+                    (now, project_id),
+                )
+                transitioned_to_plan_ready = cur.rowcount > 0
+            elif current_state == "planning_update":
+                cur = conn.execute(
+                    "UPDATE projects SET state = 'update_ready', updated_at = ? "
+                    "WHERE id = ? AND state = 'planning_update'",
+                    (now, project_id),
+                )
+                transitioned_to_update_ready = cur.rowcount > 0
 
     return {
         "ok": True,
         "accepted": accepted,
-        "transitioned_to_plan_ready": transitioned,
+        "transitioned_to_plan_ready": transitioned_to_plan_ready,
+        "transitioned_to_update_ready": transitioned_to_update_ready,
         "handoff_id": handoff_id,
         "min_completeness": min_score,
         "is_sufficient": is_sufficient,

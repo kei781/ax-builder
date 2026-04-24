@@ -13,17 +13,72 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from app.agent.llm import lifecycle
-from app.agent.system_prompt import PLANNING_SYSTEM_PROMPT
+from app.agent.system_prompt import build_system_prompt
 from app.agent.tools import registry
 from app.config import settings
+from app.storage.db import connection
 from app.transport.events import AgentEvent, make_event
 
 log = logging.getLogger(__name__)
 
 
+# ADR 0008 — 업데이트 모드로 동작해야 하는 state.
+# 이 값들 중 하나면 planning_update 프롬프트 사용.
+_UPDATE_STATES = frozenset({"planning_update", "update_ready"})
+
+
+def _is_update_mode(project_id: str) -> bool:
+    """Read the project's current state to decide which system prompt to use.
+
+    업데이트 라인(`planning_update`, `update_ready`)에서는 diff 기반 수정 가이드가
+    붙은 프롬프트를 쓴다. state가 바뀌어있지 않거나 프로젝트가 없으면 기본(첫 빌드).
+    """
+    try:
+        with connection() as conn:
+            row = conn.execute(
+                "SELECT state FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+    except Exception:
+        log.exception("failed to read project state for %s; falling back to first-build prompt", project_id)
+        return False
+    if not row:
+        return False
+    return row["state"] in _UPDATE_STATES
+
+
+def _load_existing_prd(project_id: str) -> str | None:
+    """Return current PRD.md content for UPDATE-mode prompt injection.
+
+    2026-04-24 §8 후속: UPDATE 라인에서 planning-agent가 기존 PRD를 안 읽고
+    한 줄 수정 요청을 받자마자 전체를 덮어쓰는 사고(베키 "테스트 기능" → Todo App
+    치환) 방지. 시스템 프롬프트 말미에 `<EXISTING_PRD>` 블록으로 주입해 AI가
+    무조건 보게. 파일 없거나 비어 있으면 None — 첫 빌드가 PRD 저장 전인 경우.
+    """
+    from pathlib import Path
+
+    from app.config import settings as _settings
+
+    prd_path = Path(_settings.PROJECTS_BASE_DIR) / project_id / "PRD.md"
+    try:
+        content = prd_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        log.exception("failed to read existing PRD for %s", project_id)
+        return None
+    content = content.strip()
+    return content if content else None
+
+
 def _build_initial_messages(
+    project_id: str,
     history: Sequence[dict[str, Any]],
     new_user_message: str,
+    *,
+    profile_is_developer: bool,
+    profile_explain_depth: str,
+    project_title: str | None,
+    is_update: bool,
 ) -> list[dict[str, Any]]:
     """Compose the starting chat-completions message array.
 
@@ -31,8 +86,16 @@ def _build_initial_messages(
     (Gemini's OpenAI-compat endpoint returns empty responses when it
     sees consecutive user messages without an assistant turn between).
     """
+    existing_prd = _load_existing_prd(project_id) if is_update else None
+    system_prompt = build_system_prompt(
+        is_update,
+        profile_is_developer=profile_is_developer,
+        profile_explain_depth=profile_explain_depth,
+        project_title=project_title,
+        existing_prd=existing_prd,
+    )
     msgs: list[dict[str, Any]] = [
-        {"role": "system", "content": PLANNING_SYSTEM_PROMPT}
+        {"role": "system", "content": system_prompt}
     ]
     # Defensive truncation — orchestrator enforces the limit too.
     recent = list(history)[-settings.MAX_HISTORY_MESSAGES :]
@@ -107,6 +170,10 @@ async def run_turn(
     session_id: str | None,
     history: Sequence[dict[str, Any]],
     new_user_message: str,
+    *,
+    profile_is_developer: bool = False,
+    profile_explain_depth: str = "detailed",
+    project_title: str | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Execute one conversational turn, yielding AgentEvents as they occur.
 
@@ -119,7 +186,19 @@ async def run_turn(
 
     Errors yield a single `error` event and stop.
     """
-    messages = _build_initial_messages(history, new_user_message)
+    # UPDATE 라인 탐지는 시스템 프롬프트 조립 + 툴 dispatch context 양쪽에
+    # 쓰인다. 한 번 계산해서 재사용.
+    is_update = _is_update_mode(project_id)
+
+    messages = _build_initial_messages(
+        project_id,
+        history,
+        new_user_message,
+        profile_is_developer=profile_is_developer,
+        profile_explain_depth=profile_explain_depth,
+        project_title=project_title,
+        is_update=is_update,
+    )
     tool_schemas = registry.get_schemas()
 
     yield make_event(
@@ -208,7 +287,13 @@ async def run_turn(
                 payload={"id": call_id, "name": name, "arguments": args_raw},
             )
 
-            result = await registry.dispatch(project_id, name, args_raw)
+            result = await registry.dispatch(
+                project_id,
+                name,
+                args_raw,
+                session_id=session_id,
+                is_update_mode=is_update,
+            )
 
             yield make_event(
                 "tool_result",

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 
-from app.agent.tools.base import Tool, ToolSchema
+from app.agent.tools.base import Tool, ToolCtx, ToolSchema
 from app.storage.db import connection
 
 SCHEMA: ToolSchema = {
@@ -33,12 +33,12 @@ SCHEMA: ToolSchema = {
 }
 
 
-async def fn(project_id: str, args: dict) -> dict:
+async def fn(ctx: ToolCtx, args: dict) -> dict:
     query: str = args.get("query", "") or ""
     with connection() as conn:
         rows = conn.execute(
             "SELECT key, value FROM project_memory WHERE project_id = ? AND key LIKE ? ORDER BY updated_at DESC LIMIT 20",
-            (project_id, f"%{query}%"),
+            (ctx.project_id, f"%{query}%"),
         ).fetchall()
 
     matches = []

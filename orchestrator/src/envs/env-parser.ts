@@ -56,6 +56,22 @@ const PROVIDER_KEY_PATTERNS = [
   /^MISTRAL_API_KEY$/,
 ];
 
+/**
+ * ax-builder 플랫폼이 **네임스페이스를 소유**하는 변수 — metaline 유무·값
+ * 무관하게 무조건 `system-injected`로 강제한다. Claude Code가 metaline을
+ * 그룹 헤더로 쓰거나 실수로 누락해도 유저 UI에 새어나오지 않게 하는 안전망.
+ *   - `AX_*` (AX_AI_*, AX_STORAGE_*, 향후 AX_TELEMETRY_* 등)
+ *   - `AI_GATEWAY_*` (플랫폼 운영 변수가 실수로 섞여 들어올 때)
+ */
+const SYSTEM_NAMESPACE_PATTERNS = [
+  /^AX_[A-Z0-9_]+$/,
+  /^AI_GATEWAY_[A-Z0-9_]+$/,
+];
+
+function isSystemNamespace(key: string): boolean {
+  return SYSTEM_NAMESPACE_PATTERNS.some((p) => p.test(key));
+}
+
 function normalizeMetaKey(raw: string): string {
   const lower = raw.trim().toLowerCase();
   // Korean aliases
@@ -131,7 +147,11 @@ export function parseEnvExample(content: string): ParsedEnvVar[] {
     const parsedTier = currentMeta['tier']
       ? parseTier(currentMeta['tier'])
       : null;
-    const tier: EnvTier = parsedTier ?? 'user-required';
+    // 시스템 네임스페이스(`AX_*`, `AI_GATEWAY_*`)는 metaline 무시하고 강제.
+    // Claude Code가 그룹 헤더로 meta를 쓰거나 누락해도 유저 UI에 새지 않음.
+    const tier: EnvTier = isSystemNamespace(varKey)
+      ? 'system-injected'
+      : (parsedTier ?? 'user-required');
     const required = (currentMeta['required'] ?? 'required')
       .toLowerCase()
       .includes('required')

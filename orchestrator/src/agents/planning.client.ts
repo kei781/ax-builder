@@ -8,6 +8,15 @@ export interface PlanningTurnInput {
   sessionId: string | null;
   history: Array<{ role: string; content: string }>;
   userMessage: string;
+  /**
+   * Owner profile + project title — 2026-04-23 추가 (베키 사례 대응).
+   * planning-agent가 시스템 프롬프트 상단에 런타임 주입해 비개발자/개발자
+   * 분기와 프로젝트 도메인 고정에 사용. 누락 시 planning-agent가
+   * 비개발자/detailed/null 기본값으로 fallback.
+   */
+  profileIsDeveloper: boolean;
+  profileExplainDepth: 'brief' | 'detailed';
+  projectTitle: string;
   onEvent: (event: AgentEvent) => void | Promise<void>;
 }
 
@@ -114,6 +123,9 @@ export class PlanningClient implements OnModuleInit {
       session_id: input.sessionId,
       history: input.history,
       user_message: input.userMessage,
+      profile_is_developer: input.profileIsDeveloper,
+      profile_explain_depth: input.profileExplainDepth,
+      project_title: input.projectTitle,
     });
   }
 

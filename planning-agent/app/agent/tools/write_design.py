@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.agent.tools.base import Tool, ToolSchema
+from app.agent.tools.base import Tool, ToolCtx, ToolSchema
 from app.config import settings
 
 SCHEMA: ToolSchema = {
@@ -29,12 +29,12 @@ SCHEMA: ToolSchema = {
 }
 
 
-async def fn(project_id: str, args: dict) -> dict:
+async def fn(ctx: ToolCtx, args: dict) -> dict:
     content: str = args.get("content", "") or ""
     if not content.strip():
         return {"ok": False, "error": "content is empty"}
 
-    project_dir = Path(settings.PROJECTS_BASE_DIR) / project_id
+    project_dir = Path(settings.PROJECTS_BASE_DIR) / ctx.project_id
     project_dir.mkdir(parents=True, exist_ok=True)
     design_path = project_dir / "DESIGN.md"
     design_path.write_text(content, encoding="utf-8")

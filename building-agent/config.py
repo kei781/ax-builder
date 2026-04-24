@@ -29,6 +29,10 @@ def env_int(key: str, default: int) -> int:
 class Settings:
     # Shared paths
     PROJECTS_BASE_DIR: str = env("PROJECTS_BASE_DIR", str(_ROOT / "projects"))
+    # orchestrator의 SQLite DB. qa_supervisor가 ADR 0008 §D7 regression 검증
+    # (이전 버전 primary_endpoints 로드)에서 read-only로 사용. 누락되어
+    # 2026-04-24 update build 3회 연속 AttributeError로 죽었던 사고 후 추가.
+    DB_PATH: str = env("DB_PATH", str(_ROOT / "data" / "ax-builder.db"))
 
     # LLM backend — only openai_compat supported in Step 5.
     # Ollama path will be added when Mac Studio lands.

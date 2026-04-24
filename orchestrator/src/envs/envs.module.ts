@@ -16,6 +16,7 @@ import { BuildsModule } from '../builds/builds.module.js';
 import { WebsocketModule } from '../websocket/websocket.module.js';
 import { AuthModule } from '../auth/auth.module.js';
 import { PermissionsModule } from '../permissions/permissions.module.js';
+import { AiGatewayModule } from '../ai-gateway/ai-gateway.module.js';
 
 @Module({
   imports: [
@@ -27,6 +28,7 @@ import { PermissionsModule } from '../permissions/permissions.module.js';
     WebsocketModule,
     AuthModule,
     PermissionsModule,
+    AiGatewayModule,
   ],
   controllers: [EnvsController],
   providers: [

@@ -9,7 +9,7 @@ import json
 import uuid
 from typing import Any
 
-from app.agent.tools.base import Tool, ToolSchema
+from app.agent.tools.base import Tool, ToolCtx, ToolSchema
 from app.storage.db import connection
 
 SCHEMA: ToolSchema = {
@@ -38,7 +38,7 @@ SCHEMA: ToolSchema = {
 }
 
 
-async def fn(project_id: str, args: dict) -> dict:
+async def fn(ctx: ToolCtx, args: dict) -> dict:
     key: str = args.get("key", "") or ""
     value: Any = args.get("value")
     if not key:
@@ -55,7 +55,7 @@ async def fn(project_id: str, args: dict) -> dict:
                 value = excluded.value,
                 updated_at = datetime('now')
             """,
-            (row_id, project_id, key, serialized),
+            (row_id, ctx.project_id, key, serialized),
         )
     return {"ok": True, "key": key}
 

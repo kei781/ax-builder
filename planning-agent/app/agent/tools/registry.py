@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Any
 
-from app.agent.tools.base import Tool
+from app.agent.tools.base import Tool, ToolCtx
 from app.agent.tools.evaluate_readiness import TOOL as EVALUATE_READINESS
 from app.agent.tools.propose_handoff import TOOL as PROPOSE_HANDOFF
 from app.agent.tools.search_memory import TOOL as SEARCH_MEMORY
@@ -36,7 +36,14 @@ def get_schemas() -> list[dict]:
     return [tool.schema for tool in _REGISTRY.values()]
 
 
-async def dispatch(project_id: str, name: str, args_json: str) -> dict[str, Any]:
+async def dispatch(
+    project_id: str,
+    name: str,
+    args_json: str,
+    *,
+    session_id: str | None = None,
+    is_update_mode: bool = False,
+) -> dict[str, Any]:
     tool = _REGISTRY.get(name)
     if tool is None:
         return {"ok": False, "error": f"unknown tool: {name}"}
@@ -44,8 +51,13 @@ async def dispatch(project_id: str, name: str, args_json: str) -> dict[str, Any]
         args = json.loads(args_json) if args_json else {}
     except json.JSONDecodeError as e:
         return {"ok": False, "error": f"invalid tool args: {e}"}
+    ctx = ToolCtx(
+        project_id=project_id,
+        session_id=session_id,
+        is_update_mode=is_update_mode,
+    )
     try:
-        return await tool.fn(project_id, args)
+        return await tool.fn(ctx, args)
     except Exception as e:  # noqa: BLE001 — surface to LLM, don't crash loop
         log.exception("tool %s failed for project=%s", name, project_id)
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}

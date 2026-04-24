@@ -38,7 +38,10 @@ type ProjectState =
   | 'qa'
   | 'deployed'
   | 'failed'
-  | 'modifying';
+  | 'planning_update'
+  | 'update_ready'
+  | 'updating'
+  | 'update_qa';
 
 interface ProjectInfo {
   id: string;
@@ -47,6 +50,39 @@ interface ProjectInfo {
   current_session_id: string | null;
   port: number | null;
   failure_reason?: string[] | null;
+  /**
+   * 빌드가 반송(bounced)돼서 planning/plan_ready로 되돌아왔을 때만
+   * 채워진다. 유저가 직전 실패 이유를 즉시 볼 수 있도록 배너로 노출.
+   */
+  last_bounce?: {
+    build_id: string;
+    finished_at: string | null;
+    gap_list: string[];
+  } | null;
+  /**
+   * PRD.md의 H1과 project.title이 어긋나 있으면 true. 2026-04-24 §8의
+   * PRD 전면 교체 사고로 도메인이 틀어진 프로젝트를 유저가 알아차릴 수
+   * 있게 배너로 노출. 새 write_prd 가드 이후로는 새로 생기지 않지만
+   * 과거 사고 피해는 이 필드로 가시화.
+   */
+  title_prd_mismatch?: boolean;
+}
+
+interface PrdBackup {
+  filename: string;
+  timestamp: string;
+  bytes: number;
+}
+
+/**
+ * "20260422T003530Z" → "2026-04-22 00:35:30 UTC" 형태로.
+ * 유저가 읽을 수 있게 포맷만 바꾸는 순수 함수.
+ */
+function formatBackupStamp(stamp: string): string {
+  const m = stamp.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+  if (!m) return stamp;
+  const [, y, mo, d, hh, mm, ss] = m;
+  return `${y}-${mo}-${d} ${hh}:${mm}:${ss} UTC`;
 }
 
 const STATE_LABELS: Record<ProjectState, string> = {
@@ -57,18 +93,26 @@ const STATE_LABELS: Record<ProjectState, string> = {
   qa: 'QA 검증 중',
   deployed: '배포됨',
   failed: '실패',
-  modifying: '수정 중',
+  // ADR 0008 업데이트 라인
+  planning_update: '수정 기획 중',
+  update_ready: '업데이트 준비 완료',
+  updating: '업데이트 중',
+  update_qa: '회귀 검증 중',
 };
 
 const STATE_COLORS: Record<ProjectState, string> = {
   draft: 'bg-gray-200 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
-  planning: 'bg-blue-500/10 text-blue-500 dark:text-blue-400',
-  plan_ready: 'bg-green-500/10 text-green-600 dark:text-green-400',
-  building: 'bg-yellow-500/10 text-yellow-600 dark:text-yellow-400',
-  qa: 'bg-yellow-500/10 text-yellow-600 dark:text-yellow-400',
+  planning: 'bg-sky-500/10 text-sky-600 dark:text-sky-400',
+  plan_ready: 'bg-blue-500/10 text-blue-600 dark:text-blue-400',
+  building: 'bg-blue-600/10 text-blue-700 dark:text-blue-300',
+  qa: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
   deployed: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
   failed: 'bg-red-500/10 text-red-500 dark:text-red-400',
-  modifying: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
+  // 업데이트 라인 색 체계 (DESIGN §5.1)
+  planning_update: 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-400',
+  update_ready: 'bg-teal-500/10 text-teal-600 dark:text-teal-400',
+  updating: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
+  update_qa: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
 };
 
 export default function Chat() {
@@ -83,12 +127,25 @@ export default function Chat() {
   const [status, setStatus] = useState<string>('');
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const [myRole, setMyRole] = useState<'owner' | 'editor' | 'viewer'>('viewer');
-  const [handoffBanner, setHandoffBanner] = useState<string | null>(null);
+  // 2026-04-24 §8 — PRD 백업 복원 UI. 배너에서 열 때 이 state로 토글.
+  const [prdBackupsOpen, setPrdBackupsOpen] = useState(false);
+  const [prdBackups, setPrdBackups] = useState<PrdBackup[] | null>(null);
+  const [prdRestoreBusy, setPrdRestoreBusy] = useState(false);
+  // handoff 배너 — AI 텍스트 대신 "도구 결과를 직접" 표시해 환각 차단.
+  // kind='success'  = accepted → plan_ready/update_ready 전이됨
+  // kind='rejected' = accepted=false 또는 ok=false → 거부 이유 노출
+  // kind='warning'  = 기타 주의 (ex: watchdog "AI가 도구 호출 안 함")
+  const [handoffBanner, setHandoffBanner] = useState<{
+    kind: 'success' | 'rejected' | 'warning';
+    detail: string;
+    detail_extra?: string;
+  } | null>(null);
   const [building, setBuilding] = useState(false);
   const [readiness, setReadiness] = useState<{
     completeness: Record<string, number>;
     score: number;
     can_build: boolean;
+    is_sufficient: boolean;
     summary: string;
     label: string;
   } | null>(null);
@@ -182,20 +239,82 @@ export default function Chat() {
 
           // readiness_update from evaluate_readiness tool
           if (event.phase === 'readiness_update' && p?.completeness) {
+            // is_sufficient: min >= 0.85 (충분 조건). p에 명시가 없으면 로컬 계산.
+            const vals = Object.values(p.completeness);
+            const minScore = vals.length ? Math.min(...vals) : 0;
+            const canBuild = p.can_build ?? minScore >= 0.6;
+            const isSufficient = p.is_sufficient ?? minScore >= 0.85;
             setReadiness({
               completeness: p.completeness,
               score: p.score ?? 0,
-              can_build: p.can_build ?? false,
+              can_build: canBuild,
+              is_sufficient: isSufficient,
               summary: p.summary ?? '',
-              label: p.label ?? '',
+              label:
+                p.label ||
+                (isSufficient
+                  ? '충분 조건 충족'
+                  : canBuild
+                    ? '최소 조건 충족 (보강 권장)'
+                    : '보강 필요'),
             });
           }
-          // plan_ready transition
-          if (event.phase === 'plan_ready' || event.phase === 'build_requested') {
-            if (event.phase === 'plan_ready' && p?.detail) {
-              setHandoffBanner(p.detail);
+          // plan_ready / update_ready — 성공 전이.
+          if (
+            event.phase === 'plan_ready' ||
+            event.phase === 'update_ready' ||
+            event.phase === 'build_requested'
+          ) {
+            if (
+              (event.phase === 'plan_ready' || event.phase === 'update_ready') &&
+              p?.detail
+            ) {
+              setHandoffBanner({ kind: 'success', detail: p.detail });
             }
             void fetchProject();
+          }
+          // update_cycle_cancelled — 다른 협업자가 업데이트 취소 실행.
+          // 현재 유저도 대시보드로 보내 맥락 일치시킴.
+          if (event.phase === 'update_cycle_cancelled') {
+            setHandoffBanner({
+              kind: 'warning',
+              detail:
+                (p as { detail?: string })?.detail ??
+                '업데이트 사이클이 취소되었습니다.',
+            });
+            setTimeout(() => {
+              navigate('/');
+            }, 1500);
+          }
+          // hallucination_detected — AI가 "도구 호출합니다" 텍스트 + 실제 tool_call
+          // 0회. 유저가 "왜 안 되지?" 혼란스럽지 않게 명시적 배너.
+          if (event.phase === 'hallucination_detected') {
+            const pr = p as { detail?: string };
+            setHandoffBanner({
+              kind: 'warning',
+              detail: pr.detail ?? 'AI가 도구 호출을 텍스트로만 언급했고 실제 호출은 없었어요.',
+            });
+          }
+          // handoff_rejected — accepted=false. AI 텍스트 대신 이 배너가 진실.
+          if (event.phase === 'handoff_rejected') {
+            const pr = p as {
+              detail?: string;
+              min_completeness?: number;
+              is_sufficient?: boolean;
+              has_unresolved?: boolean;
+            };
+            const extras: string[] = [];
+            if (typeof pr.min_completeness === 'number') {
+              extras.push(`최저 완성도 ${(pr.min_completeness * 100).toFixed(0)}%`);
+            }
+            if (pr.has_unresolved) {
+              extras.push('남은 질문 있음');
+            }
+            setHandoffBanner({
+              kind: 'rejected',
+              detail: pr.detail ?? '핸드오프가 거부됐습니다.',
+              detail_extra: extras.length ? extras.join(' · ') : undefined,
+            });
           }
           break;
         }
@@ -226,12 +345,9 @@ export default function Chat() {
           const err = p?.result?.error ? ` — ${p.result.error}` : '';
           setStatus(`${ok ? '✓' : '✗'} ${p?.name ?? 'tool'}${where}${err}`);
 
-          if (p?.name === 'propose_handoff' && ok) {
-            const accepted = p.result?.accepted === true;
-            if (!accepted && p.result?.reason) {
-              setHandoffBanner(`핸드오프 보류: ${p.result.reason}`);
-            }
-          }
+          // propose_handoff 결과는 server-side handleAgentEvent가 progress(phase=
+          // handoff_rejected/plan_ready/update_ready) 이벤트로 전용 emit하므로
+          // 여기서 중복 배너 설정하지 않는다. (AI 텍스트 의존 제거 — 회고 §5)
           break;
         }
         case 'completion': {
@@ -268,8 +384,13 @@ export default function Chat() {
 
   const handleSend = async () => {
     if (!input.trim() || loading || !id) return;
-    if (project?.state === 'building' || project?.state === 'qa') {
-      setStatus('빌드 중에는 대화할 수 없습니다.');
+    const s = project?.state;
+    if (s === 'building' || s === 'qa' || s === 'updating' || s === 'update_qa') {
+      setStatus(
+        s === 'updating' || s === 'update_qa'
+          ? '업데이트 중에는 대화할 수 없습니다.'
+          : '빌드 중에는 대화할 수 없습니다.',
+      );
       return;
     }
     const content = input;
@@ -289,28 +410,31 @@ export default function Chat() {
   const handleBuild = async () => {
     if (!id || building) return;
 
-    // can_build이지만 아직 plan_ready가 아니면 = AI가 propose_handoff 안 함.
+    // can_build이지만 아직 plan_ready/update_ready가 아니면 = AI가 propose_handoff 안 함.
     // 자동으로 AI에게 핸드오프 요청 메시지를 보냄 (유저가 직접 프롬프트 안 쳐도 됨)
-    if (project?.state !== 'plan_ready' && readiness?.can_build) {
+    const ready = project?.state === 'plan_ready' || project?.state === 'update_ready';
+    if (!ready && readiness?.can_build) {
       const autoMsg =
         '기획이 충분히 정리됐습니다. propose_handoff 도구를 호출해서 ' +
-        '다음 단계(Building)로 이관을 제안해주세요. ' +
+        '다음 단계로 이관을 제안해주세요. ' +
         '텍스트로만 "완료"라고 답하지 말고 반드시 도구를 호출하세요.';
       setMessages((prev) => [...prev, { role: 'user', content: autoMsg }]);
       setLoading(true);
       setStatus('핸드오프 요청 중...');
       try {
         await client.post(`/projects/${id}/chat/messages`, { content: autoMsg });
-        // Watchdog: 15s 안에 plan_ready 전이가 안 보이면 AI가 도구 호출 안 한 것.
+        // Watchdog: 15s 안에 *_ready 전이가 안 보이면 AI가 도구 호출 안 한 것.
         // ARCHITECTURE.md §6.6 참조.
         const checkAt = Date.now();
         setTimeout(async () => {
           try {
             const r = await client.get(`/projects/${id}`);
-            if (r.data.state !== 'plan_ready') {
-              setHandoffBanner(
-                'AI가 도구를 호출하지 않은 것 같아요. "AI에게 핸드오프 요청"을 한 번 더 눌러주세요.',
-              );
+            if (r.data.state !== 'plan_ready' && r.data.state !== 'update_ready') {
+              setHandoffBanner({
+                kind: 'warning',
+                detail:
+                  'AI가 도구를 호출하지 않은 것 같아요. "AI에게 핸드오프 요청"을 한 번 더 눌러주세요.',
+              });
               setStatus('핸드오프 재시도 필요');
             }
           } catch {
@@ -343,15 +467,29 @@ export default function Chat() {
     }
   };
 
-  const canBuild = project?.state === 'plan_ready';
+  const canBuild = project?.state === 'plan_ready' || project?.state === 'update_ready';
+  const isUpdateLine =
+    project?.state === 'planning_update' ||
+    project?.state === 'update_ready' ||
+    project?.state === 'updating' ||
+    project?.state === 'update_qa';
   const canEdit = myRole === 'owner' || myRole === 'editor';
   const state = project?.state ?? 'draft';
 
-  const scoreColor = (readiness?.score ?? 0) >= 600
-    ? 'text-green-400'
-    : (readiness?.score ?? 0) >= 400
-      ? 'text-yellow-400'
-      : 'text-red-400';
+  // 사이드바 색 체계 (ADR-independent — UX 일관성):
+  //   is_sufficient (min>=0.85): 초록 — "진짜 빌드 가능" 신호
+  //   can_build (min>=0.6)     : 노랑 — "최소 조건 충족, propose_handoff 거부 가능"
+  //   그 외                     : 빨강 — "보강 필요"
+  const scoreColor = readiness?.is_sufficient
+    ? 'text-green-500 dark:text-green-400'
+    : readiness?.can_build
+      ? 'text-yellow-500 dark:text-yellow-400'
+      : 'text-red-500 dark:text-red-400';
+  const scoreBarColor = readiness?.is_sufficient
+    ? 'bg-green-500'
+    : readiness?.can_build
+      ? 'bg-yellow-500'
+      : 'bg-red-500';
 
   const CATEGORY_LABELS: Record<string, string> = {
     problem_definition: '문제 정의',
@@ -363,6 +501,111 @@ export default function Chat() {
 
   return (
     <div className="h-screen bg-gray-50 dark:bg-gray-950 flex overflow-hidden">
+      {/* PRD 백업 복원 모달 (2026-04-24 §8) */}
+      {prdBackupsOpen && (
+        <div
+          className="fixed inset-0 bg-black/40 flex items-center justify-center z-50"
+          onClick={() => {
+            if (!prdRestoreBusy) setPrdBackupsOpen(false);
+          }}
+        >
+          <div
+            className="bg-white dark:bg-gray-900 rounded-xl shadow-xl w-[520px] max-h-[80vh] overflow-hidden flex flex-col border border-gray-200 dark:border-gray-800"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+              <h2 className="text-base font-semibold text-gray-900 dark:text-white">
+                PRD 이전 버전 복원
+              </h2>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                PRD 문서가 갱신될 때마다 직전 내용이 자동 저장됩니다.
+                원하는 시점의 버전을 골라 되돌릴 수 있어요. 복원 전 현재 PRD도
+                함께 백업됩니다.
+              </p>
+            </div>
+            <div className="flex-1 overflow-y-auto px-5 py-3 space-y-2">
+              {prdBackups === null && (
+                <p className="text-sm text-gray-500">불러오는 중…</p>
+              )}
+              {prdBackups && prdBackups.length === 0 && (
+                <p className="text-sm text-gray-500">
+                  저장된 이전 버전이 없습니다. (백업은 2026-04-24 이후 PRD
+                  변경부터 자동으로 쌓입니다.)
+                </p>
+              )}
+              {prdBackups?.map((b) => (
+                <div
+                  key={b.filename}
+                  className="flex items-center justify-between border border-gray-200 dark:border-gray-800 rounded-lg px-3 py-2"
+                >
+                  <div className="text-sm">
+                    <div className="text-gray-900 dark:text-gray-100 font-mono">
+                      {formatBackupStamp(b.timestamp)}
+                    </div>
+                    <div className="text-xs text-gray-500 mt-0.5">
+                      {b.bytes.toLocaleString()} bytes
+                    </div>
+                  </div>
+                  <button
+                    disabled={prdRestoreBusy}
+                    onClick={async () => {
+                      if (
+                        !confirm(
+                          `이 버전(${formatBackupStamp(
+                            b.timestamp,
+                          )})으로 PRD를 되돌립니다. 현재 PRD는 자동으로 함께 백업됩니다. 계속할까요?`,
+                        )
+                      )
+                        return;
+                      setPrdRestoreBusy(true);
+                      try {
+                        await client.post(`/projects/${id}/prd/restore`, {
+                          filename: b.filename,
+                        });
+                        alert('복원 완료. 대화를 새로 시작해주세요.');
+                        setPrdBackupsOpen(false);
+                        // project info 재조회 — mismatch 배너가 사라질 것.
+                        try {
+                          const res = await client.get<ProjectInfo>(
+                            `/projects/${id}`,
+                          );
+                          setProject(res.data);
+                        } catch {
+                          // 조회 실패는 치명적이지 않음 — 유저 새로고침으로 해결.
+                        }
+                      } catch (err: unknown) {
+                        const e = err as {
+                          response?: { data?: { message?: string } };
+                        };
+                        alert(
+                          `복원 실패: ${
+                            e.response?.data?.message ?? '알 수 없는 오류'
+                          }`,
+                        );
+                      } finally {
+                        setPrdRestoreBusy(false);
+                      }
+                    }}
+                    className="text-xs bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-700 dark:text-emerald-300 px-3 py-1.5 rounded-lg disabled:opacity-50"
+                  >
+                    이 버전으로 복원
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="px-5 py-3 border-t border-gray-200 dark:border-gray-800 flex justify-end">
+              <button
+                onClick={() => setPrdBackupsOpen(false)}
+                disabled={prdRestoreBusy}
+                className="text-xs text-gray-500 hover:text-gray-900 dark:hover:text-white px-3 py-1.5 disabled:opacity-50"
+              >
+                닫기
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Chat column */}
       <div className="flex-1 flex flex-col min-h-0">
       <header className="shrink-0 border-b border-gray-200 dark:border-gray-800 px-6 py-4 flex items-center gap-4">
@@ -385,7 +628,80 @@ export default function Chat() {
           {connected ? '실시간' : '연결 중'}
         </span>
         {status && <span className="text-xs text-gray-500 ml-auto">{status}</span>}
+        {/* 업데이트 사이클 취소 — planning_update/update_ready + owner/editor */}
+        {(state === 'planning_update' || state === 'update_ready') && canEdit && (
+          <button
+            onClick={async () => {
+              if (
+                !confirm(
+                  '이번 업데이트 사이클을 취소하고 이전 배포 상태로 돌아갑니다.\n\n' +
+                    '• 이 대화는 아카이브되고 다음에 다시 보이지 않습니다.\n' +
+                    '• PRD/DESIGN 변경사항도 이전 상태로 복원됩니다.\n\n' +
+                    '취소하시겠어요?',
+                )
+              )
+                return;
+              try {
+                await client.post(`/projects/${id}/update/cancel`);
+                setMessages([]);
+                setPendingAssistant('');
+                setStatus('');
+                setHandoffBanner(null);
+                navigate('/');
+              } catch (err: unknown) {
+                const e = err as { response?: { data?: { message?: string } } };
+                alert(`취소 실패: ${e.response?.data?.message ?? '알 수 없는 오류'}`);
+              }
+            }}
+            className={`${status ? '' : 'ml-auto'} text-xs bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 px-3 py-1.5 rounded-lg transition-colors`}
+          >
+            ↩ 업데이트 취소
+          </button>
+        )}
       </header>
+
+      {/* Title vs PRD mismatch banner (2026-04-24 §8 후속).
+          write_prd가 덮어쓰기 사고로 도메인을 날려버린 프로젝트에서 노출.
+          새 가드 이후로는 새로 생기지 않지만 과거 피해는 유저가 복원할 수 있게
+          PRD 백업 목록을 열 수 있는 버튼 함께 제공. */}
+      {project?.title_prd_mismatch && (
+        <div className="px-6 py-3 bg-amber-500/10 border-b border-amber-500/40">
+          <p className="text-sm text-amber-800 dark:text-amber-300 font-medium mb-1">
+            ⚠ 프로젝트 제목과 PRD 문서의 제목이 달라요
+          </p>
+          <p className="text-xs text-amber-700 dark:text-amber-200">
+            이 프로젝트의 이름은 <b>"{project.title}"</b>인데 PRD 문서에는 다른
+            앱으로 적혀 있습니다. 과거 업데이트 중 문서가 의도와 다르게
+            바뀌었을 수 있어요. 저장된 이전 PRD 버전에서 되돌릴 수 있습니다.
+          </p>
+          {myRole === 'owner' && (
+            <button
+              onClick={async () => {
+                setPrdBackupsOpen(true);
+                try {
+                  const res = await client.get<{ backups: PrdBackup[] }>(
+                    `/projects/${id}/prd/backups`,
+                  );
+                  setPrdBackups(res.data.backups);
+                } catch (err: unknown) {
+                  const e = err as {
+                    response?: { data?: { message?: string } };
+                  };
+                  alert(
+                    `백업 목록을 불러오지 못했어요: ${
+                      e.response?.data?.message ?? '알 수 없는 오류'
+                    }`,
+                  );
+                  setPrdBackupsOpen(false);
+                }
+              }}
+              className="mt-2 text-xs bg-amber-500/15 hover:bg-amber-500/25 text-amber-800 dark:text-amber-200 px-3 py-1.5 rounded-lg transition-colors"
+            >
+              이전 PRD 버전으로 되돌리기
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Failure banner */}
       {state === 'failed' && project?.failure_reason && project.failure_reason.length > 0 && (
@@ -401,11 +717,48 @@ export default function Chat() {
         </div>
       )}
 
-      {/* Handoff banner */}
-      {handoffBanner && (
+      {/* 업데이트 사이클 안내 — planning_update / update_ready에서 노출.
+          이전 대화가 안 보이는 이유를 유저가 오해하지 않게. 대화가 몇 개
+          없을 때만 표시 (사이클 중간부턴 이미 맥락 알고 있음). */}
+      {(state === 'planning_update' || state === 'update_ready') &&
+        messages.length <= 2 && (
+          <div className="px-6 py-3 bg-indigo-500/10 border-b border-indigo-500/30">
+            <p className="text-sm text-indigo-700 dark:text-indigo-300 font-medium mb-1">
+              ↻ 업데이트 사이클을 새로 시작합니다
+            </p>
+            <p className="text-xs text-indigo-700 dark:text-indigo-400">
+              이전 기획 대화는 PRD·DESIGN 문서에 이미 반영된 상태입니다. 이번 사이클은 **새로 추가·수정하고 싶은 기능**만 논의해요. AI가 현재 문서를 읽고 맞춰드립니다.
+            </p>
+          </div>
+        )}
+
+      {/* Bounce-back banner — build/update가 반송되어 planning/plan_ready/planning_update로 돌아왔을 때 */}
+      {(state === 'planning' ||
+        state === 'plan_ready' ||
+        state === 'planning_update' ||
+        state === 'update_ready') &&
+        project?.last_bounce &&
+        project.last_bounce.gap_list.length > 0 && (
+          <div className="px-6 py-3 bg-yellow-500/10 border-b border-yellow-500/30">
+            <p className="text-sm text-yellow-700 dark:text-yellow-400 font-medium mb-1">
+              ↩ 이전 {isUpdateLine ? '업데이트' : '빌드'}가 아래 이유로 돌아왔습니다.
+              {isUpdateLine
+                ? ' 이전 버전은 계속 운영 중입니다. 확인 후 다시 시도해주세요.'
+                : ' 확인하고 보강한 뒤 다시 빌드를 시작해주세요.'}
+            </p>
+            <ul className="text-xs text-yellow-700 dark:text-yellow-300 ml-4 list-disc space-y-0.5">
+              {project.last_bounce.gap_list.map((reason, i) => (
+                <li key={i}>{reason}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+      {/* Handoff banner — 도구 결과를 직접 표시. AI 텍스트에 의존하지 않는다. */}
+      {handoffBanner && handoffBanner.kind === 'success' && (
         <div className="px-6 py-3 bg-green-500/10 border-b border-green-500/30 flex items-center justify-between">
           <span className="text-sm text-green-700 dark:text-green-400">
-            🎉 {handoffBanner}
+            🎉 {handoffBanner.detail}
           </span>
           {canBuild && (
             <button
@@ -413,13 +766,39 @@ export default function Chat() {
               disabled={building}
               className="bg-green-600 hover:bg-green-500 disabled:bg-gray-400 text-white text-sm px-4 py-1.5 rounded-lg font-medium"
             >
-              {building ? '시작 중...' : '🚀 빌드 시작'}
+              {building
+                ? '시작 중...'
+                : isUpdateLine
+                  ? '↺ 업데이트 시작'
+                  : '🚀 빌드 시작'}
             </button>
           )}
         </div>
       )}
+      {handoffBanner && handoffBanner.kind === 'rejected' && (
+        <div className="px-6 py-3 bg-orange-500/10 border-b border-orange-500/30">
+          <p className="text-sm text-orange-700 dark:text-orange-300 font-medium mb-1">
+            ⚠ 핸드오프 거부 — {handoffBanner.detail}
+          </p>
+          {handoffBanner.detail_extra && (
+            <p className="text-xs text-orange-700 dark:text-orange-400">
+              {handoffBanner.detail_extra}
+            </p>
+          )}
+          <p className="text-xs text-orange-600 dark:text-orange-400 mt-1">
+            AI의 텍스트 설명과 무관하게 실제 도구 판정입니다. 대화로 기획을 보강한 뒤 다시 시도해주세요.
+          </p>
+        </div>
+      )}
+      {handoffBanner && handoffBanner.kind === 'warning' && (
+        <div className="px-6 py-3 bg-yellow-500/10 border-b border-yellow-500/30">
+          <p className="text-sm text-yellow-700 dark:text-yellow-300">
+            ⚠ {handoffBanner.detail}
+          </p>
+        </div>
+      )}
 
-      {/* Build redirect prompt */}
+      {/* Build / Update redirect prompt */}
       {(state === 'building' || state === 'qa') && (
         <div className="px-6 py-3 bg-yellow-500/10 border-b border-yellow-500/30 flex items-center justify-between">
           <span className="text-sm text-yellow-700 dark:text-yellow-400">
@@ -428,6 +807,19 @@ export default function Chat() {
           <button
             onClick={() => navigate(`/projects/${id}/build`)}
             className="bg-yellow-500 hover:bg-yellow-400 text-white text-sm px-4 py-1.5 rounded-lg font-medium"
+          >
+            진행 상태 보기 →
+          </button>
+        </div>
+      )}
+      {(state === 'updating' || state === 'update_qa') && (
+        <div className="px-6 py-3 bg-cyan-500/10 border-b border-cyan-500/30 flex items-center justify-between">
+          <span className="text-sm text-cyan-700 dark:text-cyan-300">
+            업데이트가 진행 중입니다. 기존 앱은 계속 접속 가능합니다.
+          </span>
+          <button
+            onClick={() => navigate(`/projects/${id}/build`)}
+            className="bg-cyan-500 hover:bg-cyan-400 text-white text-sm px-4 py-1.5 rounded-lg font-medium"
           >
             진행 상태 보기 →
           </button>
@@ -444,10 +836,23 @@ export default function Chat() {
         )}
         {!historyLoading && messages.length === 0 && !pendingAssistant && (
           <div className="text-center text-gray-500 dark:text-gray-600 mt-20">
-            <p className="text-lg mb-2 text-gray-900 dark:text-white">
-              어떤 문제를 해결하고 싶으신가요?
-            </p>
-            <p className="text-sm">AI가 아이디어를 제품으로 구체화해드립니다.</p>
+            {isUpdateLine ? (
+              <>
+                <p className="text-lg mb-2 text-gray-900 dark:text-white">
+                  어떤 기능을 추가하거나 수정하고 싶으세요?
+                </p>
+                <p className="text-sm">
+                  현재 앱은 이미 운영 중이에요. 새 기능 요청이나 개선 아이디어를 알려주시면 AI가 검토 후 문서에 반영합니다.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-lg mb-2 text-gray-900 dark:text-white">
+                  어떤 문제를 해결하고 싶으신가요?
+                </p>
+                <p className="text-sm">AI가 아이디어를 제품으로 구체화해드립니다.</p>
+              </>
+            )}
           </div>
         )}
         {messages.map((msg, i) => (
@@ -455,6 +860,26 @@ export default function Chat() {
         ))}
         {pendingAssistant && (
           <ChatMessage role="assistant" content={pendingAssistant} userLabel="owner" />
+        )}
+        {/* AI 진행 상태 — pendingAssistant 토큰이 아직 안 왔어도 loading이면 표시.
+            유저가 "얘가 뭐 하고 있나?" 불확실하지 않게. status에는 tool call 등
+            상세 정보가 실시간으로 들어옴. */}
+        {loading && !pendingAssistant && (
+          <div className="flex items-start gap-3 my-4 ml-1">
+            <div className="w-8 h-8 rounded-full bg-gray-200 dark:bg-gray-800 flex items-center justify-center text-xs text-gray-500 shrink-0">
+              AI
+            </div>
+            <div className="bg-gray-100 dark:bg-gray-900 rounded-2xl px-4 py-3 flex items-center gap-2">
+              <div className="flex gap-1">
+                <span className="w-2 h-2 bg-gray-400 dark:bg-gray-600 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                <span className="w-2 h-2 bg-gray-400 dark:bg-gray-600 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                <span className="w-2 h-2 bg-gray-400 dark:bg-gray-600 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+              </div>
+              <span className="text-xs text-gray-500 dark:text-gray-400">
+                {status || (isUpdateLine ? '수정 사항 검토 중...' : '생각 중...')}
+              </span>
+            </div>
+          </div>
         )}
         <div ref={messagesEndRef} />
       </div>
@@ -468,8 +893,12 @@ export default function Chat() {
               onChange={(e) => setInput(e.target.value)}
               placeholder={
                 canBuild
-                  ? '빌드 준비가 완료됐습니다. 추가 요청이 있으면 입력하세요.'
-                  : '아이디어를 입력하세요...'
+                  ? state === 'update_ready'
+                    ? '업데이트 준비가 완료됐습니다. 추가 수정 요청이 있으면 입력하세요.'
+                    : '빌드 준비가 완료됐습니다. 추가 요청이 있으면 입력하세요.'
+                  : isUpdateLine
+                    ? '수정 내용을 입력하세요...'
+                    : '아이디어를 입력하세요...'
               }
               className="flex-1 bg-white dark:bg-gray-900 text-gray-900 dark:text-white rounded-xl px-4 py-3 text-sm border border-gray-200 dark:border-gray-700 focus:border-green-500 focus:outline-none resize-none leading-5"
               rows={2}
@@ -479,11 +908,24 @@ export default function Chat() {
                   handleSend();
                 }
               }}
-              disabled={loading || state === 'building' || state === 'qa'}
+              disabled={
+                loading ||
+                state === 'building' ||
+                state === 'qa' ||
+                state === 'updating' ||
+                state === 'update_qa'
+              }
             />
             <button
               onClick={handleSend}
-              disabled={!input.trim() || loading || state === 'building' || state === 'qa'}
+              disabled={
+                !input.trim() ||
+                loading ||
+                state === 'building' ||
+                state === 'qa' ||
+                state === 'updating' ||
+                state === 'update_qa'
+              }
               className="bg-green-600 hover:bg-green-500 disabled:bg-gray-300 dark:disabled:bg-gray-700 text-white px-6 py-3 rounded-xl text-sm font-medium transition-colors shrink-0"
             >
               전송
@@ -511,11 +953,16 @@ export default function Chat() {
           </div>
           <div className="w-full bg-gray-200 dark:bg-gray-800 rounded-full h-3 mb-2">
             <div
-              className="bg-green-500 h-3 rounded-full transition-all duration-500"
+              className={`${scoreBarColor} h-3 rounded-full transition-all duration-500`}
               style={{ width: `${((readiness?.score ?? 0) / 1000) * 100}%` }}
             />
           </div>
           <p className={`text-sm ${scoreColor}`}>{readiness?.label ?? '대화를 시작하세요'}</p>
+          {readiness?.can_build && !readiness?.is_sufficient && (
+            <p className="text-yellow-600 dark:text-yellow-400 text-xs mt-1">
+              ⚠ 최소 조건만 충족 — propose_handoff가 "보강 권장"으로 거부될 수 있어요.
+            </p>
+          )}
           {readiness?.summary && (
             <p className="text-gray-500 text-xs mt-1">{readiness.summary}</p>
           )}
@@ -557,16 +1004,22 @@ export default function Chat() {
               disabled={!canBuild && !(readiness?.can_build)}
               className={`w-full py-3 rounded-xl text-sm font-medium transition-colors ${
                 canBuild || readiness?.can_build
-                  ? 'bg-green-600 hover:bg-green-500 text-white'
+                  ? isUpdateLine
+                    ? 'bg-teal-600 hover:bg-teal-500 text-white'
+                    : 'bg-green-600 hover:bg-green-500 text-white'
                   : 'bg-gray-200 dark:bg-gray-800 text-gray-400 dark:text-gray-600 cursor-not-allowed'
               }`}
             >
               {canBuild
-                ? '🚀 제작 시작'
+                ? isUpdateLine
+                  ? '↺ 업데이트 시작'
+                  : '🚀 제작 시작'
                 : readiness?.can_build
                   ? loading
                     ? '핸드오프 요청 중...'
-                    : '📋 AI에게 핸드오프 요청'
+                    : isUpdateLine
+                      ? '📋 AI에게 업데이트 이관 요청'
+                      : '📋 AI에게 핸드오프 요청'
                   : `스코어 600점 이상 시 제작 가능`}
             </button>
           </div>

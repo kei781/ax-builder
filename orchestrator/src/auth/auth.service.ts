@@ -1,6 +1,13 @@
-import { Injectable, ConflictException, NotFoundException } from '@nestjs/common';
+import {
+  Injectable,
+  ConflictException,
+  NotFoundException,
+  Logger,
+  OnModuleInit,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { User } from './entities/user.entity.js';
 import { AccessRequest } from './entities/access-request.entity.js';
@@ -12,8 +19,25 @@ interface OAuthUserData {
   avatar_url: string | null;
 }
 
+/**
+ * ADMIN_EMAILS 파싱 헬퍼.
+ * 쉼표/세미콜론/공백으로 구분된 이메일 목록을 소문자 Set으로 정규화.
+ */
+function parseAdminEmails(raw: string | undefined): Set<string> {
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(/[,;\s]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
 @Injectable()
-export class AuthService {
+export class AuthService implements OnModuleInit {
+  private readonly logger = new Logger(AuthService.name);
+  private readonly adminEmails: Set<string>;
+
   constructor(
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
@@ -21,22 +45,60 @@ export class AuthService {
     private readonly accessRequestRepo: Repository<AccessRequest>,
     private readonly jwtService: JwtService,
     private readonly mailService: MailService,
-  ) {}
+    private readonly config: ConfigService,
+  ) {
+    this.adminEmails = parseAdminEmails(
+      this.config.get<string>('ADMIN_EMAILS'),
+    );
+    if (this.adminEmails.size > 0) {
+      this.logger.log(
+        `ADMIN_EMAILS 로드됨: ${[...this.adminEmails].join(', ')}`,
+      );
+    }
+  }
+
+  /**
+   * Startup — ADMIN_EMAILS에 있는 이메일의 기존 유저 행에 is_admin=true를
+   * 일괄 반영. OAuth 로그인 때 새로 들어오는 유저는 validateOAuthUser가
+   * 처리하지만, 이미 가입된 유저는 env 변경만으로는 업그레이드되지 않으므로
+   * 이 훅이 필요.
+   */
+  async onModuleInit(): Promise<void> {
+    if (this.adminEmails.size === 0) return;
+    for (const email of this.adminEmails) {
+      const user = await this.userRepo.findOne({ where: { email } });
+      if (user && !user.is_admin) {
+        user.is_admin = true;
+        await this.userRepo.save(user);
+        this.logger.log(`  - ${email} → is_admin=true`);
+      }
+    }
+  }
+
+  private isAdminEmail(email: string): boolean {
+    return this.adminEmails.has(email.trim().toLowerCase());
+  }
 
   async validateOAuthUser(data: OAuthUserData): Promise<User> {
     let user = await this.userRepo.findOne({ where: { email: data.email } });
+    const shouldBeAdmin = this.isAdminEmail(data.email);
 
     if (!user) {
       user = this.userRepo.create({
         email: data.email,
         name: data.name,
         avatar_url: data.avatar_url,
+        is_admin: shouldBeAdmin,
       });
       user = await this.userRepo.save(user);
     } else {
-      // Update name and avatar on each login
+      // Update name/avatar + admin 승급 (downgrade는 수동 — env 실수로 권한
+      // 빼앗기는 상황 방지).
       user.name = data.name;
       user.avatar_url = data.avatar_url;
+      if (shouldBeAdmin && !user.is_admin) {
+        user.is_admin = true;
+      }
       user = await this.userRepo.save(user);
     }
 
@@ -44,7 +106,11 @@ export class AuthService {
   }
 
   generateJwt(user: User): string {
-    const payload = { sub: user.id, email: user.email };
+    const payload = {
+      sub: user.id,
+      email: user.email,
+      is_admin: user.is_admin === true,
+    };
     return this.jwtService.sign(payload);
   }
 

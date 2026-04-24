@@ -49,4 +49,19 @@ export class ChatController {
     }
     return this.chat.sendUserMessage(id, user.id, body.content);
   }
+
+  /**
+   * 업데이트 사이클 취소 — planning_update/update_ready 상태에서 유저가
+   * "이 대화 잘못됐어, 이전 배포 상태로 돌려"라고 선택할 때.
+   * 문서 백업 복원 + session archive + state → deployed.
+   */
+  @Post(':id/update/cancel')
+  @RequireRoles('owner', 'editor')
+  async cancelUpdate(
+    @Param('id') id: string,
+    @Req() req: Record<string, any>,
+  ) {
+    const user = req['user'] as JwtUser;
+    return this.chat.cancelUpdateCycle(id, user.id);
+  }
 }

@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from app.agent.tools.base import Tool, ToolSchema
+from app.agent.tools.base import Tool, ToolCtx, ToolSchema
 from app.config import settings
 
 COMPLETENESS_KEYS = (
@@ -78,7 +78,7 @@ SCHEMA: ToolSchema = {
 }
 
 
-async def fn(project_id: str, args: dict[str, Any]) -> dict[str, Any]:
+async def fn(ctx: ToolCtx, args: dict[str, Any]) -> dict[str, Any]:
     comp = args.get("completeness") or {}
     summary = args.get("summary", "")
 

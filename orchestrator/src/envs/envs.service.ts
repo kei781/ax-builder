@@ -9,7 +9,6 @@ import { ConfigService } from '@nestjs/config';
 import { IsNull, Repository } from 'typeorm';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { randomBytes } from 'crypto';
 
 import {
   ProjectEnvVar,
@@ -23,6 +22,7 @@ import {
 } from './env-parser.js';
 import { EnvCryptoService } from './env-crypto.service.js';
 import { Project } from '../projects/entities/project.entity.js';
+import { AiGatewayService } from '../ai-gateway/ai-gateway.service.js';
 
 export interface EnvVarView {
   key: string;
@@ -61,6 +61,7 @@ export class EnvsService {
     private readonly projectRepo: Repository<Project>,
     private readonly crypto: EnvCryptoService,
     private readonly config: ConfigService,
+    private readonly aiGateway: AiGatewayService,
   ) {}
 
   /**
@@ -131,12 +132,21 @@ export class EnvsService {
       row.max_length = v.max_length ?? null;
 
       if (v.tier === 'system-injected') {
-        const injected = this.resolveSystemInjected(v.key);
-        if (injected != null) {
-          row.value_ciphertext = this.crypto.encrypt(injected);
+        // AX_AI_TOKEN: real minting, idempotent per project (ADR 0003).
+        if (v.key === 'AX_AI_TOKEN') {
+          const fresh = await this.aiGateway.ensureToken(projectId);
+          if (fresh) {
+            // First mint — store plaintext encrypted so writeDotenv can recover.
+            row.value_ciphertext = this.crypto.encrypt(fresh);
+          }
+          // If not fresh: project already has a hash. The existing
+          // value_ciphertext (from `prev`) is preserved.
+        } else {
+          const injected = this.resolveSystemInjected(v.key);
+          if (injected != null) {
+            row.value_ciphertext = this.crypto.encrypt(injected);
+          }
         }
-        // If we don't know this system var, leave null — it's a config gap
-        // we'll surface later.
         systemInjectedCount++;
       } else if (v.tier === 'user-required') {
         if (row.value_ciphertext) userRequiredFilled++;
@@ -164,16 +174,18 @@ export class EnvsService {
     };
   }
 
-  /** Resolve a system-injected variable name to its value. Null = unknown. */
+  /**
+   * Resolve a system-injected variable name to its value. Null = unknown
+   * (or handled elsewhere — AX_AI_TOKEN goes through `aiGateway.ensureToken`).
+   */
   private resolveSystemInjected(key: string): string | null {
     switch (key) {
       case 'AX_AI_BASE_URL':
-        return this.config.get<string>('AI_GATEWAY_BASE_URL') ?? null;
-      case 'AX_AI_TOKEN':
-        // Stub. Real impl calls the Gateway admin API to issue a
-        // project-scoped token (ADR 0003). For now, issue an opaque
-        // placeholder so apps can at least start up.
-        return `axt_stub_${randomBytes(12).toString('hex')}`;
+        return (
+          this.config.get<string>('AI_GATEWAY_BASE_URL') ??
+          this.config.get<string>('AX_AI_BASE_URL') ??
+          null
+        );
       case 'AX_STORAGE_PATH':
         return '/app/data';
       default:
@@ -312,6 +324,27 @@ export class EnvsService {
     const dest = path.join(project.project_path, '.env');
     await fs.writeFile(dest, lines.join('\n'), { mode: 0o600 });
     this.logger.log(`Wrote .env for project ${projectId} (${rows.length} vars)`);
+  }
+
+  /**
+   * Return all resolved env values (decrypted) as a key→value dict.
+   * Used to pass as Docker container Env at create time, so the app
+   * process sees them in process.env without needing `dotenv`.
+   */
+  async resolveAllForContainer(projectId: string): Promise<Record<string, string>> {
+    const rows = await this.envRepo.find({ where: { project_id: projectId } });
+    const dict: Record<string, string> = {};
+    for (const r of rows) {
+      if (!r.value_ciphertext) continue;
+      try {
+        dict[r.key] = this.crypto.decrypt(r.value_ciphertext);
+      } catch (err: any) {
+        this.logger.warn(
+          `resolveAllForContainer: decrypt failed for ${r.key}: ${err?.message ?? err}`,
+        );
+      }
+    }
+    return dict;
   }
 
   async hasUserRequired(projectId: string): Promise<boolean> {

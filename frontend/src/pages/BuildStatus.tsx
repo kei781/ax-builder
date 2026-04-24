@@ -28,6 +28,9 @@ export default function BuildStatus() {
   const [projectState, setProjectState] = useState<string>('building');
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  // classifier 결과 저장 — "infra_failure"면 실패 배너에 관리자 문의 노출 (retry 의미 無).
+  const [failureKind, setFailureKind] = useState<string | null>(null);
   const startRef = useRef(Date.now());
 
   useEffect(() => {
@@ -51,6 +54,9 @@ export default function BuildStatus() {
         const data = buildRes.data;
         if (data.build?.started_at) {
           startRef.current = new Date(data.build.started_at).getTime();
+        }
+        if (typeof data.consecutive_failures === 'number') {
+          setConsecutiveFailures(data.consecutive_failures);
         }
         if (data.phases?.length) {
           const phaseLines: string[] = [];
@@ -128,8 +134,11 @@ export default function BuildStatus() {
           break;
         }
         case 'error': {
-          const msg = (event.payload?.message as string) || 'unknown error';
+          const payload = event.payload ?? {};
+          const msg = (payload.message as string) || 'unknown error';
+          const kind = (payload.kind as string) || null;
           setError(msg);
+          if (kind) setFailureKind(kind);
           setLogs((p) => [...p, `⚠ ERROR: ${msg}`]);
           break;
         }
@@ -150,12 +159,65 @@ export default function BuildStatus() {
   const isComplete = projectState === 'deployed';
   const isFailed = projectState === 'failed';
   const isBounced = phase === 'bounce_back';
+  const isUpdateLine =
+    projectState === 'updating' || projectState === 'update_qa';
+  // 진행 중인 상태 — 중단 가능.
+  const isRunning =
+    projectState === 'building' ||
+    projectState === 'qa' ||
+    projectState === 'updating' ||
+    projectState === 'update_qa';
+  const [cancelling, setCancelling] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+
+  const handleCancel = async () => {
+    if (!id || cancelling) return;
+    if (!confirm(isUpdateLine ? '업데이트를 중단할까요?\n(이전 버전은 그대로 유지됩니다)' : '빌드를 중단할까요?')) {
+      return;
+    }
+    setCancelling(true);
+    try {
+      const res = await client.post(`/projects/${id}/build/cancel`);
+      setProjectState(res.data.state ?? 'failed');
+      setLogs((p) => [...p, '⚠ 사용자 요청으로 중단됐습니다.']);
+    } catch (err: unknown) {
+      const e = err as { response?: { data?: { message?: string } } };
+      alert(`중단 실패: ${e.response?.data?.message ?? '알 수 없는 오류'}`);
+    } finally {
+      setCancelling(false);
+    }
+  };
+
+  const handleRetry = async () => {
+    if (!id || retrying) return;
+    setRetrying(true);
+    try {
+      // /build/retry — failed → plan_ready 복구 후 재빌드를 원자적으로.
+      await client.post(`/projects/${id}/build/retry`);
+      setProjectState('building');
+      setPercent(0);
+      setPhase('setup');
+      setLogs(['↻ 재빌드 시작...']);
+      startRef.current = Date.now();
+      setError(null);
+    } catch (err: unknown) {
+      const e = err as { response?: { data?: { message?: string } } };
+      alert(
+        `재빌드 실패: ${e.response?.data?.message ?? '알 수 없는 오류'}\n\n` +
+          `기획 대화로 돌아가서 propose_handoff를 다시 호출해주세요.`,
+      );
+    } finally {
+      setRetrying(false);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950">
       <header className="border-b border-gray-200 dark:border-gray-800 px-6 py-4 flex items-center gap-4">
         <a href="/" className="text-gray-500 hover:text-gray-900 dark:hover:text-white">← 대시보드</a>
-        <h1 className="text-gray-900 dark:text-white font-medium">빌드 진행 상태</h1>
+        <h1 className="text-gray-900 dark:text-white font-medium">
+          {isUpdateLine ? '업데이트 진행 상태' : '빌드 진행 상태'}
+        </h1>
         <span className={`text-xs px-2 py-1 rounded-full ${connected ? 'bg-green-500/10 text-green-400' : 'bg-gray-200 dark:bg-gray-800 text-gray-500'}`}>
           {connected ? '실시간' : '연결 중'}
         </span>
@@ -165,19 +227,92 @@ export default function BuildStatus() {
       </header>
 
       <main className="max-w-4xl mx-auto px-6 py-8">
+        {/* 업데이트 중 배너 — 기존 앱 접속 가능 */}
+        {isUpdateLine && (
+          <div className="bg-cyan-500/10 border border-cyan-500/30 rounded-xl p-4 mb-6">
+            <p className="text-cyan-700 dark:text-cyan-300 text-sm">
+              ↺ 업데이트 진행 중 — 기존 앱은 계속 접속 가능합니다. 변경 적용이 실패해도 이전 버전이 유지됩니다.
+            </p>
+          </div>
+        )}
         {/* Banner */}
         {isComplete && (
           <div className="bg-green-500/10 border border-green-500/30 rounded-xl p-4 mb-6 flex items-center justify-between">
-            <p className="text-green-400 font-medium">빌드 완료!</p>
+            <p className="text-green-400 font-medium">
+              {isUpdateLine ? '업데이트 완료!' : '빌드 완료!'}
+            </p>
             <button onClick={() => navigate('/')} className="bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded-xl text-sm">대시보드로</button>
           </div>
         )}
-        {isFailed && (
-          <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-6">
-            <p className="text-red-400 font-medium">빌드 실패</p>
-            {error && <p className="text-red-300/70 text-sm mt-1">{error}</p>}
+        {/* infra_failure — 관리자 개입 필요. retry·기획수정 둘 다 의미 없음. */}
+        {isFailed && failureKind === 'infra_failure' && (
+          <div className="bg-red-600/10 border border-red-600/40 rounded-xl p-4 mb-6">
+            <p className="text-red-500 font-bold text-base">
+              ⚠ 시스템 인프라 문제 — 관리자 문의 필요
+            </p>
+            {error && <p className="text-red-400 text-sm mt-1">{error}</p>}
+            <p className="text-red-400/80 text-xs mt-2">
+              앱 빌드 시스템 자체의 문제(Claude CLI 인증 만료·리소스 부족 등)라
+              기획을 바꾸거나 재시도해도 해결되지 않습니다. 관리자에게 문의해주세요.
+            </p>
+            <button
+              onClick={() => navigate('/')}
+              className="mt-3 bg-gray-200 dark:bg-gray-800 text-gray-700 dark:text-gray-200 px-4 py-2 rounded-xl text-sm"
+            >
+              대시보드로
+            </button>
           </div>
         )}
+        {isFailed && failureKind !== 'infra_failure' && (() => {
+          // 2회 이상 연속 실패 시 "기획 대화로"를 primary로 플립.
+          // 같은 기획으로 반복 실패한다는 건 재시도보다 기획 보강이 효과적이라는 신호.
+          const chatFirst = consecutiveFailures >= 2;
+          const retryBtn = (
+            <button
+              key="retry"
+              onClick={handleRetry}
+              disabled={retrying}
+              className={
+                chatFirst
+                  ? 'bg-gray-200 dark:bg-gray-800 text-gray-700 dark:text-gray-200 px-4 py-2 rounded-xl text-sm'
+                  : 'bg-red-500 hover:bg-red-400 disabled:bg-gray-400 text-white px-4 py-2 rounded-xl text-sm font-medium'
+              }
+            >
+              {retrying ? '재시작 중...' : '↻ 다시 빌드'}
+            </button>
+          );
+          const chatBtn = (
+            <button
+              key="chat"
+              onClick={() => navigate(`/projects/${id}/chat`)}
+              className={
+                chatFirst
+                  ? 'bg-red-500 hover:bg-red-400 text-white px-4 py-2 rounded-xl text-sm font-medium'
+                  : 'bg-gray-200 dark:bg-gray-800 text-gray-700 dark:text-gray-200 px-4 py-2 rounded-xl text-sm'
+              }
+            >
+              기획 대화로
+            </button>
+          );
+          return (
+            <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 mb-6 flex items-start justify-between gap-4">
+              <div className="flex-1">
+                <p className="text-red-400 font-medium">
+                  빌드 실패{consecutiveFailures > 1 ? ` (연속 ${consecutiveFailures}회)` : ''}
+                </p>
+                {error && <p className="text-red-300/70 text-sm mt-1">{error}</p>}
+                <p className="text-red-300/60 text-xs mt-2">
+                  {chatFirst
+                    ? '같은 기획으로 여러 번 실패했어요. 대화로 보강한 뒤 다시 빌드하는 편이 효과적입니다.'
+                    : '프로세스가 중단됐거나 실행 환경 문제였다면 "다시 빌드"로 재시도할 수 있어요. 기획 자체에 수정이 필요하면 "기획 대화로"를 선택하세요.'}
+                </p>
+              </div>
+              <div className="flex flex-col gap-2 shrink-0">
+                {chatFirst ? [chatBtn, retryBtn] : [retryBtn, chatBtn]}
+              </div>
+            </div>
+          );
+        })()}
         {isBounced && (
           <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4 mb-6 flex items-center justify-between">
             <div>
@@ -188,16 +323,33 @@ export default function BuildStatus() {
           </div>
         )}
 
-        {/* Progress */}
+        {/* Progress + Cancel */}
         {!isComplete && !isFailed && !isBounced && (
           <div className="mb-6">
-            <div className="flex justify-between text-xs text-gray-500 mb-1">
+            <div className="flex justify-between items-center text-xs text-gray-500 mb-1">
               <span>{phase || 'setup'}</span>
-              <span>{percent}%</span>
+              <div className="flex items-center gap-3">
+                <span>{percent}%</span>
+                {isRunning && (
+                  <button
+                    onClick={handleCancel}
+                    disabled={cancelling}
+                    className="text-xs bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 px-3 py-1 rounded-lg disabled:opacity-50"
+                  >
+                    {cancelling
+                      ? '중단 중...'
+                      : isUpdateLine
+                        ? '↺ 업데이트 중단'
+                        : '■ 빌드 중단'}
+                  </button>
+                )}
+              </div>
             </div>
             <div className="w-full bg-gray-200 dark:bg-gray-800 rounded-full h-2">
               <div
-                className="bg-green-500 h-2 rounded-full transition-all duration-500"
+                className={`h-2 rounded-full transition-all duration-500 ${
+                  isUpdateLine ? 'bg-cyan-500' : 'bg-green-500'
+                }`}
                 style={{ width: `${percent}%` }}
               />
             </div>
