@@ -208,8 +208,13 @@ export class ChatService {
       throw new ForbiddenException('빈 메시지는 보낼 수 없습니다.');
     }
 
+    // owner relation을 함께 로드 — planning-agent에 유저 페르소나
+    // (profile_is_developer / profile_explain_depth)를 런타임 주입하기 위함.
+    // 2026-04-23 베키 사례: 페르소나가 DB에 저장만 되고 프롬프트에 반영되지
+    // 않아 비개발자 유저에게 단위테스트/통합테스트 환각이 발생했던 건 참조.
     const project = await this.projectRepo.findOne({
       where: { id: projectId },
+      relations: ['owner'],
     });
     if (!project) throw new NotFoundException('프로젝트를 찾을 수 없습니다.');
 
@@ -357,11 +362,17 @@ export class ChatService {
 
     // Dispatch to Planning Agent. The PlanningClient's agent:event callback
     // forwards all downstream events — we return immediately.
+    // Owner 필드는 findOne에서 relations:['owner']로 이미 로드됐다.
+    // 방어적으로 owner가 비어있으면(테스트 데이터 등) 비개발자/detailed 기본값.
+    const owner = project.owner;
     await this.planning.sendUserMessage({
       projectId,
       sessionId: session.id,
       history: history.map((m) => ({ role: m.role, content: m.content ?? '' })),
       userMessage: content,
+      profileIsDeveloper: owner?.profile_is_developer ?? false,
+      profileExplainDepth: owner?.profile_explain_depth ?? 'detailed',
+      projectTitle: project.title,
       onEvent: (event) => this.handleAgentEvent(event, session.id),
     });
 

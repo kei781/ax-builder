@@ -241,3 +241,104 @@ state: In(['building', 'qa', 'deployed', 'modifying']),
 - **할당자(allocator)는 자신의 기록만 믿지 말라**. DB 쿼리는 시작점이지 결론이 아니다. OS의 실제 상태(bind 가능 여부, 프로세스 존재 여부)로 교차검증.
 - **하드코딩을 "허용"하는 시스템은 시간 지나면 깨진다**. ADR 0001의 "관찰 QA"는 단일 앱 테스트엔 맞지만 병렬 기동 환경에는 약함. 앱 측 규율(PORT env 존중)을 명시적으로 요구하는 게 장기적으로 건강.
 - **후속 작업** (완료 — 같은 날): `BuildingRunner.cleanupFailedContainer()` 헬퍼 신규. 첫 빌드 라인의 모든 failure 경로(handleExit의 infra/transient/code_bug/unrecoverable, cancel의 rollback 불가 분기)에서 호출해 `docker rm -f` + projects.port/container_id clear. 업데이트 라인은 previous 유지 불변식 때문에 호출 안 함. 추가로 `onModuleInit`에 "state=failed인데 container_id 살아있는" 좀비 스위프 단계도 추가 — 재시작마다 과거 누적 좀비 자동 정리. 예방이 탐지·복구보다 싸다.
+
+---
+
+## 8. 추가 사건 — 비개발자 유저에게 단위테스트/통합테스트/E2E 환각 (2026-04-23)
+
+### 8.1 증상
+
+유저(베키, `profile_is_developer=0`)가 배포된 "랜덤 간식 당번" 앱의 `planning_update` 세션에서 "테스트해볼 수 있도록 테스트 기능을 추가해줘. 미리 정상 작동되는지 보고싶어"라고 요청.
+
+AI 응답:
+> 어떤 종류의 테스트 기능을 원하나요?
+> - **단위 테스트 (Unit Test)**: 개발자가 코드의 특정 부분이…
+> - **통합 테스트 (Integration Test)**: 여러 컴포넌트가…
+> - **E2E (End-to-End) 테스트**: 실제 사용자가 앱을 사용하는 것처럼…
+
+유저: "데모가 뭐고 샘플이 뭔지부터 잘 모르겠어요."
+
+추가로 같은 응답 내에 "현재 **할 일 관리** 앱의 PRD를 검토해보니"라는 표현이 있었다. 이 앱은 "랜덤 간식 당번"인데 AI가 **일반화된 도메인 명칭("할 일 관리")**으로 지칭.
+
+### 8.2 원인 두 겹
+
+1. **페르소나 필드가 DB에만 존재, 프롬프트에 주입 안 됨**. `users.profile_is_developer` 컬럼은 존재(베키=0)하지만 orchestrator `chat.service.sendUserMessage`가 `projectRepo.findOne`에서 `relations:['owner']` 생략 → owner entity 미로드. planning-agent `chat:turn` 페이로드엔 프로필 필드 자체가 없었다. `system_prompt.py`의 "사용자는 비개발자로 가정"은 모든 유저에게 동일하게 하드코딩된 고정 문구였고, **유저별 실제 값으로 강화되지 않았음**.
+2. **프로젝트 제목도 프롬프트에 없었다**. LLM은 오직 대화 이력 + 저장된 PRD.md만 봄. PRD 내용 패턴이 "할 일(Todo) 관리" 앱과 겹치는 부분이 있어 **일반화된 도메인 명사**로 말해버림. 프로젝트 고유 제목을 프롬프트에 고정하지 않으면 이 일반화를 막을 수단이 없다.
+
+### 8.3 근본 문제 — "페르소나는 선언이 아니라 런타임 주입이어야 동작한다"
+
+§2.1 "선언→강제" 격차, §6 "프롬프트만으로 환각 못 막는다"와 같은 축. 프롬프트에 "비개발자로 가정" 문구를 적어두는 **선언**은 있었지만, 유저별 프로필 값을 매 턴 **강제**로 꽂아넣지 않으면 LLM이 표면 키워드(예: "테스트")에 먼저 반응해 개발자 용어 사전을 꺼낸다.
+
+"데이터 필드는 있지만 쓰이지 않음"은 관찰하기 어렵다. 테이블에 칼럼도 있고 유저 프로필 UI에서 저장도 되니 "작동 중"으로 보이지만, 실제 LLM 응답은 값과 무관. 이 갭은 E2E 관찰로만 드러난다.
+
+### 8.4 대응 (같은 날 적용)
+
+1. **프로필 + 프로젝트 제목을 런타임 주입**: `system_prompt.build_system_prompt(is_update_mode, profile_is_developer, profile_explain_depth, project_title)`로 시그니처 확장. 결과 프롬프트 상단에 유저별 preamble을 붙인다.
+   - 비개발자: "⛔ 금지 용어: 단위/통합/E2E 테스트, API, 엔드포인트, 스키마, 컴포넌트, 훅, 디펜던시, 런타임… / 번역 규칙: '테스트' → '버튼 눌러서 동작 확인' / 되묻기는 기술 분류가 아니라 사용 장면으로"
+   - 개발자: 기술 용어 허용, 의사결정 부담은 여전히 최소화.
+   - `profile_explain_depth=brief`면 "2~3문장으로 짧게" 지시 추가.
+   - `project_title`을 프롬프트 상단에 고정 + "일반화 금지(예: '할 일 관리 앱'으로 호칭 금지)" 명시.
+2. **소켓 페이로드 확장**: orchestrator `chat.service`가 `projectRepo.findOne({relations:['owner']})`로 owner 로드 → `planning.client` 인터페이스에 `profileIsDeveloper/profileExplainDepth/projectTitle` 필드 추가 → `chat:turn` emit payload에 포함. planning-agent `sio_handlers.on_chat_turn`이 수신해 `run_turn`에 전달. 누락 시 비개발자/detailed/null fallback.
+
+### 8.5 교훈
+
+- **"필드가 존재한다"와 "필드가 동작한다"는 다르다**. DB 컬럼·엔티티 프로퍼티·유저 설정 UI가 다 있어도 런타임 경로 어딘가에서 읽히지 않으면 0비트다. 새 프로필 필드를 추가할 때는 "저장→읽기→프롬프트 주입→LLM 응답 변화"까지 E2E로 관찰해야 실제 가치가 입증된다.
+- **같은 시스템 프롬프트에 유저별 분기가 없으면 페르소나는 없다**. "비개발자로 가정" 같은 고정 문구는 모든 유저에게 같은 답을 만든다. 유저별 값이 프롬프트 상단에 preamble로 꽂혀 있어야 LLM이 표면 키워드에 지지 않는다.
+- **프로젝트 도메인 고유명사는 프롬프트에 반드시 고정**. PRD.md 파싱에 의존해 LLM이 도메인을 "재구성"하게 두면 일반화 환각이 반드시 생긴다. "이 프로젝트의 제목은 정확히 X다. 다른 이름으로 부르지 말라"를 선언으로 넣어두는 비용이 거의 없다.
+- **후속 관찰 포인트**: planning-agent 로그에 매 턴 `dev=<bool> depth=<str> title=<str>`를 찍어두면 장래 회귀 여부를 grep 한 번으로 확인 가능. 새 유저 프로필 필드가 추가될 때마다 같은 로그 라인에 추가해 "지금 주입되고 있는가"를 영속적으로 관찰.
+
+### 8.6 심층 추적 — "할 일 관리 앱" 오인의 실제 원인 (같은 날 이어서)
+
+페르소나 주입으로 1차 방어를 끝낸 뒤, "AI가 왜 이 앱을 '할 일 관리'라고 지칭했는가"를 파고들다가 훨씬 더 심각한 **데이터 유실 사고**를 발견했다.
+
+**타임라인 (2026-04-22, 프로젝트 7526a154)**:
+| 시각 | 사건 |
+|---|---|
+| 00:29:21 | `write_prd` #1 — "간식 당번 자동화 봇" PRD 초안 |
+| 00:35:30 | `write_prd` #2 — "간식 당번 자동화 봇" PRD 확장본 (3.2KB) |
+| 00:35:38 | `write_design` — "간식 당번" 디자인 시스템 |
+| 00:35:46 | propose_handoff 성공 → 빌드 → 배포 (port 3004, 컨테이너 title "간식 당번 관리자") |
+| 00:47:25 | 유저(베키) 업데이트 메시지: "테스트 기능을 추가해줘" |
+| **00:47:33** | **`write_prd` #3 — 8초 만에 PRD가 `"Product Requirements Document (PRD) for Todo App"`으로 통째 교체** |
+| 00:50:06, 00:50:14 | "할 일 관리 애플리케이션" PRD로 2회 더 갱신 (데모 모드 섹션 부풀림) |
+
+**핵심**: AI가 "할 일 관리 앱"이라고 지칭한 건 환각이 아니라 **정직한 보고**였다. 이전 턴에 본인이 파괴한 PRD를 이번 턴에 읽고 사실대로 말한 것. 컨테이너(실제 앱)는 "간식 당번"인데 PRD는 "Todo"라는 **도메인 완전 불일치** 상태로 48시간 방치돼 있었다. 이 상태에서 유저가 "업데이트 시작"을 누르면 Building Agent가 PRD 기준으로 코드를 갱신해 간식 당번 앱이 Todo 앱으로 변신했을 것. 다행히 `planning_update`에서 멈춰있어 회귀 빌드는 안 돌았다.
+
+### 8.7 세 겹 원인
+
+1. **UPDATE 라인의 `write_prd`가 유저 한 줄에 8초만에 catastrophic overwrite**. `UPDATE_SYSTEM_PROMPT`에 "변경 없는 섹션은 원문 그대로 복제하라"는 규칙이 있었지만 무시. LLM이 "테스트 기능" 키워드에 훈련 데이터의 Todo App 예제로 매칭해 전체 재생성.
+2. **애초에 불가능한 안전 지시 — "`Read` 도구로 기존 PRD를 먼저 읽어라"**. planning-agent tool registry에 `Read` 도구가 **존재하지 않는다**. 프롬프트 레벨 선언인데 그 선언을 이행할 수단이 없음. 원본 베타 단계에서 도구를 붙이기로 의도했다가 미완료된 구간.
+3. **백업도 변경률 검사도 없는 단순 덮어쓰기 도구**. write_prd는 `prd_path.write_text(content)` 한 줄. 이전 값 보존도, 변경량 비교도 없었다. 유실 후 복구 가능성은 "agent_logs에 payload가 통째로 남아있기를 운에 맡기는" 수준.
+
+### 8.8 근본 문제 — "도구의 프롬프트 지시는 도구 능력의 상한을 못 넘는다"
+
+§2.1 선언→강제 격차의 가장 극명한 사례. 프롬프트에 "Read로 먼저 읽어라"는 선언은 있었지만 Read 도구 자체가 없었다. "변경 없는 섹션 복제하라"는 지시도 LLM이 지키지 않으면 끝. **도구 레벨의 강제**가 없으면 프롬프트 규칙은 "잘 지키기를 바라는 기도"에 가깝다.
+
+동시에 "**전체 덮어쓰기 도구의 UPDATE 모드 사용은 태생적으로 위험하다**". 이상적으로는 UPDATE에서 `apply_prd_patch(old, new)` 같은 diff 기반 도구여야 하지만 당장은 write_prd 하나뿐. 그렇다면 **가드**로 감싸야 한다.
+
+### 8.9 대응 (같은 날, 4종 + 복원)
+
+1. **P0-1: UPDATE 모드 시스템 프롬프트에 기존 PRD 선주입** (`planning-agent/app/agent/loop.py:_load_existing_prd`, `system_prompt.build_system_prompt(existing_prd=...)`). Read 도구가 없는 걸 문제 삼는 대신 **session 시작 시 서버가 PRD 파일을 읽어 system prompt 말미에 `<EXISTING_PRD>` 블록으로 박아넣음**. AI가 "모름"이라고 주장할 수 없는 구조.
+2. **P0-2: `write_prd` 덮어쓰기 직전 자동 `.bak.{iso8601Z}` 백업**. 첫 빌드/업데이트 무관, 매 호출 적용. 실패해도 원본 write는 막지 않음(복구 가능성 감소일 뿐). 기존 PRD가 없으면 skip.
+3. **P1: UPDATE 모드 변경률 + H1 가드** (도구 레벨 reject).
+   - `difflib.SequenceMatcher.ratio() < 0.3` → reject ("사실상 전체 재작성")
+   - 최상단 `# H1`이 바뀌고 ratio < 0.7 → reject ("도메인 전환으로 보입니다")
+   - 실측 반영: 사건 재현에서 간식→Todo similarity 0.106, H1 변경. 가드에 정확히 걸림. 정상 UPDATE 리팩토링은 0.311~0.835로 통과.
+   - Reject 시 AI에게 구체 가이드 반환: "`<EXISTING_PRD>`의 변경 없는 섹션은 원문 그대로 복제해서 재시도하거나, 도메인 자체가 바뀐다면 유저에게 '새 프로젝트로 만들까요?' 먼저 질문".
+4. **P2: orchestrator `findOne` 응답에 `title_prd_mismatch: boolean` 추가**. PRD의 H1과 `project.title`을 정규화 비교. 불일치면 프론트 Chat 페이지에 호박색 배너 + "이전 PRD 버전으로 되돌리기" 버튼(owner 한정). 신규 `GET /projects/:id/prd/backups` + `POST /projects/:id/prd/restore` 엔드포인트 + 프론트 복원 모달. 복원도 원상복구 가능하도록 복원 직전 현재 PRD를 `.bak`으로 자동 보존.
+
+**도구 시그니처 리팩토링**: `Tool.fn`이 `(project_id, args)` → `(ToolCtx, args)`로 변경. `ToolCtx`는 `project_id/session_id/is_update_mode`를 담아 도구가 런타임 맥락을 읽을 수 있게. write_prd 가드가 UPDATE 모드 여부를 핸들러 내부에서 확인할 수 있는 건 이 때문.
+
+### 8.10 피해 복구 — 7526a154
+
+백업 로직 도입 이전 사고라 `.bak` 파일이 없어서 **agent_logs에서 복원**. 2026-04-22 00:35:30의 `write_prd` tool_call payload에서 간식 당번 PRD 원본(6.2KB)을 꺼내 `PRD.md`에 재기록. 파괴됐던 Todo PRD는 `PRD.md.bak.20260424T004038Z`로 이관. active 세션(bddd75cf)은 `archived`, project.state를 `planning_update → deployed`, `current_session_id=NULL`로 롤백.
+
+복구 후 상태: state=`deployed`, port=3004(컨테이너 그대로 37시간+ up), PRD/DESIGN 모두 "간식 당번" 도메인으로 일관. 유저가 다시 채팅을 시작하면 새 session으로 `deployed → planning_update` 깨끗하게 진입하고, 이번엔 system prompt에 `<EXISTING_PRD>`가 선주입된 상태로 AI가 원본 PRD를 참조.
+
+### 8.11 교훈 (기존 8.5에 추가)
+
+- **"도구의 프롬프트 지시는 도구 능력의 상한을 못 넘는다"**. `Read` 도구가 없는데 "Read로 먼저 읽어라"는 지시를 넣는 것은 AI를 탓하기 쉬운 구조를 만들 뿐. 지시는 반드시 그 지시를 이행할 수단과 쌍으로 설계.
+- **"전체 덮어쓰기 도구의 UPDATE 모드는 반드시 가드로 감싼다"**. 이상적으로는 diff 기반 도구로 교체가 맞지만, 가드(변경률 임계치 + H1 감지 + 자동 백업)만으로도 실전 사고는 차단 가능. 실측 기반 임계치가 중요 — 사건과 정상 UPDATE의 실제 유사도 분포를 모아 경계선을 긋는다.
+- **"백업은 선언이 아니라 도구 내부에서 자동"**. "사용자가 write 전에 읽어서 수동으로 저장하세요" 같은 구조는 절대 안 지켜진다. 도구가 매 호출마다 자동으로 .bak을 남기고, UI가 그 목록을 노출해서 복원을 1클릭으로.
+- **"이미 깨진 상태는 UI에서 먼저 가시화"**. `title_prd_mismatch` 배너처럼, 시스템이 유저보다 먼저 "여기가 어긋났습니다"를 알려야 사일런트 사고의 수명이 짧아진다. 유저가 "왜 AI가 내 앱을 다른 이름으로 부르지?"라고 의심하기까지 이틀이 걸렸는데 그 기간 동안 UI는 아무 경고도 없었다.
+- **"과거 사고도 복원 가능성 유지"**. 백업이 없던 시절의 피해도 agent_logs의 tool_call payload에서 복원 가능. 향후 migration/복구 도구를 개발할 때 agent_logs를 **2차 진실원**으로 설계해두면 가치가 있다. 그래서 agent_logs는 건드리지 말고 append-only 유지.

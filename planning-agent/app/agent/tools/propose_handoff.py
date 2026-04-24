@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from app.agent.tools.base import Tool, ToolSchema
+from app.agent.tools.base import Tool, ToolCtx, ToolSchema
 from app.config import settings
 from app.storage.db import connection
 
@@ -114,7 +114,8 @@ def _validate(args: dict[str, Any]) -> tuple[bool, str | None]:
     return True, None
 
 
-async def fn(project_id: str, args: dict[str, Any]) -> dict[str, Any]:
+async def fn(ctx: ToolCtx, args: dict[str, Any]) -> dict[str, Any]:
+    project_id = ctx.project_id
     ok, err = _validate(args)
     if not ok:
         return {"ok": False, "accepted": False, "error": err}

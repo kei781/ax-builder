@@ -59,6 +59,30 @@ interface ProjectInfo {
     finished_at: string | null;
     gap_list: string[];
   } | null;
+  /**
+   * PRD.md의 H1과 project.title이 어긋나 있으면 true. 2026-04-24 §8의
+   * PRD 전면 교체 사고로 도메인이 틀어진 프로젝트를 유저가 알아차릴 수
+   * 있게 배너로 노출. 새 write_prd 가드 이후로는 새로 생기지 않지만
+   * 과거 사고 피해는 이 필드로 가시화.
+   */
+  title_prd_mismatch?: boolean;
+}
+
+interface PrdBackup {
+  filename: string;
+  timestamp: string;
+  bytes: number;
+}
+
+/**
+ * "20260422T003530Z" → "2026-04-22 00:35:30 UTC" 형태로.
+ * 유저가 읽을 수 있게 포맷만 바꾸는 순수 함수.
+ */
+function formatBackupStamp(stamp: string): string {
+  const m = stamp.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+  if (!m) return stamp;
+  const [, y, mo, d, hh, mm, ss] = m;
+  return `${y}-${mo}-${d} ${hh}:${mm}:${ss} UTC`;
 }
 
 const STATE_LABELS: Record<ProjectState, string> = {
@@ -103,6 +127,10 @@ export default function Chat() {
   const [status, setStatus] = useState<string>('');
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const [myRole, setMyRole] = useState<'owner' | 'editor' | 'viewer'>('viewer');
+  // 2026-04-24 §8 — PRD 백업 복원 UI. 배너에서 열 때 이 state로 토글.
+  const [prdBackupsOpen, setPrdBackupsOpen] = useState(false);
+  const [prdBackups, setPrdBackups] = useState<PrdBackup[] | null>(null);
+  const [prdRestoreBusy, setPrdRestoreBusy] = useState(false);
   // handoff 배너 — AI 텍스트 대신 "도구 결과를 직접" 표시해 환각 차단.
   // kind='success'  = accepted → plan_ready/update_ready 전이됨
   // kind='rejected' = accepted=false 또는 ok=false → 거부 이유 노출
@@ -473,6 +501,111 @@ export default function Chat() {
 
   return (
     <div className="h-screen bg-gray-50 dark:bg-gray-950 flex overflow-hidden">
+      {/* PRD 백업 복원 모달 (2026-04-24 §8) */}
+      {prdBackupsOpen && (
+        <div
+          className="fixed inset-0 bg-black/40 flex items-center justify-center z-50"
+          onClick={() => {
+            if (!prdRestoreBusy) setPrdBackupsOpen(false);
+          }}
+        >
+          <div
+            className="bg-white dark:bg-gray-900 rounded-xl shadow-xl w-[520px] max-h-[80vh] overflow-hidden flex flex-col border border-gray-200 dark:border-gray-800"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+              <h2 className="text-base font-semibold text-gray-900 dark:text-white">
+                PRD 이전 버전 복원
+              </h2>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                PRD 문서가 갱신될 때마다 직전 내용이 자동 저장됩니다.
+                원하는 시점의 버전을 골라 되돌릴 수 있어요. 복원 전 현재 PRD도
+                함께 백업됩니다.
+              </p>
+            </div>
+            <div className="flex-1 overflow-y-auto px-5 py-3 space-y-2">
+              {prdBackups === null && (
+                <p className="text-sm text-gray-500">불러오는 중…</p>
+              )}
+              {prdBackups && prdBackups.length === 0 && (
+                <p className="text-sm text-gray-500">
+                  저장된 이전 버전이 없습니다. (백업은 2026-04-24 이후 PRD
+                  변경부터 자동으로 쌓입니다.)
+                </p>
+              )}
+              {prdBackups?.map((b) => (
+                <div
+                  key={b.filename}
+                  className="flex items-center justify-between border border-gray-200 dark:border-gray-800 rounded-lg px-3 py-2"
+                >
+                  <div className="text-sm">
+                    <div className="text-gray-900 dark:text-gray-100 font-mono">
+                      {formatBackupStamp(b.timestamp)}
+                    </div>
+                    <div className="text-xs text-gray-500 mt-0.5">
+                      {b.bytes.toLocaleString()} bytes
+                    </div>
+                  </div>
+                  <button
+                    disabled={prdRestoreBusy}
+                    onClick={async () => {
+                      if (
+                        !confirm(
+                          `이 버전(${formatBackupStamp(
+                            b.timestamp,
+                          )})으로 PRD를 되돌립니다. 현재 PRD는 자동으로 함께 백업됩니다. 계속할까요?`,
+                        )
+                      )
+                        return;
+                      setPrdRestoreBusy(true);
+                      try {
+                        await client.post(`/projects/${id}/prd/restore`, {
+                          filename: b.filename,
+                        });
+                        alert('복원 완료. 대화를 새로 시작해주세요.');
+                        setPrdBackupsOpen(false);
+                        // project info 재조회 — mismatch 배너가 사라질 것.
+                        try {
+                          const res = await client.get<ProjectInfo>(
+                            `/projects/${id}`,
+                          );
+                          setProject(res.data);
+                        } catch {
+                          // 조회 실패는 치명적이지 않음 — 유저 새로고침으로 해결.
+                        }
+                      } catch (err: unknown) {
+                        const e = err as {
+                          response?: { data?: { message?: string } };
+                        };
+                        alert(
+                          `복원 실패: ${
+                            e.response?.data?.message ?? '알 수 없는 오류'
+                          }`,
+                        );
+                      } finally {
+                        setPrdRestoreBusy(false);
+                      }
+                    }}
+                    className="text-xs bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-700 dark:text-emerald-300 px-3 py-1.5 rounded-lg disabled:opacity-50"
+                  >
+                    이 버전으로 복원
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="px-5 py-3 border-t border-gray-200 dark:border-gray-800 flex justify-end">
+              <button
+                onClick={() => setPrdBackupsOpen(false)}
+                disabled={prdRestoreBusy}
+                className="text-xs text-gray-500 hover:text-gray-900 dark:hover:text-white px-3 py-1.5 disabled:opacity-50"
+              >
+                닫기
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Chat column */}
       <div className="flex-1 flex flex-col min-h-0">
       <header className="shrink-0 border-b border-gray-200 dark:border-gray-800 px-6 py-4 flex items-center gap-4">
@@ -526,6 +659,49 @@ export default function Chat() {
           </button>
         )}
       </header>
+
+      {/* Title vs PRD mismatch banner (2026-04-24 §8 후속).
+          write_prd가 덮어쓰기 사고로 도메인을 날려버린 프로젝트에서 노출.
+          새 가드 이후로는 새로 생기지 않지만 과거 피해는 유저가 복원할 수 있게
+          PRD 백업 목록을 열 수 있는 버튼 함께 제공. */}
+      {project?.title_prd_mismatch && (
+        <div className="px-6 py-3 bg-amber-500/10 border-b border-amber-500/40">
+          <p className="text-sm text-amber-800 dark:text-amber-300 font-medium mb-1">
+            ⚠ 프로젝트 제목과 PRD 문서의 제목이 달라요
+          </p>
+          <p className="text-xs text-amber-700 dark:text-amber-200">
+            이 프로젝트의 이름은 <b>"{project.title}"</b>인데 PRD 문서에는 다른
+            앱으로 적혀 있습니다. 과거 업데이트 중 문서가 의도와 다르게
+            바뀌었을 수 있어요. 저장된 이전 PRD 버전에서 되돌릴 수 있습니다.
+          </p>
+          {myRole === 'owner' && (
+            <button
+              onClick={async () => {
+                setPrdBackupsOpen(true);
+                try {
+                  const res = await client.get<{ backups: PrdBackup[] }>(
+                    `/projects/${id}/prd/backups`,
+                  );
+                  setPrdBackups(res.data.backups);
+                } catch (err: unknown) {
+                  const e = err as {
+                    response?: { data?: { message?: string } };
+                  };
+                  alert(
+                    `백업 목록을 불러오지 못했어요: ${
+                      e.response?.data?.message ?? '알 수 없는 오류'
+                    }`,
+                  );
+                  setPrdBackupsOpen(false);
+                }
+              }}
+              className="mt-2 text-xs bg-amber-500/15 hover:bg-amber-500/25 text-amber-800 dark:text-amber-200 px-3 py-1.5 rounded-lg transition-colors"
+            >
+              이전 PRD 버전으로 되돌리기
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Failure banner */}
       {state === 'failed' && project?.failure_reason && project.failure_reason.length > 0 && (
