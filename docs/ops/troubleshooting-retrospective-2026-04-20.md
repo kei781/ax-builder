@@ -342,3 +342,99 @@ AI 응답:
 - **"백업은 선언이 아니라 도구 내부에서 자동"**. "사용자가 write 전에 읽어서 수동으로 저장하세요" 같은 구조는 절대 안 지켜진다. 도구가 매 호출마다 자동으로 .bak을 남기고, UI가 그 목록을 노출해서 복원을 1클릭으로.
 - **"이미 깨진 상태는 UI에서 먼저 가시화"**. `title_prd_mismatch` 배너처럼, 시스템이 유저보다 먼저 "여기가 어긋났습니다"를 알려야 사일런트 사고의 수명이 짧아진다. 유저가 "왜 AI가 내 앱을 다른 이름으로 부르지?"라고 의심하기까지 이틀이 걸렸는데 그 기간 동안 UI는 아무 경고도 없었다.
 - **"과거 사고도 복원 가능성 유지"**. 백업이 없던 시절의 피해도 agent_logs의 tool_call payload에서 복원 가능. 향후 migration/복구 도구를 개발할 때 agent_logs를 **2차 진실원**으로 설계해두면 가치가 있다. 그래서 agent_logs는 건드리지 말고 append-only 유지.
+
+---
+
+## 9. 추가 사건 — building-agent settings.DB_PATH 누락 + 컨테이너 require cache 미스 (2026-04-24 후속)
+
+### 9.1 증상
+
+베키(다른 프로젝트 df146ba5, "랜덤 간식 당번" v1 deployed, port 3005)가 모바일에서 두 버튼 클릭 시 404:
+- "Slack 테스트 알림 보내기" → `POST /api/slack/send-test-message` → 404
+- "당번 이력 → 사이클 초기화" → `POST /api/snack-duty/reset-cycle` → 404
+
+같은 화면의 다른 버튼들(직원 목록, Slack 설정 저장, 수동 추첨, 당번 이력 조회)은 정상.
+
+### 9.2 표면 진단 (오답)
+
+처음엔 frontend 버튼만 있고 backend route가 누락된 케이스로 추정. 실제 확인:
+- `routes/slackConfigRoutes.js:51` 에 `router.post('/send-test-message', ...)` 정의 ✅
+- `routes/snackDutyRoutes.js:42` 에 `router.post('/reset-cycle', ...)` 정의 ✅
+- `server.js`에 `app.use('/api/slack', slackConfigRoutes)` / `app.use('/api/snack-duty', snackDutyRoutes)` 마운트 ✅
+- 컨테이너 안에서 `node -e` 로 fresh require하면 router stack에 두 endpoint 다 등록됨
+
+코드는 멀쩡한데 실제 호출은 404 — 표면 진단으로 못 풀림.
+
+### 9.3 진짜 root cause (두 겹)
+
+**(A) 컨테이너 require cache 미스**: bind mount(`projects/df146ba5-...` → `/app`)라서 호스트 디스크 변경이 컨테이너에 즉시 반영되지만, **node 프로세스는 04:26 시점에 이미 require한 router 객체를 메모리에 가짐**. 그 후 14:54(slackConfigRoutes), 15:04(snackDutyRoutes)에 디스크가 갱신돼도 살아있는 server는 옛 stack만 들고 있어 새 endpoint만 404.
+
+**(B) update 빌드가 3회 연속 같은 에러로 실패** (컨테이너 갱신 못 함):
+
+| 빌드 ID | 시작 | 종료 | 결과 |
+|---|---|---|---|
+| dbcf1a0d (v1) | 04:12 | 04:22 | success — 컨테이너 83fbebca 시작 |
+| 529ea7ff (v2) | 04:29 | 04:41 | failed |
+| 4bbc8321 (v2) | 04:45 | 04:54 | failed |
+| b1c6515f (v2) | 04:58 | 05:09 | failed |
+
+3건 모두 동일 stack trace:
+```
+File "building-agent/qa_supervisor.py", line 231, in _load_previous_primary_endpoints
+  db_path = Path(settings.DB_PATH)
+AttributeError: 'Settings' object has no attribute 'DB_PATH'
+```
+
+ADR 0008 §D7 "이전 버전 동작 엔드포인트" 구현 단계에서 `_load_previous_primary_endpoints` 함수만 추가하고 `building-agent/config.py:Settings` 클래스의 `DB_PATH` 속성 추가를 빠뜨림. **§6/§8과 같은 "선언 ↔ 강제 격차" 패턴 — 코드는 그 속성을 *기대*만 하고 *생성*은 안 함**.
+
+### 9.4 사고 시퀀스 — 두 겹의 결합
+
+```
+v1 deploy → require cache 고정 → v2 빌드 실패 (DB_PATH 부재)
+          → 그러나 빌드 도중 디스크에 v2 코드 일부 기록됨 → cleanup 안 함
+          → 다음 v2 빌드도 같은 코드에서 같은 에러 → 또 실패
+          → 결과: DB=v1, 컨테이너=v1 코드 실행, 디스크=v2 코드(부분 기록)
+          → 베키가 v2에서 새로 생긴 두 endpoint 호출 시 404
+```
+
+회고 §6의 "도구 결과 vs AI 설명 vs UI 지표 3자 불일치"의 또 다른 표면 — 여기선 **DB 상태 vs 컨테이너 메모리 vs 디스크 코드의 3자 불일치**.
+
+### 9.5 대응 (즉시)
+
+**Fix 1 (root cause)**: [building-agent/config.py](../../building-agent/config.py) `Settings` 클래스에 `DB_PATH` 속성 추가:
+```python
+DB_PATH: str = env("DB_PATH", str(_ROOT / "data" / "ax-builder.db"))
+```
+검증: `_load_previous_primary_endpoints('df146ba5-...')` 호출 시 v1의 primary_endpoints `['/', '/api/health', '/configure', '/history', '/manual-draw', '/test']` 정상 반환. building-agent는 매 빌드마다 spawn되므로 다음 빌드부터 자동 적용.
+
+**Fix 2 (피해 복구)**: v2 빌드 재시도 trigger. 정상 §D4 흐름으로 복구 (새 v2 컨테이너 deploy → 헬스체크 + regression → v1 컨테이너 정리 → DB·컨테이너·디스크 모두 v2로 일치).
+
+대안으로 "컨테이너만 restart"로 5초 안에 404 해결 가능했지만, DB(v1)와 디스크(v2) mismatch가 잔류해서 다음 update 사이클의 §D7 regression이 잘못된 baseline으로 비교 가능. 정상 경로 복구가 깨끗.
+
+### 9.6 진단 도중 본 시사점 — Bug Triage Agent의 PoC 정의 격상
+
+이번 사고는 사용자 제안의 "Bug Triage Agent" PoC 첫 케이스로 검토하기에 적합. 그러나 **B 선택지(Planning에 read_file 도구만 부여)로는 절대 못 잡음**:
+- 디스크 코드는 멀쩡 → Planning이 코드 읽어도 "라우트 있네요. 정상이어야 합니다"로 끝
+- **메모리 vs 디스크 vs DB 갭은 코드만 봐서는 안 보인다**
+
+Triage Agent가 실효 있으려면 **런타임 probe 도구**가 필수:
+- `docker_exec(container_id, cmd)` — 컨테이너 내부 file mtime, process start time
+- `http_probe(url)` — 실제 endpoint 응답
+- `agent_logs_filter(build_id)` — building-agent stack trace 추출
+- `compare_db_vs_container(project_id)` — current_version vs container 안 코드 일치 여부
+
+PoC 정의를 "코드 읽기만"이 아니라 **"코드 + 런타임 probe + 로그 스캔"**으로 격상해야 한다는 게 이번 케이스의 교훈.
+
+### 9.7 후속 작업 (todo.md #10~#12로 분리)
+
+이번 사고가 드러낸 시스템 갭 3건. 각각 별도 PR 가치:
+
+1. **failure_classifier에 building-agent 자체 버그 카테고리 추가** — `AttributeError`/`ImportError`/`ModuleNotFoundError`/`NameError` 등 building-agent 코드 결함은 `infra_error`로 분류. 유저 화면엔 "운영자에게 알림 전송됨" 메시지 + "기획 보강하세요" 메시지 차단. 회고 §11 / ADR 0002 패턴.
+2. **update 라인 retry 한계** — 첫 빌드 라인의 "2회 실패 시 CTA flip"(회고 §6)에 해당하는 안전장치를 update 라인에도. **같은 stack trace N회 반복**이면 retry 버튼 비활성화 + 운영자 알림.
+3. **update 빌드 실패 시 디스크 코드 cleanup or rollback** — 회고 §7의 `cleanupFailedContainer()`가 첫 빌드 라인엔 있지만 update 라인은 previous 보존 불변식 때문에 cleanup 안 함. 그러나 **디스크 코드는 그대로 남아 컨테이너 require cache와 어긋남**. ADR 0008 §D4-bis의 PRD 백업·복원처럼 update 빌드 실패 시 디스크도 `.bak` 또는 git checkout으로 되돌려야 함. 앞서 논의된 모노레포·git 도입과 자연스럽게 합류 — git 도입의 첫 가치가 "update 실패 시 `git revert HEAD`로 디스크 원복"으로 명확해짐.
+
+### 9.8 교훈 추가
+
+- **"Settings 추가는 기능 추가의 일부다"**. 새 기능이 settings 속성을 *읽기만* 하면 추가 안 한 거다. 도입 PR에 `class Settings:` diff가 함께 있는지 reviewer가 항상 확인.
+- **"같은 에러 N회 반복은 retry로 안 풀린다"**. retry-first 정책은 *확률적* 실패 가정에서만 유효. 결정론적 에러(코드 결함, 환경 결함)는 N=1에서 이미 답이 정해져 있다. classifier가 결정론 vs 확률 구분을 해야 한다.
+- **"디스크·메모리·DB 3자 일관성은 명시적 invariant로 관리해야"**. 어느 한 쪽이 갱신되면 다른 둘도 같은 transaction 안에서 갱신되거나, 갱신 못 했음을 시스템이 즉시 인지해야 한다. 지금은 "디스크는 v2, 메모리는 v1, DB는 v1" 같은 상태가 silently 유지될 수 있고 유저가 신고할 때까지 아무도 모른다.

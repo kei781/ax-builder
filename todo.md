@@ -94,9 +94,45 @@
 
 ---
 
+## 회고 §9 후속 (2026-04-24, building-agent settings 누락 + 컨테이너 require cache 미스 사고에서 파생)
+
+### [ ] 10. failure_classifier에 building-agent 자체 버그 카테고리 추가
+
+- **내용**: `AttributeError` / `ImportError` / `ModuleNotFoundError` / `NameError` 등 building-agent 자체 코드 결함은 현재 `unknown`으로 분류돼 유저에게 "기획 보강하세요" 메시지 노출. 사실은 운영자가 코드를 고쳐야 하는 영역 — 유저는 할 수 있는 게 없다.
+- **관련 파일**:
+  - `building-agent/qa_supervisor.py` — failure classifier 위치
+  - `orchestrator/src/agents/building.runner.ts` — handleExit에서 분류 결과 라우팅
+  - 회고 §9.7 항목 1
+- **조치**: classifier에 `infra_error_agent_bug` 카테고리 신설. building-agent stderr에서 Python `Traceback` 패턴 + 위 4개 예외 클래스 매칭. 매칭 시 유저 화면엔 "운영자에게 알림이 전송됐습니다. 기획 수정으로 해결되지 않습니다" 메시지 + "↻ 다시 빌드" CTA 제거. 운영자 알림 채널은 별도 (이번엔 회고 문서로 대체).
+
+### [ ] 11. update 라인 retry 한계 — 같은 stack trace N회 차단
+
+- **내용**: 첫 빌드 라인은 회고 §6의 "2회 연속 실패 시 CTA flip"이 있지만 update 라인엔 같은 안전장치 없음. 베키 사례에서 v2 빌드 3회 같은 `AttributeError`로 실패하는 동안 매번 retry 버튼이 활성화돼 유저가 의미 없는 재시도 가능했음.
+- **관련 파일**:
+  - `frontend/src/components/ProjectCard.tsx` (또는 BuildStatus) — retry CTA 표시 로직
+  - `orchestrator/src/projects/projects.service.ts` `findOne` — last_bounce/failure_reason 응답에 "consecutive_same_error_count" 같은 필드 추가
+  - 회고 §9.7 항목 2
+- **조치**: 직전 N개 build의 stderr stack tail 정규화 비교. 동일 stack 2회 이상이면 retry CTA 비활성화 + "같은 에러가 반복되고 있어요. 운영자에게 알림이 전송됐습니다" 메시지. N=2 권장(첫 빌드 라인과 대칭).
+
+### [ ] 12. update 빌드 실패 시 디스크 코드 cleanup or git rollback
+
+- **내용**: 회고 §7의 `BuildingRunner.cleanupFailedContainer()`는 첫 빌드 라인 한정. update 라인은 previous 컨테이너 보존 불변식(§D4) 때문에 컨테이너 cleanup 안 함. **그런데 디스크 코드도 cleanup 안 됨** → 빌드가 phase 일부만 진행한 상태로 디스크에 변경이 남고, 이게 살아있는 v1 컨테이너의 require cache와 어긋난다(베키 사례 root cause B).
+- **관련 파일**:
+  - `building-agent/orchestrator.py` — phase 실패 시 정리
+  - `orchestrator/src/agents/building.runner.ts` — handleExit update 라인 분기
+  - 모노레포·git 도입(MEMORY 항목 "ax-builder GitHub 방향")과 자연스럽게 합류
+  - 회고 §9.7 항목 3
+- **조치 후보**:
+  - (A) 빌드 시작 직전 `projects/<id>/.ax-build/pre-update-disk-backup/`에 source tree tar.gz 백업 → 실패 시 복원. PRD/DESIGN과 같은 D4-bis 백업 패턴의 코드 트리 확장.
+  - (B) git 도입 시: 빌드 시작에서 `git checkout -b update-{build_id}` → 성공 시 main에 merge, 실패 시 브랜치 폐기 + main 그대로. **이 경로가 git 도입의 가장 명확한 첫 가치**.
+- **권장**: B로 가되 PoC 단계에선 A로 임시 막기. git 도입은 별도 의사결정이라 시간 걸림.
+
+---
+
 ## 우선순위 요약
 
 1. **#1** (qa/update_qa state 전이) — 유저가 보는 UX 직결. 처리 시 #1만 별도 PR 가치 있음.
 2. **#2 + #3** — PRD·ADR 문서 정합. 코드 1곳도 건드리지 않고 `.md` 수정만으로 끝. 같이 묶어 처리.
 3. **#4 ~ #6** — 한 번에 정리 가능한 minor 정돈.
 4. **#7 ~ #9** — 후속 작업. 필요할 때 개별 처리.
+5. **#10 ~ #12** — 회고 §9 사고 후속. **#12가 가장 큰 영향**(메모리·디스크·DB 3자 일관성 invariant 정립). #10 #11은 단발 PR.
